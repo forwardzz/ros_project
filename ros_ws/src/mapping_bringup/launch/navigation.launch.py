@@ -40,6 +40,11 @@ def generate_launch_description():
             description="Lidar mounting height (m)",
         ),
         DeclareLaunchArgument(
+            name="lidar_yaw",
+            default_value="3.1415926",
+            description="Lidar yaw relative to base_link (rad)",
+        ),
+        DeclareLaunchArgument(
             name="use_rviz",
             default_value="false",
             description="Launch RViz on the robot",
@@ -71,7 +76,7 @@ def generate_launch_description():
             name="base_to_laser",
             arguments=[
                 "--x", "0", "--y", "0", "--z", LaunchConfiguration("lidar_z"),
-                "--roll", "0", "--pitch", "0", "--yaw", "3.1425926",
+                "--roll", "0", "--pitch", "0", "--yaw", LaunchConfiguration("lidar_yaw"),
                 "--frame-id", "base_link",
                 "--child-frame-id", LaunchConfiguration("lidar_frame_id"),
             ],

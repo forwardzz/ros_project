@@ -12,6 +12,13 @@ import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import LaserScan
 
 
@@ -24,10 +31,21 @@ class RosUiAdapter:
         self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
         self.spin_thread.start()
 
+        map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
         self.cmd_vel_pub = self.node.create_publisher(Twist, "/cmd_vel", 10)
         self.odom_sub = self.node.create_subscription(Odometry, "/odom", self._odom_cb, 10)
-        self.scan_sub = self.node.create_subscription(LaserScan, "/scan", self._scan_cb, 10)
-        self.map_sub = self.node.create_subscription(OccupancyGrid, "/map", self._map_cb, 1)
+        self.scan_sub = self.node.create_subscription(
+            LaserScan, "/scan", self._scan_cb, qos_profile_sensor_data
+        )
+        self.map_sub = self.node.create_subscription(
+            OccupancyGrid, "/map", self._map_cb, map_qos
+        )
 
         self.robot_x = 0.0
         self.robot_y = 0.0
@@ -74,6 +92,83 @@ class LaunchManager:
         self.active_process = None
         self.active_name = "idle"
         self.last_exit_code = None
+
+    def _run_remote_cleanup(self, patterns):
+        if not patterns:
+            return
+        cleanup_steps = [f"pkill -TERM -f {pattern} || true" for pattern in patterns]
+        cleanup_steps.append("sleep 1")
+        cleanup = " ; ".join(cleanup_steps)
+        proc = subprocess.Popen(
+            [
+                "ssh",
+                f"{self.remote_user}@{self.remote_host}",
+                f"bash -lc {shlex.quote(cleanup)}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            stdout, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, _ = proc.communicate()
+            self.log_callback("[WARN] remote cleanup timed out")
+        if stdout:
+            self.log_callback(stdout.rstrip())
+
+    def _stop_patterns_for(self, name):
+        common = [
+            "ros2",
+            "mapping.launch.py",
+            "navigation.launch.py",
+            "sllidar_node",
+            "rf2o_laser_odometry",
+            "static_transform_publisher",
+            "tracked_motor_driver",
+        ]
+        if name == "mapping":
+            return [
+                "ros2",
+                "mapping.launch.py",
+                "slam_toolbox",
+                *common,
+            ]
+        if name == "navigation":
+            return [
+                "ros2",
+                "navigation.launch.py",
+                "nav2_amcl",
+                "planner_server",
+                "controller_server",
+                "bt_navigator",
+                "behavior_server",
+                "smoother_server",
+                "velocity_smoother",
+                "map_server",
+                "lifecycle_manager_navigation",
+                *common,
+            ]
+        return [
+            "ros2",
+            "mapping.launch.py",
+            "navigation.launch.py",
+            "slam_toolbox",
+            "nav2_amcl",
+            "planner_server",
+            "controller_server",
+            "bt_navigator",
+            "behavior_server",
+            "smoother_server",
+            "velocity_smoother",
+            "map_server",
+            "lifecycle_manager_navigation",
+            "sllidar_node",
+            "rf2o_laser_odometry",
+            "tracked_motor_driver",
+            "static_transform_publisher",
+        ]
 
     def _build_remote_command(self, command):
         setup_path = os.path.join(self.workspace_path, "install", "setup.bash")
@@ -124,8 +219,11 @@ class LaunchManager:
         threading.Thread(target=worker, daemon=True).start()
 
     def stop(self):
+        target_name = self.active_name
         if not self.active_process or self.active_process.poll() is not None:
-            self.log_callback("[INFO] No active launch process.")
+            patterns = self._stop_patterns_for(target_name)
+            self._run_remote_cleanup(patterns)
+            self.log_callback(f"[STOP] remote cleanup for {target_name or 'all'}")
             self.active_name = "idle"
             return
 
@@ -135,6 +233,7 @@ class LaunchManager:
         except ProcessLookupError:
             pass
         finally:
+            self._run_remote_cleanup(self._stop_patterns_for(target_name))
             self.active_process = None
             self.active_name = "idle"
 
@@ -189,7 +288,7 @@ class RobotControlApp:
         self.last_map_render_key = None
 
         self.root.title("Tracked Robot Control UI")
-        self.root.geometry("1180x760")
+        self.root.geometry("1280x760")
         self.root.configure(bg="#ebe6dc")
 
         self.map_var = tk.StringVar(value=self.default_map_path)
@@ -238,10 +337,12 @@ class RobotControlApp:
         body = tk.Frame(self.root, bg="#ebe6dc")
         body.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
 
-        left = tk.Frame(body, bg="#ebe6dc")
+        left = tk.Frame(body, bg="#ebe6dc", width=720)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        right = tk.Frame(body, bg="#ebe6dc")
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(18, 0))
+        left.pack_propagate(False)
+        right = tk.Frame(body, bg="#ebe6dc", width=500)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(18, 0))
+        right.pack_propagate(False)
 
         self._build_launch_panel(left)
         self._build_log_panel(left)
@@ -298,7 +399,7 @@ class RobotControlApp:
         frame.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(
             frame,
-            height=24,
+            height=18,
             bg="#101820",
             fg="#d8f3dc",
             insertbackground="#d8f3dc",
@@ -312,8 +413,8 @@ class RobotControlApp:
         frame.pack(fill=tk.X)
         self.map_canvas = tk.Canvas(
             frame,
-            width=320,
-            height=320,
+            width=460,
+            height=210,
             bg="#f7f3eb",
             highlightthickness=0,
         )
@@ -348,7 +449,7 @@ class RobotControlApp:
             ("Map", self.map_var_status, "#6d597a"),
         ]
         for title, variable, color in cards:
-            card = tk.Frame(frame, bg=color, width=280, height=92)
+            card = tk.Frame(frame, bg=color, width=440, height=64)
             card.pack(fill=tk.X, padx=12, pady=10)
             card.pack_propagate(False)
             tk.Label(card, text=title, bg=color, fg="white", font=("Helvetica", 12, "bold")).pack(
@@ -380,8 +481,10 @@ class RobotControlApp:
 
         extra = tk.Frame(frame, bg="#ebe6dc")
         extra.pack(fill=tk.X, padx=12, pady=(0, 12))
-        ttk.Button(extra, text="Forward Left", command=self.forward_left).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(extra, text="Forward Right", command=self.forward_right).pack(side=tk.LEFT, padx=8)
+        ttk.Button(extra, text="Forward Left", command=self.forward_left).grid(row=0, column=0, padx=(0, 8), pady=4, sticky="ew")
+        ttk.Button(extra, text="Forward Right", command=self.forward_right).grid(row=0, column=1, padx=(8, 0), pady=4, sticky="ew")
+        extra.grid_columnconfigure(0, weight=1)
+        extra.grid_columnconfigure(1, weight=1)
 
     def _bind_keys(self):
         bindings = {
@@ -400,6 +503,7 @@ class RobotControlApp:
 
     def start_mapping(self):
         self._apply_workspace()
+        self.log_queue.put("[INFO] Start mapping. Make sure navigation is not running at the same time.")
         self.launch_manager.start("mapping", "ros2 launch mapping_bringup mapping.launch.py")
 
     def start_navigation(self):
@@ -408,6 +512,7 @@ class RobotControlApp:
         if not map_path:
             messagebox.showerror("Missing Map", "Map YAML path is required.")
             return
+        self.log_queue.put("[INFO] Start navigation. Stop mapping first to avoid TF conflicts between slam_toolbox and AMCL.")
         self.launch_manager.start(
             "navigation",
             f"ros2 launch mapping_bringup navigation.launch.py map:={map_path}",
