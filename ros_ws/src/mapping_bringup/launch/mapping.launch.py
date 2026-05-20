@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
@@ -7,6 +7,16 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    cyclone_uri = (
+        "<CycloneDDS xmlns='https://cdds.io/config'>"
+        "<Domain Id='any'>"
+        "<Discovery>"
+        "<ParticipantIndex>none</ParticipantIndex>"
+        "<MaxAutoParticipantIndex>200</MaxAutoParticipantIndex>"
+        "</Discovery>"
+        "</Domain>"
+        "</CycloneDDS>"
+    )
     sllidar_launch_path = PathJoinSubstitution(
         [FindPackageShare("sllidar_ros2"), "launch", "sllidar_a1_launch.py"]
     )
@@ -20,6 +30,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        SetEnvironmentVariable("CYCLONEDDS_URI", cyclone_uri),
         DeclareLaunchArgument(
             name="serial_port",
             default_value="/dev/rplidar",
@@ -75,6 +86,7 @@ def generate_launch_description():
             executable="rf2o_laser_odometry_node",
             name="rf2o_laser_odometry",
             output="screen",
+            arguments=["--ros-args", "--log-level", "error"],
             parameters=[{
                 "laser_scan_topic": "/scan",
                 "odom_topic": "/odom",
@@ -91,6 +103,13 @@ def generate_launch_description():
             package="mapping_bringup",
             executable="tracked_motor_driver",
             name="motor_driver",
+            output="screen",
+        ),
+
+        Node(
+            package="mapping_bringup",
+            executable="thermal_camera_node",
+            name="thermal_camera_node",
             output="screen",
         ),
 

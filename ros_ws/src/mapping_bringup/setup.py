@@ -27,6 +27,8 @@ setup(
     entry_points={
         "console_scripts": [
             "tracked_motor_driver = mapping_bringup.tracked_motor_driver:main",
+            "mission_manager = mapping_bringup.mission_manager:main",
+            "thermal_camera_node = mapping_bringup.thermal_camera_node:main",
         ],
     },
 )

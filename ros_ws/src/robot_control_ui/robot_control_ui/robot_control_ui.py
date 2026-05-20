@@ -1,3 +1,4 @@
+import math
 import os
 import queue
 import shlex
@@ -8,8 +9,10 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import matplotlib
 import rclpy
 from geometry_msgs.msg import Twist
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import (
@@ -20,6 +23,14 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32MultiArray
+
+from robot_mission_utils.tsp_planner import TSPPlanner
+from robot_monitor_interfaces.msg import InspectionPoint
+from robot_monitor_interfaces.srv import ConfirmInspectionPoints, Localize, StartNavigation
+
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
 
 
 class RosUiAdapter:
@@ -46,19 +57,45 @@ class RosUiAdapter:
         self.map_sub = self.node.create_subscription(
             OccupancyGrid, "/map", self._map_cb, map_qos
         )
+        self.thermal_sub = self.node.create_subscription(
+            Float32MultiArray, "/thermal_frame", self._thermal_cb, 10
+        )
+        self.localize_client = self.node.create_client(Localize, "/localize_robot")
+        self.confirm_points_client = self.node.create_client(
+            ConfirmInspectionPoints, "/confirm_inspection_points"
+        )
+        self.start_navigation_client = self.node.create_client(
+            StartNavigation, "/start_navigation"
+        )
 
         self.robot_x = 0.0
         self.robot_y = 0.0
+        self.robot_yaw = 0.0
         self.robot_yaw_rate = 0.0
         self.scan_count = 0
         self.map_data = None
         self.last_scan_stamp = 0.0
         self.last_odom_stamp = 0.0
         self.last_map_stamp = 0.0
+        self.last_thermal_stamp = 0.0
+        self.thermal_width = 32
+        self.thermal_height = 24
+        self.thermal_frame = []
+        self.thermal_min = 0.0
+        self.thermal_max = 0.0
+        self.thermal_avg = 0.0
+        self.thermal_change_per_min = 0.0
+        self.thermal_change_ready = False
+        self.thermal_baseline_avg = None
+        self.thermal_baseline_time = 0.0
 
     def _odom_cb(self, msg):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.robot_yaw = math.atan2(siny_cosp, cosy_cosp)
         self.robot_yaw_rate = msg.twist.twist.angular.z
         self.last_odom_stamp = time.time()
 
@@ -70,11 +107,59 @@ class RosUiAdapter:
         self.map_data = msg
         self.last_map_stamp = time.time()
 
+    def _thermal_cb(self, msg):
+        dims = msg.layout.dim
+        if len(dims) >= 2 and dims[0].size > 0 and dims[1].size > 0:
+            self.thermal_height = int(dims[0].size)
+            self.thermal_width = int(dims[1].size)
+
+        if not msg.data:
+            return
+
+        self.thermal_frame = list(msg.data)
+        self.thermal_min = min(self.thermal_frame)
+        self.thermal_max = max(self.thermal_frame)
+        self.thermal_avg = sum(self.thermal_frame) / len(self.thermal_frame)
+        now = time.time()
+        if self.thermal_baseline_avg is None:
+            self.thermal_baseline_avg = self.thermal_avg
+            self.thermal_baseline_time = now
+        elif now - self.thermal_baseline_time >= 60.0:
+            self.thermal_change_per_min = self.thermal_avg - self.thermal_baseline_avg
+            self.thermal_change_ready = True
+            self.thermal_baseline_avg = self.thermal_avg
+            self.thermal_baseline_time = now
+        self.last_thermal_stamp = time.time()
+
     def publish_cmd_vel(self, linear_x=0.0, angular_z=0.0):
         msg = Twist()
         msg.linear.x = linear_x
         msg.angular.z = angular_z
         self.cmd_vel_pub.publish(msg)
+
+    def call_service_async(self, client, request, done_callback, timeout_sec=6.0):
+        def worker():
+            if not client.wait_for_service(timeout_sec=timeout_sec):
+                done_callback(None, f"Service {client.srv_name} is unavailable")
+                return
+
+            future = client.call_async(request)
+            deadline = time.time() + timeout_sec
+            while rclpy.ok() and not future.done() and time.time() < deadline:
+                time.sleep(0.05)
+
+            if not future.done():
+                done_callback(None, f"Service {client.srv_name} timed out")
+                return
+
+            try:
+                result = future.result()
+            except Exception as exc:
+                done_callback(None, str(exc))
+                return
+            done_callback(result, None)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def shutdown(self):
         self.executor.shutdown()
@@ -90,8 +175,19 @@ class LaunchManager:
         self.ros_setup_path = ros_setup_path
         self.log_callback = log_callback
         self.active_process = None
+        self.thermal_process = None
         self.active_name = "idle"
         self.last_exit_code = None
+        self.cyclone_uri = (
+            "<CycloneDDS xmlns='https://cdds.io/config'>"
+            "<Domain Id='any'>"
+            "<Discovery>"
+            "<ParticipantIndex>none</ParticipantIndex>"
+            "<MaxAutoParticipantIndex>200</MaxAutoParticipantIndex>"
+            "</Discovery>"
+            "</Domain>"
+            "</CycloneDDS>"
+        )
 
     def _run_remote_cleanup(self, patterns):
         if not patterns:
@@ -133,6 +229,7 @@ class LaunchManager:
                 "ros2",
                 "mapping.launch.py",
                 "slam_toolbox",
+                "thermal_camera_node",
                 *common,
             ]
         if name == "navigation":
@@ -148,6 +245,7 @@ class LaunchManager:
                 "velocity_smoother",
                 "map_server",
                 "lifecycle_manager_navigation",
+                "thermal_camera_node",
                 *common,
             ]
         return [
@@ -168,11 +266,13 @@ class LaunchManager:
             "rf2o_laser_odometry",
             "tracked_motor_driver",
             "static_transform_publisher",
+            "thermal_camera_node",
         ]
 
     def _build_remote_command(self, command):
         setup_path = os.path.join(self.workspace_path, "install", "setup.bash")
         return (
+            f"export CYCLONEDDS_URI={shlex.quote(self.cyclone_uri)} && "
             f"source {self.ros_setup_path} && "
             f"source {setup_path} && "
             f"cd {self.workspace_path} && "
@@ -240,7 +340,44 @@ class LaunchManager:
     def is_running(self):
         return bool(self.active_process and self.active_process.poll() is None)
 
-    def _stream_output(self, proc, name, track_active=True):
+    def start_thermal(self):
+        if self.thermal_process and self.thermal_process.poll() is None:
+            self.log_callback("[WARN] Thermal node is already running.")
+            return False
+
+        self._run_remote_cleanup(["thermal_camera_node"])
+        command = "ros2 run mapping_bringup thermal_camera_node"
+        self.thermal_process = subprocess.Popen(
+            self._build_ssh_invocation(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            preexec_fn=os.setsid,
+        )
+        self.log_callback(f"[RUN] thermal: {command}")
+        threading.Thread(
+            target=self._stream_output,
+            args=(self.thermal_process, "thermal"),
+            kwargs={"track_active": False, "track_thermal": True},
+            daemon=True,
+        ).start()
+        return True
+
+    def stop_thermal(self):
+        try:
+            if self.thermal_process and self.thermal_process.poll() is None:
+                os.killpg(os.getpgid(self.thermal_process.pid), signal.SIGTERM)
+                self.log_callback("[STOP] thermal")
+        except ProcessLookupError:
+            pass
+        finally:
+            self._run_remote_cleanup(["thermal_camera_node"])
+            self.thermal_process = None
+
+    def is_thermal_running(self):
+        return bool(self.thermal_process and self.thermal_process.poll() is None)
+
+    def _stream_output(self, proc, name, track_active=True, track_thermal=False):
         if proc.stdout is not None:
             for line in proc.stdout:
                 self.log_callback(line.rstrip())
@@ -250,6 +387,8 @@ class LaunchManager:
         if track_active and self.active_process is proc:
             self.active_process = None
             self.active_name = "idle"
+        if track_thermal and self.thermal_process is proc:
+            self.thermal_process = None
 
 
 class RobotControlApp:
@@ -285,7 +424,15 @@ class RobotControlApp:
         self.manual_linear = 0.12
         self.manual_angular = 0.8
         self.pose_history = []
+        self.mission_points = []
+        self.point_counter = 1
+        self.tsp_planner = TSPPlanner()
         self.last_map_render_key = None
+        self.thermal_window = None
+        self.thermal_popup_fig = None
+        self.thermal_popup_ax = None
+        self.thermal_popup_canvas = None
+        self.thermal_popup_cbar = None
 
         self.root.title("Tracked Robot Control UI")
         self.root.geometry("1280x760")
@@ -296,10 +443,12 @@ class RobotControlApp:
         self.remote_user_var = tk.StringVar(value=self.remote_user)
         self.remote_host_var = tk.StringVar(value=self.remote_host)
         self.status_var = tk.StringVar(value="Idle")
-        self.pose_var = tk.StringVar(value="x=0.00  y=0.00")
+        self.pose_var = tk.StringVar(value="x=0.00  y=0.00  yaw=0.0")
         self.scan_var = tk.StringVar(value="scan: no data")
         self.odom_var = tk.StringVar(value="odom: no data")
         self.map_var_status = tk.StringVar(value="map: no data")
+        self.mission_var = tk.StringVar(value="mission: 0 points")
+        self.thermal_var = tk.StringVar(value="thermal: no data")
         self.ssh_var = tk.StringVar(value=f"{self.remote_user}@{self.remote_host}")
         self.indicators = {}
 
@@ -345,8 +494,10 @@ class RobotControlApp:
         right.pack_propagate(False)
 
         self._build_launch_panel(left)
+        self._build_mission_panel(left)
         self._build_log_panel(left)
         self._build_map_panel(right)
+        self._build_thermal_panel(right)
         self._build_status_panel(right)
         self._build_drive_panel(right)
 
@@ -408,13 +559,71 @@ class RobotControlApp:
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
+    def _build_mission_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Mission Points", style="Card.TLabelframe")
+        frame.pack(fill=tk.X, pady=(0, 18))
+
+        tk.Label(
+            frame,
+            text="Use current pose to create inspection points, then optimize visit order.",
+            bg="#ebe6dc",
+            font=("Helvetica", 10),
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+
+        list_row = tk.Frame(frame, bg="#ebe6dc")
+        list_row.pack(fill=tk.X, padx=12, pady=(6, 8))
+        self.point_listbox = tk.Listbox(list_row, height=6, font=("Courier New", 10))
+        self.point_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        scroll = ttk.Scrollbar(list_row, orient=tk.VERTICAL, command=self.point_listbox.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.point_listbox.configure(yscrollcommand=scroll.set)
+
+        buttons = tk.Frame(frame, bg="#ebe6dc")
+        buttons.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ttk.Button(buttons, text="Add Current Pose", command=self.add_current_pose_point).grid(
+            row=0, column=0, padx=(0, 8), pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Delete Selected", command=self.delete_selected_point).grid(
+            row=0, column=1, padx=8, pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Clear Points", command=self.clear_points).grid(
+            row=0, column=2, padx=(8, 0), pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Optimize Order", command=self.optimize_points).grid(
+            row=1, column=0, padx=(0, 8), pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Current Order", command=self.use_current_order).grid(
+            row=1, column=1, padx=8, pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Sync Points", command=self.sync_points_to_robot).grid(
+            row=1, column=2, padx=(8, 0), pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Check Localization", command=self.check_localization).grid(
+            row=2, column=0, padx=(0, 8), pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Start Mission", command=self.start_mission).grid(
+            row=2, column=1, padx=8, pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Log Request", command=self.log_navigation_request).grid(
+            row=2, column=2, padx=(8, 0), pady=4, sticky="ew"
+        )
+        for col in range(3):
+            buttons.grid_columnconfigure(col, weight=1)
+
+        tk.Label(
+            frame,
+            textvariable=self.mission_var,
+            bg="#ebe6dc",
+            font=("Helvetica", 10, "bold"),
+        ).pack(anchor="w", padx=12, pady=(0, 12))
+
     def _build_map_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Live Map", style="Card.TLabelframe")
         frame.pack(fill=tk.X)
         self.map_canvas = tk.Canvas(
             frame,
             width=460,
-            height=210,
+            height=180,
             bg="#f7f3eb",
             highlightthickness=0,
         )
@@ -426,13 +635,34 @@ class RobotControlApp:
             font=("Helvetica", 10),
         ).pack(anchor="w", padx=12, pady=(0, 12))
 
+    def _build_thermal_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Thermal Camera", style="Card.TLabelframe")
+        frame.pack(fill=tk.X, pady=(18, 0))
+        self.thermal_fig, self.thermal_ax = plt.subplots(figsize=(5.3, 2.5), dpi=90)
+        self.thermal_cbar = None
+        self.thermal_canvas = FigureCanvasTkAgg(self.thermal_fig, frame)
+        self.thermal_canvas.draw()
+        self.thermal_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 8))
+        buttons = tk.Frame(frame, bg="#ebe6dc")
+        buttons.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ttk.Button(buttons, text="Start Thermal", command=self.start_thermal).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Stop Thermal", command=self.stop_thermal).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(buttons, text="Open Thermal Window", command=self.open_thermal_window).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(buttons, text="Save Snapshot", command=self.save_thermal_snapshot).pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(
+            frame,
+            textvariable=self.thermal_var,
+            bg="#ebe6dc",
+            font=("Helvetica", 10),
+        ).pack(anchor="w", padx=12, pady=(0, 12))
+
     def _build_status_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Robot Status", style="Card.TLabelframe")
         frame.pack(fill=tk.X, pady=(18, 0))
 
         lights = tk.Frame(frame, bg="#ebe6dc")
         lights.pack(fill=tk.X, padx=12, pady=(12, 6))
-        for name in ["SSH", "Laser", "Odom", "Map"]:
+        for name in ["SSH", "Laser", "Odom", "Map", "Thermal"]:
             lamp = tk.Frame(lights, bg="#ebe6dc")
             lamp.pack(fill=tk.X, pady=4)
             canvas = tk.Canvas(lamp, width=18, height=18, bg="#ebe6dc", highlightthickness=0)
@@ -447,6 +677,8 @@ class RobotControlApp:
             ("Laser", self.scan_var, "#437f97"),
             ("Odometry", self.odom_var, "#bc4b51"),
             ("Map", self.map_var_status, "#6d597a"),
+            ("Mission", self.mission_var, "#9c6644"),
+            ("Thermal", self.thermal_var, "#6b705c"),
         ]
         for title, variable, color in cards:
             card = tk.Frame(frame, bg=color, width=440, height=64)
@@ -550,10 +782,194 @@ class RobotControlApp:
     def stop_robot(self):
         self.ros.publish_cmd_vel(0.0, 0.0)
 
+    def start_thermal(self):
+        self._apply_workspace()
+        self.log_queue.put("[INFO] Start standalone thermal camera node.")
+        self.launch_manager.start_thermal()
+
+    def stop_thermal(self):
+        self.launch_manager.stop_thermal()
+
+    def open_thermal_window(self):
+        if self.thermal_window is not None and self.thermal_window.winfo_exists():
+            self.thermal_window.lift()
+            self._draw_thermal_view()
+            return
+
+        self.thermal_window = tk.Toplevel(self.root)
+        self.thermal_window.title("Thermal Camera Detail")
+        self.thermal_window.geometry("900x620")
+        self.thermal_window.configure(bg="#ebe6dc")
+        self.thermal_window.protocol("WM_DELETE_WINDOW", self._close_thermal_window)
+
+        frame = ttk.LabelFrame(self.thermal_window, text="Thermal Detail", style="Card.TLabelframe")
+        frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        self.thermal_popup_fig, self.thermal_popup_ax = plt.subplots(figsize=(8.4, 5.0), dpi=100)
+        self.thermal_popup_canvas = FigureCanvasTkAgg(self.thermal_popup_fig, frame)
+        self.thermal_popup_canvas.draw()
+        self.thermal_popup_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        self._draw_thermal_view()
+
+    def _close_thermal_window(self):
+        if self.thermal_popup_fig is not None:
+            plt.close(self.thermal_popup_fig)
+        self.thermal_window.destroy()
+        self.thermal_window = None
+        self.thermal_popup_fig = None
+        self.thermal_popup_ax = None
+        self.thermal_popup_canvas = None
+        self.thermal_popup_cbar = None
+
+    def save_thermal_snapshot(self):
+        if not self.ros.thermal_frame:
+            messagebox.showinfo("Thermal Snapshot", "No thermal data available yet.")
+            return
+
+        output_dir = os.path.join(os.path.expanduser("~"), "Pictures", "thermal_snapshots")
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(output_dir, f"thermal_{timestamp}.png")
+        self.thermal_fig.savefig(output_path, dpi=180, bbox_inches="tight")
+        self.log_queue.put(f"[THERMAL] snapshot saved: {output_path}")
+        messagebox.showinfo("Thermal Snapshot", f"Saved to:\n{output_path}")
+
+    def add_current_pose_point(self):
+        point = InspectionPoint()
+        point.point_name = f"P{self.point_counter}"
+        point.x = self.ros.robot_x
+        point.y = self.ros.robot_y
+        point.theta = self.ros.robot_yaw
+        point.is_confirmed = True
+        self.point_counter += 1
+        self.mission_points.append(point)
+        self._sync_point_listbox()
+        self.log_queue.put(
+            f"[MISSION] add {point.point_name} -> ({point.x:.2f}, {point.y:.2f}, yaw={math.degrees(point.theta):.1f}deg)"
+        )
+
+    def delete_selected_point(self):
+        selection = self.point_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Mission Points", "Select a point to delete.")
+            return
+        index = selection[0]
+        point = self.mission_points.pop(index)
+        self._sync_point_listbox()
+        self.log_queue.put(f"[MISSION] delete {point.point_name}")
+
+    def clear_points(self):
+        self.mission_points.clear()
+        self._sync_point_listbox()
+        self.log_queue.put("[MISSION] cleared all points")
+
+    def optimize_points(self):
+        if len(self.mission_points) < 2:
+            self.log_queue.put("[MISSION] need at least 2 points to optimize order")
+            return
+        anchor = self._make_anchor_point()
+        points = [anchor, *self.mission_points]
+        self.tsp_planner.calculate_distance_matrix(points)
+        order = self.tsp_planner.solve_tsp_dynamic_programming(points)
+        if not order:
+            self.log_queue.put("[WARN] mission order optimization returned no route")
+            return
+        ordered = [points[idx] for idx in order if idx != 0]
+        self.mission_points = ordered
+        self._sync_point_listbox()
+        names = " -> ".join(point.point_name for point in self.mission_points)
+        self.log_queue.put(f"[MISSION] optimized order: {names}")
+
+    def use_current_order(self):
+        if not self.mission_points:
+            self.log_queue.put("[MISSION] no points in current mission order")
+            return
+        names = " -> ".join(point.point_name for point in self.mission_points)
+        self.log_queue.put(f"[MISSION] current order kept: {names}")
+
+    def log_navigation_request(self):
+        if not self.mission_points:
+            self.log_queue.put("[MISSION] no points to export")
+            return
+        request_text = ", ".join(
+            f"{point.point_name}({point.x:.2f},{point.y:.2f},{math.degrees(point.theta):.1f}deg)"
+            for point in self.mission_points
+        )
+        self.log_queue.put(f"[MISSION] StartNavigation request preview: {request_text}")
+
+    def check_localization(self):
+        request = Localize.Request()
+
+        def done(result, error):
+            self.root.after(0, lambda: self._handle_localize_result(result, error))
+
+        self.log_queue.put("[MISSION] querying localization status")
+        self.ros.call_service_async(self.ros.localize_client, request, done)
+
+    def sync_points_to_robot(self):
+        if not self.mission_points:
+            messagebox.showinfo("Mission Points", "No mission points to sync.")
+            return
+
+        request = ConfirmInspectionPoints.Request()
+        request.points = self.mission_points
+
+        def done(result, error):
+            self.root.after(0, lambda: self._handle_confirm_result(result, error))
+
+        self.log_queue.put(f"[MISSION] syncing {len(self.mission_points)} points to robot")
+        self.ros.call_service_async(self.ros.confirm_points_client, request, done)
+
+    def start_mission(self):
+        if not self.mission_points:
+            messagebox.showinfo("Mission Points", "Add at least one mission point first.")
+            return
+
+        request = StartNavigation.Request()
+        request.waypoints = self.mission_points
+
+        def done(result, error):
+            self.root.after(0, lambda: self._handle_start_mission_result(result, error))
+
+        self.log_queue.put(f"[MISSION] sending mission with {len(self.mission_points)} points")
+        self.ros.call_service_async(self.ros.start_navigation_client, request, done, timeout_sec=10.0)
+
     def _apply_workspace(self):
         self.launch_manager.workspace_path = self.workspace_var.get().strip() or self.workspace_path
         self.launch_manager.remote_user = self.remote_user_var.get().strip() or self.remote_user
         self.launch_manager.remote_host = self.remote_host_var.get().strip() or self.remote_host
+
+    def _handle_localize_result(self, result, error):
+        if error is not None:
+            self.log_queue.put(f"[ERROR] localization check failed: {error}")
+            messagebox.showerror("Localization", error)
+            return
+        self.log_queue.put(f"[MISSION] {result.message}")
+        if result.success:
+            messagebox.showinfo("Localization", result.message)
+        else:
+            messagebox.showwarning("Localization", result.message)
+
+    def _handle_confirm_result(self, result, error):
+        if error is not None:
+            self.log_queue.put(f"[ERROR] point sync failed: {error}")
+            messagebox.showerror("Sync Points", error)
+            return
+        self.log_queue.put(f"[MISSION] {result.message}")
+        if result.success:
+            messagebox.showinfo("Sync Points", result.message)
+        else:
+            messagebox.showwarning("Sync Points", result.message)
+
+    def _handle_start_mission_result(self, result, error):
+        if error is not None:
+            self.log_queue.put(f"[ERROR] mission start failed: {error}")
+            messagebox.showerror("Start Mission", error)
+            return
+        self.log_queue.put(f"[MISSION] {result.message}")
+        if result.success:
+            messagebox.showinfo("Start Mission", result.message)
+        else:
+            messagebox.showwarning("Start Mission", result.message)
 
     def _schedule_update(self):
         self._flush_logs()
@@ -568,7 +984,9 @@ class RobotControlApp:
 
     def _refresh_status(self):
         now = time.time()
-        self.pose_var.set(f"x={self.ros.robot_x:.2f}  y={self.ros.robot_y:.2f}")
+        self.pose_var.set(
+            f"x={self.ros.robot_x:.2f}  y={self.ros.robot_y:.2f}  yaw={math.degrees(self.ros.robot_yaw):.1f}deg"
+        )
         self._record_pose()
         if now - self.ros.last_scan_stamp < 1.0:
             self.scan_var.set(f"scan alive, ranges={self.ros.scan_count}")
@@ -593,6 +1011,15 @@ class RobotControlApp:
             self.map_var_status.set("map timeout")
             self._set_indicator("map", False, "Map: timeout")
 
+        if now - self.ros.last_thermal_stamp < 2.0 and self.ros.thermal_frame:
+            self.thermal_var.set(
+                f"thermal alive, min={self.ros.thermal_min:.1f}C  max={self.ros.thermal_max:.1f}C  avg={self.ros.thermal_avg:.1f}C"
+            )
+            self._set_indicator("thermal", True, "Thermal: online")
+        else:
+            self.thermal_var.set("thermal timeout")
+            self._set_indicator("thermal", False, "Thermal: timeout")
+
         ssh_ok = self.launch_manager.last_exit_code in (None, 0) or self.launch_manager.is_running()
         self._set_indicator("ssh", ssh_ok, f"SSH: {self.ssh_var.get()}")
 
@@ -601,7 +1028,9 @@ class RobotControlApp:
         else:
             self.status_var.set("Idle")
 
+        self._refresh_mission_status()
         self._draw_map_view()
+        self._draw_thermal_view()
 
     def _set_indicator(self, key, ok, text):
         canvas, label = self.indicators[key]
@@ -616,6 +1045,33 @@ class RobotControlApp:
             self.pose_history.append(point)
             if len(self.pose_history) > 80:
                 self.pose_history.pop(0)
+
+    def _sync_point_listbox(self):
+        self.point_listbox.delete(0, tk.END)
+        for index, point in enumerate(self.mission_points, start=1):
+            self.point_listbox.insert(
+                tk.END,
+                f"{index:>2}. {point.point_name:<6} x={point.x:>6.2f}  y={point.y:>6.2f}",
+            )
+        self.last_map_render_key = None
+
+    def _refresh_mission_status(self):
+        if not self.mission_points:
+            self.mission_var.set("mission: 0 points")
+        else:
+            names = " -> ".join(point.point_name for point in self.mission_points[:4])
+            if len(self.mission_points) > 4:
+                names += " ..."
+            self.mission_var.set(f"mission: {len(self.mission_points)} points | {names}")
+
+    def _make_anchor_point(self):
+        point = InspectionPoint()
+        point.point_name = "ROBOT"
+        point.x = self.ros.robot_x
+        point.y = self.ros.robot_y
+        point.theta = self.ros.robot_yaw
+        point.is_confirmed = True
+        return point
 
     def _draw_map_view(self):
         map_msg = self.ros.map_data
@@ -685,6 +1141,30 @@ class RobotControlApp:
         if len(trail) >= 4:
             canvas.create_line(*trail, fill="#3a86ff", width=2, smooth=True)
 
+        for index, point in enumerate(self.mission_points, start=1):
+            point_px, point_py = self._world_to_canvas(
+                point.x,
+                point.y,
+                origin_x,
+                origin_y,
+                resolution,
+                grid_w,
+                grid_h,
+                inner_w,
+                inner_h,
+            )
+            canvas.create_oval(
+                point_px - 4, point_py - 4, point_px + 4, point_py + 4, fill="#ff9f1c", outline=""
+            )
+            canvas.create_text(
+                point_px + 10,
+                point_py - 8,
+                text=f"{index}:{point.point_name}",
+                fill="#7f5539",
+                anchor="w",
+                font=("Helvetica", 9, "bold"),
+            )
+
         robot_px, robot_py = self._world_to_canvas(
             self.ros.robot_x,
             self.ros.robot_y,
@@ -708,12 +1188,122 @@ class RobotControlApp:
         py = 8 + inner_h - max(0.0, min(1.0, rel_y)) * inner_h
         return px, py
 
+    def _draw_thermal_view(self):
+        self.thermal_cbar = self._render_thermal_axes(
+            self.thermal_fig,
+            self.thermal_ax,
+            self.thermal_cbar,
+            title="MLX90640 Thermal View",
+        )
+        self.thermal_canvas.draw_idle()
+
+        if self.thermal_popup_fig is not None and self.thermal_popup_ax is not None and self.thermal_popup_canvas is not None:
+            self.thermal_popup_cbar = self._render_thermal_axes(
+                self.thermal_popup_fig,
+                self.thermal_popup_ax,
+                self.thermal_popup_cbar,
+                title="MLX90640 Thermal Detail",
+            )
+            self.thermal_popup_canvas.draw_idle()
+
+    def _render_thermal_axes(self, figure, ax, current_cbar, title):
+        ax.clear()
+
+        if current_cbar is not None:
+            try:
+                current_cbar.remove()
+            except Exception:
+                pass
+            current_cbar = None
+
+        if not self.ros.thermal_frame:
+            ax.text(
+                0.5,
+                0.5,
+                "No /thermal_frame data yet",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=12,
+                color="red",
+            )
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            return current_cbar
+
+        cols = max(1, self.ros.thermal_width)
+        rows = max(1, self.ros.thermal_height)
+        frame = self.ros.thermal_frame[: rows * cols]
+        matrix = [frame[row * cols:(row + 1) * cols] for row in range(rows)]
+        vmin = self.ros.thermal_min if self.ros.thermal_min > 0 else 20.0
+        vmax = self.ros.thermal_max if self.ros.thermal_max > 0 else 75.0
+
+        plot = ax.imshow(matrix, cmap="inferno", vmin=vmin, vmax=vmax)
+        current_cbar = figure.colorbar(plot, ax=ax, shrink=0.82)
+        current_cbar.set_label("Temp (C)", fontsize=9)
+
+        ax.text(
+            0.02,
+            0.95,
+            f"Min: {self.ros.thermal_min:.1f}C",
+            transform=ax.transAxes,
+            color="cyan",
+            fontsize=9,
+            bbox=dict(facecolor="black", alpha=0.5),
+        )
+        ax.text(
+            0.02,
+            0.90,
+            f"Max: {self.ros.thermal_max:.1f}C",
+            transform=ax.transAxes,
+            color="red",
+            fontsize=9,
+            bbox=dict(facecolor="black", alpha=0.5),
+        )
+        ax.text(
+            0.02,
+            0.85,
+            f"Avg: {self.ros.thermal_avg:.1f}C",
+            transform=ax.transAxes,
+            color="lime",
+            fontsize=9,
+            bbox=dict(facecolor="black", alpha=0.5),
+        )
+
+        if self.ros.thermal_change_ready:
+            delta_text = f"Delta/min: {self.ros.thermal_change_per_min:.1f}C"
+            delta_color = "red" if self.ros.thermal_change_per_min > 0 else "cyan"
+        else:
+            delta_text = "Delta/min: collecting..."
+            delta_color = "white"
+        ax.text(
+            0.02,
+            0.80,
+            delta_text,
+            transform=ax.transAxes,
+            color=delta_color,
+            fontsize=9,
+            bbox=dict(facecolor="black", alpha=0.5),
+        )
+
+        ax.set_xlabel("Pixel X (32)", fontsize=9)
+        ax.set_ylabel("Pixel Y (24)", fontsize=9)
+        ax.set_title(title, fontsize=11)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return current_cbar
+
     def on_close(self):
         try:
             self.stop_robot()
+            self.stop_thermal()
             self.launch_manager.stop()
             self.ros.shutdown()
         finally:
+            if self.thermal_window is not None and self.thermal_window.winfo_exists():
+                self._close_thermal_window()
             self.root.destroy()
 
 
