@@ -111,11 +111,10 @@ local_costmap:
       height: 4
       resolution: 0.05
       robot_radius: 0.18
-      inflation_radius: 0.25
-      cost_scaling_factor: 2.0
+      inflation_radius: 0.18
+      cost_scaling_factor: 4.0
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
-        plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
         observation_sources: laser
         laser:
@@ -144,8 +143,8 @@ global_costmap:
       rolling_window: false
       resolution: 0.03
       robot_radius: 0.18
-      inflation_radius: 0.25
-      cost_scaling_factor: 2.0
+      inflation_radius: 0.18
+      cost_scaling_factor: 4.0
       plugins: ["static_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
