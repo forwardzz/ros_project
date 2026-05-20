@@ -1,9 +1,5 @@
-import os
-
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
@@ -17,10 +13,6 @@ def generate_launch_description():
     nav2_param_path = PathJoinSubstitution(
         [FindPackageShare("mapping_bringup"), "config", "nav2_params.yaml"]
     )
-    ekf_config_path = PathJoinSubstitution(
-        [FindPackageShare("mapping_bringup"), "config", "ekf.yaml"]
-    )
-
     return LaunchDescription([
         DeclareLaunchArgument(
             name="map",
@@ -46,11 +38,6 @@ def generate_launch_description():
             name="lidar_z",
             default_value="0.15",
             description="Lidar mounting height (m)",
-        ),
-        DeclareLaunchArgument(
-            name="imu_z",
-            default_value="0.1",
-            description="IMU mounting height (m)",
         ),
         DeclareLaunchArgument(
             name="use_rviz",
@@ -89,29 +76,6 @@ def generate_launch_description():
                 "--child-frame-id", LaunchConfiguration("lidar_frame_id"),
             ],
         ),
-        Node(
-            package="tf2_ros",
-            executable="static_transform_publisher",
-            name="base_to_imu",
-            arguments=[
-                "--x", "0", "--y", "0", "--z", LaunchConfiguration("imu_z"),
-                "--roll", "0", "--pitch", "0", "--yaw", "0",
-                "--frame-id", "base_link",
-                "--child-frame-id", "imu_link",
-            ],
-        ),
-        Node(
-            package="tf2_ros",
-            executable="static_transform_publisher",
-            name="odom_to_base_link_fallback",
-            arguments=[
-                "--x", "0", "--y", "0", "--z", "0",
-                "--roll", "0", "--pitch", "0", "--yaw", "0",
-                "--frame-id", "odom",
-                "--child-frame-id", "base_link",
-            ],
-        ),
-
         # ===== Odometry =====
 
         Node(
@@ -121,7 +85,7 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "laser_scan_topic": "/scan",
-                "odom_topic": "/laser_odom",
+                "odom_topic": "/odom",
                 "publish_tf": False,
                 "base_frame_id": "base_link",
                 "odom_frame_id": "odom",
@@ -135,14 +99,6 @@ def generate_launch_description():
             executable="tracked_motor_driver",
             name="motor_driver",
             output="screen",
-        ),
-
-        Node(
-            package="robot_localization",
-            executable="ekf_node",
-            name="ekf_filter_node",
-            output="screen",
-            parameters=[ekf_config_path],
         ),
 
         # ===== Nav2 =====
