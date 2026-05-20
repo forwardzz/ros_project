@@ -1,0 +1,27 @@
+ekf_filter_node:
+  ros__parameters:
+    frequency: 20.0
+    sensor_timeout: 0.2
+    two_d_mode: true
+
+    odom_frame: odom
+    map_frame: map
+    base_link_frame: base_link
+    world_frame: odom
+
+    # IMU: roll, pitch (gravity ref), angular velocity Z, linear acceleration X/Y
+    # yaw disabled — magnetometer drifts during rotation, use laser odom yaw instead
+    imu0: /imu/data_raw
+    imu0_config: [false, false, false,
+                  true,  true,  false,
+                  false, false, false,
+                  false, false, true,
+                  true,  true,  false]
+
+    # Laser odometry (rf2o) — X, Y, yaw, Vx, Vyaw from scan matching
+    odom0: /laser_odom
+    odom0_config: [true,  true,  false,
+                   false, false, true,
+                   true,  false, false,
+                   false, false, true,
+                   false, false, false]
