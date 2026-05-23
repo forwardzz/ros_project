@@ -48,7 +48,9 @@ class MissionManager(Node):
         )
         self.create_subscription(OccupancyGrid, "/map", self._map_cb, latched_qos)
         self.create_subscription(PointStamped, "/clicked_point", self._clicked_point_cb, 10)
-        self.create_subscription(PoseStamped, "/goal_pose", self._goal_pose_cb, 10)
+        self.create_subscription(
+            PoseStamped, "/mission_goal_pose", self._goal_pose_cb, 10
+        )
 
         self.preview_pub = self.create_publisher(Path, "/mission_preview_path", latched_qos)
         self.marker_pub = self.create_publisher(MarkerArray, "/mission_points_markers", latched_qos)
@@ -109,13 +111,13 @@ class MissionManager(Node):
         frame_id = msg.header.frame_id or "map"
         if frame_id != "map":
             self.get_logger().warn(
-                f"Ignoring RViz goal pose in frame {frame_id}; use Fixed Frame=map"
+                f"Ignoring RViz mission heading pose in frame {frame_id}; use Fixed Frame=map"
             )
             return
 
         if not self.rviz_points:
             self.get_logger().warn(
-                "Received a 2D Goal Pose but there are no RViz mission points yet"
+                "Received a Mission Heading pose but there are no RViz mission points yet"
             )
             return
 
@@ -131,7 +133,7 @@ class MissionManager(Node):
 
         if closest_index is None or closest_distance is None or closest_distance > 0.75:
             self.get_logger().warn(
-                "Ignoring RViz goal pose because it is not close to any stored mission point"
+                "Ignoring RViz mission heading pose because it is not close to any stored mission point"
             )
             return
 

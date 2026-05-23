@@ -159,9 +159,15 @@ rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rv
 这个配置里已经包含：
 
 - `Publish Point` 工具，发布到 `/clicked_point`
-- `2D Goal Pose` 工具，发布到 `/goal_pose`
+- `2D Goal Pose (Nav)` 工具，发布到 `/goal_pose`
+- `2D Goal Pose (Mission Heading)` 工具，发布到 `/mission_goal_pose`
 - `/mission_points_markers` 任务点标记
 - `/mission_preview_path` 预览路径
+
+两种 `2D Goal Pose` 的用途：
+
+- 仅导航：使用 `2D Goal Pose (Nav)`，机器人会按 Nav2 立即前往目标
+- 任务朝向编辑：使用 `2D Goal Pose (Mission Heading)`，只更新任务点朝向，不触发运动
 
 ### 3. 添加任务点
 
@@ -178,14 +184,14 @@ rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rv
 
 如果某个任务点需要指定朝向：
 
-- 选择 RViz 的 `2D Goal Pose` 工具
+- 选择 RViz 的 `2D Goal Pose (Mission Heading)` 工具
 - 在目标任务点附近按下并拖动箭头
 - `mission_manager` 会把这个朝向写入离该位置最近的 RViz 任务点
 
 约束：
 
-- 只有离现有 RViz 任务点足够近的 `2D Goal Pose` 才会被接受
-- 避免把普通导航目标误当成任务点朝向
+- 只有离现有 RViz 任务点足够近的 `/mission_goal_pose` 才会被接受
+- 普通 `2D Goal Pose (Nav)` 只用于导航，不会再改任务点朝向
 - RViz 里会显示蓝色朝向箭头和文本角度
 
 ### 5. 确认并执行

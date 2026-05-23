@@ -597,7 +597,7 @@ class RobotControlApp:
 
         tk.Label(
             frame,
-            text="Use current pose to create inspection points, then optimize visit order.",
+            text="Use current pose to create inspection points, then optimize visit order.\nRViz mission heading: use 2D Goal Pose (Mission Heading) near a picked point.",
             bg="#ebe6dc",
             font=("Helvetica", 10),
         ).pack(anchor="w", padx=12, pady=(12, 4))
@@ -1015,7 +1015,7 @@ class RobotControlApp:
         if not self.mission_points:
             confirm = messagebox.askyesno(
                 "Start Mission",
-                "No local mission points in UI.\n\nUse the mission points picked in RViz and start execution?",
+                "No local mission points in UI.\n\nUse the mission points picked in RViz and start execution?\n\nTip: Set point heading in RViz with 2D Goal Pose (Mission Heading).",
             )
             if not confirm:
                 return

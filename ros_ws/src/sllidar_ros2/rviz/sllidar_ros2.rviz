@@ -20,6 +20,7 @@ Panels:
   - Class: rviz_common/Tool Properties
     Expanded:
       - /2D Goal Pose1
+      - /2D Goal Pose2
       - /Publish Point1
     Name: Tool Properties
     Splitter Ratio: 0.5886790156364441
@@ -198,12 +199,21 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /initialpose
     - Class: rviz_default_plugins/SetGoal
+      Name: 2D Goal Pose (Nav)
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /goal_pose
+    - Class: rviz_default_plugins/SetGoal
+      Name: 2D Goal Pose (Mission Heading)
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /mission_goal_pose
     - Class: rviz_default_plugins/PublishPoint
       Single click: true
       Topic:
