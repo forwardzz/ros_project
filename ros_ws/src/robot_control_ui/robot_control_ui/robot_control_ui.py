@@ -24,9 +24,11 @@ from rclpy.qos import (
 )
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray
+from std_srvs.srv import Trigger
 
+from robot_mission_utils.inspection_planner import plan_mission_order, preview_current_order as preview_order_route
 from robot_mission_utils.tsp_planner import TSPPlanner
-from robot_monitor_interfaces.msg import InspectionPoint
+from robot_monitor_interfaces.msg import GasData, InspectionPoint
 from robot_monitor_interfaces.srv import ConfirmInspectionPoints, Localize, StartNavigation
 
 matplotlib.use("TkAgg")
@@ -60,12 +62,18 @@ class RosUiAdapter:
         self.thermal_sub = self.node.create_subscription(
             Float32MultiArray, "/thermal_frame", self._thermal_cb, 10
         )
+        self.gas_sub = self.node.create_subscription(
+            GasData, "/gas_data", self._gas_cb, 10
+        )
         self.localize_client = self.node.create_client(Localize, "/localize_robot")
         self.confirm_points_client = self.node.create_client(
             ConfirmInspectionPoints, "/confirm_inspection_points"
         )
         self.start_navigation_client = self.node.create_client(
             StartNavigation, "/start_navigation"
+        )
+        self.clear_rviz_points_client = self.node.create_client(
+            Trigger, "/clear_rviz_points"
         )
 
         self.robot_x = 0.0
@@ -78,6 +86,7 @@ class RosUiAdapter:
         self.last_odom_stamp = 0.0
         self.last_map_stamp = 0.0
         self.last_thermal_stamp = 0.0
+        self.last_gas_stamp = 0.0
         self.thermal_width = 32
         self.thermal_height = 24
         self.thermal_frame = []
@@ -88,6 +97,12 @@ class RosUiAdapter:
         self.thermal_change_ready = False
         self.thermal_baseline_avg = None
         self.thermal_baseline_time = 0.0
+        self.gas_data = {
+            "H2": 0.0,
+            "CO": 0.0,
+            "VOC": 0.0,
+            "Smoke": 0.0,
+        }
 
     def _odom_cb(self, msg):
         self.robot_x = msg.pose.pose.position.x
@@ -106,6 +121,13 @@ class RosUiAdapter:
     def _map_cb(self, msg):
         self.map_data = msg
         self.last_map_stamp = time.time()
+
+    def _gas_cb(self, msg):
+        self.gas_data["H2"] = float(msg.hydrogen_concentration)
+        self.gas_data["CO"] = float(msg.co_concentration)
+        self.gas_data["VOC"] = float(msg.voc_concentration)
+        self.gas_data["Smoke"] = float(msg.smoke_concentration)
+        self.last_gas_stamp = time.time()
 
     def _thermal_cb(self, msg):
         dims = msg.layout.dim
@@ -223,6 +245,7 @@ class LaunchManager:
             "rf2o_laser_odometry",
             "static_transform_publisher",
             "tracked_motor_driver",
+            "gas_sensor_node",
         ]
         if name == "mapping":
             return [
@@ -230,6 +253,7 @@ class LaunchManager:
                 "mapping.launch.py",
                 "slam_toolbox",
                 "thermal_camera_node",
+                "gas_sensor_node",
                 *common,
             ]
         if name == "navigation":
@@ -246,6 +270,7 @@ class LaunchManager:
                 "map_server",
                 "lifecycle_manager_navigation",
                 "thermal_camera_node",
+                "gas_sensor_node",
                 *common,
             ]
         return [
@@ -267,6 +292,7 @@ class LaunchManager:
             "tracked_motor_driver",
             "static_transform_publisher",
             "thermal_camera_node",
+            "gas_sensor_node",
         ]
 
     def _build_remote_command(self, command):
@@ -345,8 +371,8 @@ class LaunchManager:
             self.log_callback("[WARN] Thermal node is already running.")
             return False
 
-        self._run_remote_cleanup(["thermal_camera_node"])
-        command = "ros2 run mapping_bringup thermal_camera_node"
+        self._run_remote_cleanup(["thermal_camera_node", "gas_sensor_node", "sensor_monitor.launch.py"])
+        command = "ros2 launch mapping_bringup sensor_monitor.launch.py"
         self.thermal_process = subprocess.Popen(
             self._build_ssh_invocation(command),
             stdout=subprocess.PIPE,
@@ -371,7 +397,7 @@ class LaunchManager:
         except ProcessLookupError:
             pass
         finally:
-            self._run_remote_cleanup(["thermal_camera_node"])
+            self._run_remote_cleanup(["thermal_camera_node", "gas_sensor_node", "sensor_monitor.launch.py"])
             self.thermal_process = None
 
     def is_thermal_running(self):
@@ -424,6 +450,7 @@ class RobotControlApp:
         self.manual_linear = 0.12
         self.manual_angular = 0.8
         self.pose_history = []
+        self.route_preview = []
         self.mission_points = []
         self.point_counter = 1
         self.tsp_planner = TSPPlanner()
@@ -449,6 +476,11 @@ class RobotControlApp:
         self.map_var_status = tk.StringVar(value="map: no data")
         self.mission_var = tk.StringVar(value="mission: 0 points")
         self.thermal_var = tk.StringVar(value="thermal: no data")
+        self.gas_var = tk.StringVar(value="gas: no data")
+        self.gas_h2_var = tk.StringVar(value="H2: --")
+        self.gas_co_var = tk.StringVar(value="CO: --")
+        self.gas_voc_var = tk.StringVar(value="VOC: --")
+        self.gas_smoke_var = tk.StringVar(value="Smoke: --")
         self.ssh_var = tk.StringVar(value=f"{self.remote_user}@{self.remote_host}")
         self.indicators = {}
 
@@ -604,7 +636,7 @@ class RobotControlApp:
         ttk.Button(buttons, text="Start Mission", command=self.start_mission).grid(
             row=2, column=1, padx=8, pady=4, sticky="ew"
         )
-        ttk.Button(buttons, text="Log Request", command=self.log_navigation_request).grid(
+        ttk.Button(buttons, text="Clear RViz Points", command=self.clear_rviz_points).grid(
             row=2, column=2, padx=(8, 0), pady=4, sticky="ew"
         )
         for col in range(3):
@@ -654,7 +686,21 @@ class RobotControlApp:
             textvariable=self.thermal_var,
             bg="#ebe6dc",
             font=("Helvetica", 10),
-        ).pack(anchor="w", padx=12, pady=(0, 12))
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        gas_frame = tk.Frame(frame, bg="#ebe6dc")
+        gas_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+        for idx, variable in enumerate([self.gas_h2_var, self.gas_co_var, self.gas_voc_var, self.gas_smoke_var]):
+            row = idx // 2
+            col = idx % 2
+            tk.Label(
+                gas_frame,
+                textvariable=variable,
+                bg="#ebe6dc",
+                font=("Helvetica", 10, "bold"),
+                anchor="w",
+                width=18,
+            ).grid(row=row, column=col, sticky="w", padx=(0, 16), pady=2)
 
     def _build_status_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Robot Status", style="Card.TLabelframe")
@@ -662,7 +708,7 @@ class RobotControlApp:
 
         lights = tk.Frame(frame, bg="#ebe6dc")
         lights.pack(fill=tk.X, padx=12, pady=(12, 6))
-        for name in ["SSH", "Laser", "Odom", "Map", "Thermal"]:
+        for name in ["SSH", "Laser", "Odom", "Map", "Thermal", "Gas"]:
             lamp = tk.Frame(lights, bg="#ebe6dc")
             lamp.pack(fill=tk.X, pady=4)
             canvas = tk.Canvas(lamp, width=18, height=18, bg="#ebe6dc", highlightthickness=0)
@@ -679,6 +725,7 @@ class RobotControlApp:
             ("Map", self.map_var_status, "#6d597a"),
             ("Mission", self.mission_var, "#9c6644"),
             ("Thermal", self.thermal_var, "#6b705c"),
+            ("Gas", self.gas_var, "#7c6a0a"),
         ]
         for title, variable, color in cards:
             card = tk.Frame(frame, bg=color, width=440, height=64)
@@ -784,7 +831,7 @@ class RobotControlApp:
 
     def start_thermal(self):
         self._apply_workspace()
-        self.log_queue.put("[INFO] Start standalone thermal camera node.")
+        self.log_queue.put("[INFO] Start thermal and gas sensor nodes.")
         self.launch_manager.start_thermal()
 
     def stop_thermal(self):
@@ -842,6 +889,7 @@ class RobotControlApp:
         point.is_confirmed = True
         self.point_counter += 1
         self.mission_points.append(point)
+        self._set_route_preview([])
         self._sync_point_listbox()
         self.log_queue.put(
             f"[MISSION] add {point.point_name} -> ({point.x:.2f}, {point.y:.2f}, yaw={math.degrees(point.theta):.1f}deg)"
@@ -854,11 +902,13 @@ class RobotControlApp:
             return
         index = selection[0]
         point = self.mission_points.pop(index)
+        self._set_route_preview([])
         self._sync_point_listbox()
         self.log_queue.put(f"[MISSION] delete {point.point_name}")
 
     def clear_points(self):
         self.mission_points.clear()
+        self._set_route_preview([])
         self._sync_point_listbox()
         self.log_queue.put("[MISSION] cleared all points")
 
@@ -866,23 +916,55 @@ class RobotControlApp:
         if len(self.mission_points) < 2:
             self.log_queue.put("[MISSION] need at least 2 points to optimize order")
             return
+
+        original_points = list(self.mission_points)
+        advanced_plan = None
+        if self.ros.map_data is not None:
+            advanced_plan = plan_mission_order(
+                self.ros.map_data,
+                (self.ros.robot_x, self.ros.robot_y),
+                original_points,
+            )
+
+        if advanced_plan:
+            self.mission_points = [original_points[index] for index in advanced_plan.ordered_indices]
+            self._set_route_preview(advanced_plan.preview_path)
+            self._sync_point_listbox()
+            names = " -> ".join(point.point_name for point in self.mission_points)
+            self.log_queue.put(
+                f"[MISSION] obstacle-aware order: {names} | cost={advanced_plan.final_cost:.1f}"
+            )
+            return
+
         anchor = self._make_anchor_point()
-        points = [anchor, *self.mission_points]
+        points = [anchor, *original_points]
         self.tsp_planner.calculate_distance_matrix(points)
         order = self.tsp_planner.solve_tsp_dynamic_programming(points)
         if not order:
             self.log_queue.put("[WARN] mission order optimization returned no route")
+            self._set_route_preview([])
             return
         ordered = [points[idx] for idx in order if idx != 0]
         self.mission_points = ordered
+        preview = self._preview_current_order_plan()
+        self._set_route_preview(preview.preview_path if preview else [])
         self._sync_point_listbox()
         names = " -> ".join(point.point_name for point in self.mission_points)
-        self.log_queue.put(f"[MISSION] optimized order: {names}")
+        self.log_queue.put(f"[MISSION] fallback order: {names}")
 
     def use_current_order(self):
         if not self.mission_points:
             self.log_queue.put("[MISSION] no points in current mission order")
             return
+        preview = self._preview_current_order_plan()
+        if preview:
+            self._set_route_preview(preview.preview_path)
+            self.log_queue.put(
+                f"[MISSION] current order preview ready | cost={preview.final_cost:.1f}"
+            )
+        else:
+            self._set_route_preview([])
+            self.log_queue.put("[WARN] failed to preview current mission order on the map")
         names = " -> ".join(point.point_name for point in self.mission_points)
         self.log_queue.put(f"[MISSION] current order kept: {names}")
 
@@ -895,6 +977,15 @@ class RobotControlApp:
             for point in self.mission_points
         )
         self.log_queue.put(f"[MISSION] StartNavigation request preview: {request_text}")
+
+    def clear_rviz_points(self):
+        request = Trigger.Request()
+
+        def done(result, error):
+            self.root.after(0, lambda: self._handle_clear_rviz_points_result(result, error))
+
+        self.log_queue.put("[MISSION] clearing RViz-picked mission points on robot")
+        self.ros.call_service_async(self.ros.clear_rviz_points_client, request, done)
 
     def check_localization(self):
         request = Localize.Request()
@@ -920,17 +1011,22 @@ class RobotControlApp:
         self.ros.call_service_async(self.ros.confirm_points_client, request, done)
 
     def start_mission(self):
-        if not self.mission_points:
-            messagebox.showinfo("Mission Points", "Add at least one mission point first.")
-            return
-
         request = StartNavigation.Request()
-        request.waypoints = self.mission_points
+        if not self.mission_points:
+            confirm = messagebox.askyesno(
+                "Start Mission",
+                "No local mission points in UI.\n\nUse the mission points picked in RViz and start execution?",
+            )
+            if not confirm:
+                return
+            self.log_queue.put("[MISSION] sending mission using RViz-picked points")
+        else:
+            request.waypoints = self.mission_points
+            self.log_queue.put(f"[MISSION] sending mission with {len(self.mission_points)} UI points")
 
         def done(result, error):
             self.root.after(0, lambda: self._handle_start_mission_result(result, error))
 
-        self.log_queue.put(f"[MISSION] sending mission with {len(self.mission_points)} points")
         self.ros.call_service_async(self.ros.start_navigation_client, request, done, timeout_sec=10.0)
 
     def _apply_workspace(self):
@@ -959,6 +1055,17 @@ class RobotControlApp:
             messagebox.showinfo("Sync Points", result.message)
         else:
             messagebox.showwarning("Sync Points", result.message)
+
+    def _handle_clear_rviz_points_result(self, result, error):
+        if error is not None:
+            self.log_queue.put(f"[ERROR] clear RViz points failed: {error}")
+            messagebox.showerror("Clear RViz Points", error)
+            return
+        self.log_queue.put(f"[MISSION] {result.message}")
+        if result.success:
+            messagebox.showinfo("Clear RViz Points", result.message)
+        else:
+            messagebox.showwarning("Clear RViz Points", result.message)
 
     def _handle_start_mission_result(self, result, error):
         if error is not None:
@@ -1020,6 +1127,24 @@ class RobotControlApp:
             self.thermal_var.set("thermal timeout")
             self._set_indicator("thermal", False, "Thermal: timeout")
 
+        if now - self.ros.last_gas_stamp < 2.0:
+            self.gas_h2_var.set(f"H2: {self.ros.gas_data['H2']:.1f}")
+            self.gas_co_var.set(f"CO: {self.ros.gas_data['CO']:.1f}")
+            self.gas_voc_var.set(f"VOC: {self.ros.gas_data['VOC']:.1f}")
+            self.gas_smoke_var.set(f"Smoke: {self.ros.gas_data['Smoke']:.1f}")
+            self.gas_var.set(
+                f"H2={self.ros.gas_data['H2']:.1f}  CO={self.ros.gas_data['CO']:.1f}  "
+                f"VOC={self.ros.gas_data['VOC']:.1f}  Smoke={self.ros.gas_data['Smoke']:.1f}"
+            )
+            self._set_indicator("gas", True, "Gas: online")
+        else:
+            self.gas_h2_var.set("H2: --")
+            self.gas_co_var.set("CO: --")
+            self.gas_voc_var.set("VOC: --")
+            self.gas_smoke_var.set("Smoke: --")
+            self.gas_var.set("gas timeout")
+            self._set_indicator("gas", False, "Gas: timeout")
+
         ssh_ok = self.launch_manager.last_exit_code in (None, 0) or self.launch_manager.is_running()
         self._set_indicator("ssh", ssh_ok, f"SSH: {self.ssh_var.get()}")
 
@@ -1073,6 +1198,19 @@ class RobotControlApp:
         point.is_confirmed = True
         return point
 
+    def _preview_current_order_plan(self):
+        if self.ros.map_data is None or not self.mission_points:
+            return None
+        return preview_order_route(
+            self.ros.map_data,
+            (self.ros.robot_x, self.ros.robot_y),
+            self.mission_points,
+        )
+
+    def _set_route_preview(self, preview_path):
+        self.route_preview = list(preview_path)
+        self.last_map_render_key = None
+
     def _draw_map_view(self):
         map_msg = self.ros.map_data
         key = (
@@ -1082,6 +1220,7 @@ class RobotControlApp:
             getattr(map_msg.info, "width", 0) if map_msg else 0,
             getattr(map_msg.info, "height", 0) if map_msg else 0,
             int(self.ros.last_map_stamp),
+            len(self.route_preview),
         )
         if key == self.last_map_render_key:
             return
@@ -1141,6 +1280,13 @@ class RobotControlApp:
         if len(trail) >= 4:
             canvas.create_line(*trail, fill="#3a86ff", width=2, smooth=True)
 
+        preview = []
+        for x, y in self.route_preview:
+            px, py = self._world_to_canvas(x, y, origin_x, origin_y, resolution, grid_w, grid_h, inner_w, inner_h)
+            preview.extend([px, py])
+        if len(preview) >= 4:
+            canvas.create_line(*preview, fill="#2a9d8f", width=3, smooth=True)
+
         for index, point in enumerate(self.mission_points, start=1):
             point_px, point_py = self._world_to_canvas(
                 point.x,
@@ -1177,6 +1323,8 @@ class RobotControlApp:
             inner_h,
         )
         canvas.create_oval(robot_px - 5, robot_py - 5, robot_px + 5, robot_py + 5, fill="#e63946", outline="")
+        if self.route_preview:
+            canvas.create_text(18, 36, anchor="nw", text=f"Route preview points: {len(self.route_preview)}", fill="#2a9d8f", font=("Helvetica", 10, "bold"))
         canvas.create_text(18, 18, anchor="nw", text=f"Pose ({self.ros.robot_x:.2f}, {self.ros.robot_y:.2f})", fill="#153243", font=("Helvetica", 10, "bold"))
 
     def _world_to_canvas(self, x, y, origin_x, origin_y, resolution, grid_w, grid_h, inner_w, inner_h):

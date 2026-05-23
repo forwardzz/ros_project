@@ -6,6 +6,9 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
+LIDAR_PORT = "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0"
+
+
 def generate_launch_description():
     cyclone_uri = (
         "<CycloneDDS xmlns='https://cdds.io/config'>"
@@ -33,7 +36,7 @@ def generate_launch_description():
         SetEnvironmentVariable("CYCLONEDDS_URI", cyclone_uri),
         DeclareLaunchArgument(
             name="serial_port",
-            default_value="/dev/rplidar",
+            default_value=LIDAR_PORT,
             description="RPLIDAR serial port",
         ),
         DeclareLaunchArgument(
@@ -57,7 +60,6 @@ def generate_launch_description():
             description="Lidar yaw relative to base_link (rad)",
         ),
 
-        # RPLIDAR
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(sllidar_launch_path),
             launch_arguments={
@@ -67,7 +69,6 @@ def generate_launch_description():
             }.items(),
         ),
 
-        # Static TFs
         Node(
             package="tf2_ros",
             executable="static_transform_publisher",
@@ -80,7 +81,6 @@ def generate_launch_description():
             ],
         ),
 
-        # RF2O laser odometry
         Node(
             package="rf2o_laser_odometry",
             executable="rf2o_laser_odometry_node",
@@ -98,7 +98,6 @@ def generate_launch_description():
             }],
         ),
 
-        # Motor driver
         Node(
             package="mapping_bringup",
             executable="tracked_motor_driver",
@@ -106,14 +105,6 @@ def generate_launch_description():
             output="screen",
         ),
 
-        Node(
-            package="mapping_bringup",
-            executable="thermal_camera_node",
-            name="thermal_camera_node",
-            output="screen",
-        ),
-
-        # SLAM Toolbox (online async mapping)
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(slam_launch_path),
             launch_arguments={

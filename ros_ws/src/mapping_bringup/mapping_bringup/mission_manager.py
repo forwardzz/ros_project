@@ -1,13 +1,17 @@
 import math
 
 import rclpy
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PointStamped, PoseStamped, PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateThroughPoses
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.action import ActionClient
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_srvs.srv import Trigger
+from visualization_msgs.msg import Marker, MarkerArray
 
+from robot_mission_utils.inspection_planner import plan_mission_order, preview_current_order
 from robot_mission_utils.tsp_planner import TSPPlanner
 from robot_monitor_interfaces.msg import InspectionPoint
 from robot_monitor_interfaces.srv import ConfirmInspectionPoints, Localize, StartNavigation
@@ -29,7 +33,11 @@ class MissionManager(Node):
         self.have_odom = False
         self.have_map_pose = False
         self.have_map = False
+        self.map_msg = None
         self.confirmed_points = []
+        self.rviz_points = []
+        self.rviz_ordered_points = []
+        self.rviz_preview_path = []
         self.goal_handle = None
         self.mission_active = False
         self.tsp_planner = TSPPlanner()
@@ -39,6 +47,11 @@ class MissionManager(Node):
             PoseWithCovarianceStamped, "/amcl_pose", self._amcl_pose_cb, 10
         )
         self.create_subscription(OccupancyGrid, "/map", self._map_cb, latched_qos)
+        self.create_subscription(PointStamped, "/clicked_point", self._clicked_point_cb, 10)
+        self.create_subscription(PoseStamped, "/goal_pose", self._goal_pose_cb, 10)
+
+        self.preview_pub = self.create_publisher(Path, "/mission_preview_path", latched_qos)
+        self.marker_pub = self.create_publisher(MarkerArray, "/mission_points_markers", latched_qos)
 
         self.create_service(Localize, "/localize_robot", self._handle_localize)
         self.create_service(
@@ -46,9 +59,8 @@ class MissionManager(Node):
             "/confirm_inspection_points",
             self._handle_confirm_points,
         )
-        self.create_service(
-            StartNavigation, "/start_navigation", self._handle_start_navigation
-        )
+        self.create_service(StartNavigation, "/start_navigation", self._handle_start_navigation)
+        self.create_service(Trigger, "/clear_rviz_points", self._handle_clear_rviz_points)
 
         self.nav_client = ActionClient(self, NavigateThroughPoses, "/navigate_through_poses")
         self.get_logger().info("Mission manager ready")
@@ -64,9 +76,184 @@ class MissionManager(Node):
         self.current_map_pose["y"] = msg.pose.pose.position.y
         self.current_map_pose["theta"] = self._quat_to_yaw(msg.pose.pose.orientation)
         self.have_map_pose = True
+        if self.rviz_points:
+            self._recompute_rviz_plan()
 
-    def _map_cb(self, _msg):
+    def _map_cb(self, msg):
         self.have_map = True
+        self.map_msg = msg
+        if self.rviz_points:
+            self._recompute_rviz_plan()
+
+    def _clicked_point_cb(self, msg):
+        frame_id = msg.header.frame_id or "map"
+        if frame_id != "map":
+            self.get_logger().warn(
+                f"Ignoring RViz point in frame {frame_id}; use RViz Publish Point with Fixed Frame=map"
+            )
+            return
+
+        point = InspectionPoint()
+        point.point_name = f"RVIZ_{len(self.rviz_points) + 1}"
+        point.x = float(msg.point.x)
+        point.y = float(msg.point.y)
+        point.theta = 0.0
+        point.is_confirmed = True
+        self.rviz_points.append(point)
+        self.get_logger().info(
+            f"Added RViz mission point {point.point_name} at ({point.x:.2f}, {point.y:.2f})"
+        )
+        self._recompute_rviz_plan()
+
+    def _goal_pose_cb(self, msg):
+        frame_id = msg.header.frame_id or "map"
+        if frame_id != "map":
+            self.get_logger().warn(
+                f"Ignoring RViz goal pose in frame {frame_id}; use Fixed Frame=map"
+            )
+            return
+
+        if not self.rviz_points:
+            self.get_logger().warn(
+                "Received a 2D Goal Pose but there are no RViz mission points yet"
+            )
+            return
+
+        target_x = float(msg.pose.position.x)
+        target_y = float(msg.pose.position.y)
+        closest_index = None
+        closest_distance = None
+        for index, point in enumerate(self.rviz_points):
+            distance = math.hypot(point.x - target_x, point.y - target_y)
+            if closest_distance is None or distance < closest_distance:
+                closest_distance = distance
+                closest_index = index
+
+        if closest_index is None or closest_distance is None or closest_distance > 0.75:
+            self.get_logger().warn(
+                "Ignoring RViz goal pose because it is not close to any stored mission point"
+            )
+            return
+
+        point = self.rviz_points[closest_index]
+        point.theta = self._quat_to_yaw(msg.pose.orientation)
+        self.get_logger().info(
+            f"Updated heading for {point.point_name} to {math.degrees(point.theta):.1f} deg"
+        )
+        self._publish_rviz_plan_visuals()
+
+    def _recompute_rviz_plan(self):
+        self.rviz_ordered_points = list(self.rviz_points)
+        self.rviz_preview_path = []
+        if not self.rviz_points:
+            self._publish_rviz_plan_visuals()
+            return
+
+        if self.map_msg is not None and self.have_map_pose:
+            advanced_plan = plan_mission_order(
+                self.map_msg,
+                (self.current_map_pose["x"], self.current_map_pose["y"]),
+                self.rviz_points,
+            )
+            if advanced_plan:
+                self.rviz_ordered_points = [
+                    self.rviz_points[index] for index in advanced_plan.ordered_indices
+                ]
+                self.rviz_preview_path = list(advanced_plan.preview_path)
+            else:
+                preview = preview_current_order(
+                    self.map_msg,
+                    (self.current_map_pose["x"], self.current_map_pose["y"]),
+                    self.rviz_points,
+                )
+                if preview:
+                    self.rviz_preview_path = list(preview.preview_path)
+        self._publish_rviz_plan_visuals()
+
+    def _publish_rviz_plan_visuals(self):
+        marker_array = MarkerArray()
+        delete_all = Marker()
+        delete_all.header.frame_id = "map"
+        delete_all.header.stamp = self.get_clock().now().to_msg()
+        delete_all.action = Marker.DELETEALL
+        marker_array.markers.append(delete_all)
+
+        stamp = self.get_clock().now().to_msg()
+        for index, point in enumerate(self.rviz_ordered_points, start=1):
+            marker_id = index * 3
+            sphere = Marker()
+            sphere.header.frame_id = "map"
+            sphere.header.stamp = stamp
+            sphere.ns = "mission_points"
+            sphere.id = marker_id
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = point.x
+            sphere.pose.position.y = point.y
+            sphere.pose.position.z = 0.05
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = 0.14
+            sphere.scale.y = 0.14
+            sphere.scale.z = 0.14
+            sphere.color.r = 1.0
+            sphere.color.g = 0.62
+            sphere.color.b = 0.11
+            sphere.color.a = 0.95
+            marker_array.markers.append(sphere)
+
+            text = Marker()
+            text.header.frame_id = "map"
+            text.header.stamp = stamp
+            text.ns = "mission_labels"
+            text.id = marker_id + 1
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose.position.x = point.x
+            text.pose.position.y = point.y
+            text.pose.position.z = 0.28
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.14
+            text.color.r = 0.16
+            text.color.g = 0.21
+            text.color.b = 0.25
+            text.color.a = 1.0
+            text.text = f"{index}:{point.point_name} ({math.degrees(point.theta):.0f}deg)"
+            marker_array.markers.append(text)
+
+            arrow = Marker()
+            arrow.header.frame_id = "map"
+            arrow.header.stamp = stamp
+            arrow.ns = "mission_heading"
+            arrow.id = marker_id + 2
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.pose.position.x = point.x
+            arrow.pose.position.y = point.y
+            arrow.pose.position.z = 0.08
+            arrow.pose.orientation.z = math.sin(point.theta / 2.0)
+            arrow.pose.orientation.w = math.cos(point.theta / 2.0)
+            arrow.scale.x = 0.24
+            arrow.scale.y = 0.05
+            arrow.scale.z = 0.07
+            arrow.color.r = 0.16
+            arrow.color.g = 0.53
+            arrow.color.b = 0.90
+            arrow.color.a = 0.95
+            marker_array.markers.append(arrow)
+
+        self.marker_pub.publish(marker_array)
+
+        path_msg = Path()
+        path_msg.header.frame_id = "map"
+        path_msg.header.stamp = stamp
+        for x, y in self.rviz_preview_path:
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+        self.preview_pub.publish(path_msg)
 
     def _handle_localize(self, _request, response):
         pose = self.current_map_pose if self.have_map_pose else self.current_odom
@@ -104,6 +291,17 @@ class MissionManager(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _handle_clear_rviz_points(self, _request, response):
+        count = len(self.rviz_points)
+        self.rviz_points = []
+        self.rviz_ordered_points = []
+        self.rviz_preview_path = []
+        self._publish_rviz_plan_visuals()
+        response.success = True
+        response.message = f"Cleared {count} RViz mission points"
+        self.get_logger().info(response.message)
+        return response
+
     def _handle_start_navigation(self, request, response):
         if self.mission_active:
             response.success = False
@@ -111,6 +309,10 @@ class MissionManager(Node):
             return response
 
         points = list(request.waypoints) if request.waypoints else list(self.confirmed_points)
+        source = "request"
+        if not points and self.rviz_points:
+            points = list(self.rviz_points)
+            source = "rviz"
         if not points:
             response.success = False
             response.message = "No mission points available"
@@ -121,7 +323,7 @@ class MissionManager(Node):
             response.message = "AMCL pose unavailable. Set the initial pose before starting a mission."
             return response
 
-        if not self.have_map:
+        if not self.have_map or self.map_msg is None:
             response.success = False
             response.message = "No /map data received"
             return response
@@ -132,6 +334,9 @@ class MissionManager(Node):
             return response
 
         ordered_points = self._order_points(points)
+        if source == "rviz" and self.rviz_ordered_points:
+            ordered_points = list(self.rviz_ordered_points)
+
         goal = NavigateThroughPoses.Goal()
         goal.poses = [self._inspection_point_to_pose(point) for point in ordered_points]
 
@@ -143,13 +348,28 @@ class MissionManager(Node):
 
         names = " -> ".join(point.point_name for point in ordered_points)
         response.success = True
-        response.message = f"Mission goal sent with {len(ordered_points)} points: {names}"
+        response.message = f"Mission goal sent with {len(ordered_points)} points from {source}: {names}"
         self.get_logger().info(response.message)
         return response
 
     def _order_points(self, points):
         if len(points) < 2:
             return points
+
+        advanced_plan = None
+        if self.map_msg is not None and self.have_map_pose:
+            advanced_plan = plan_mission_order(
+                self.map_msg,
+                (self.current_map_pose["x"], self.current_map_pose["y"]),
+                points,
+            )
+        if advanced_plan:
+            ordered = [points[index] for index in advanced_plan.ordered_indices]
+            self.get_logger().info(
+                "Advanced mission planner selected order: %s"
+                % " -> ".join(point.point_name for point in ordered)
+            )
+            return ordered
 
         anchor = InspectionPoint()
         anchor.point_name = "ROBOT"
@@ -162,8 +382,13 @@ class MissionManager(Node):
         self.tsp_planner.calculate_distance_matrix(candidates)
         order = self.tsp_planner.solve_tsp_dynamic_programming(candidates)
         if not order:
+            self.get_logger().warn("Mission planner fallback kept the original point order")
             return points
-        return [candidates[index] for index in order if index != 0]
+        ordered = [candidates[index] for index in order if index != 0]
+        self.get_logger().warn(
+            "Advanced mission planner unavailable, falling back to Euclidean TSP order"
+        )
+        return ordered
 
     def _inspection_point_to_pose(self, point):
         pose = PoseStamped()
@@ -236,8 +461,9 @@ def main(args=None):
     node = MissionManager()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

@@ -6,6 +6,9 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
+LIDAR_PORT = "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0"
+
+
 def generate_launch_description():
     cyclone_uri = (
         "<CycloneDDS xmlns='https://cdds.io/config'>"
@@ -32,7 +35,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             name="serial_port",
-            default_value="/dev/rplidar",
+            default_value=LIDAR_PORT,
             description="RPLIDAR serial port",
         ),
         DeclareLaunchArgument(
@@ -61,8 +64,6 @@ def generate_launch_description():
             description="Launch RViz on the robot",
         ),
 
-        # ===== Sensors =====
-
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(sllidar_launch_path),
             launch_arguments={
@@ -71,15 +72,6 @@ def generate_launch_description():
                 "frame_id": LaunchConfiguration("lidar_frame_id"),
             }.items(),
         ),
-
-        # Node(
-        #     package="imu_ros2_device",
-        #     executable="ybimu_driver",
-        #     name="ybimu_node",
-        #     output="screen",
-        # ),
-
-        # ===== Static TFs =====
 
         Node(
             package="tf2_ros",
@@ -92,7 +84,6 @@ def generate_launch_description():
                 "--child-frame-id", LaunchConfiguration("lidar_frame_id"),
             ],
         ),
-        # ===== Odometry =====
 
         Node(
             package="rf2o_laser_odometry",
@@ -124,15 +115,6 @@ def generate_launch_description():
             name="mission_manager",
             output="screen",
         ),
-
-        Node(
-            package="mapping_bringup",
-            executable="thermal_camera_node",
-            name="thermal_camera_node",
-            output="screen",
-        ),
-
-        # ===== Nav2 =====
 
         Node(
             package="nav2_map_server",

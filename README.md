@@ -129,6 +129,91 @@ ros2 launch mapping_bringup navigation.launch.py map:=/home/yy/ros2_ws/map_name.
 - 导航时是 `map_server + amcl` 在管理 `map`
 - 两套同时运行会导致 TF 冲突、初始位姿异常、坐标轴乱跳
 
+## RViz 任务点模式
+
+现在支持直接在 RViz 里选任务点，再由你确认后执行。这个模式适合巡检或多点导航。
+
+### 1. 启动导航
+
+先启动导航，而不是建图：
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 launch mapping_bringup navigation.launch.py map:=/home/yy/ros2_ws/map_name.yaml
+```
+
+然后在 RViz 里先用 `2D Pose Estimate` 设定机器人初始位姿。
+
+### 2. 打开推荐 RViz 配置
+
+本机推荐直接使用项目里的 RViz 配置：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/install/setup.bash
+rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rviz/sllidar_ros2.rviz
+```
+
+这个配置里已经包含：
+
+- `Publish Point` 工具，发布到 `/clicked_point`
+- `2D Goal Pose` 工具，发布到 `/goal_pose`
+- `/mission_points_markers` 任务点标记
+- `/mission_preview_path` 预览路径
+
+### 3. 添加任务点
+
+在 RViz 顶部工具栏选择 `Publish Point`，在地图上逐个点击任务点。
+
+每点击一次：
+
+- `mission_manager` 会记录一个 RViz 任务点
+- RViz 中会显示编号标记
+- 系统会自动重新计算访问顺序
+- 绿色路径会显示当前预览路线
+
+### 4. 给任务点指定朝向
+
+如果某个任务点需要指定朝向：
+
+- 选择 RViz 的 `2D Goal Pose` 工具
+- 在目标任务点附近按下并拖动箭头
+- `mission_manager` 会把这个朝向写入离该位置最近的 RViz 任务点
+
+约束：
+
+- 只有离现有 RViz 任务点足够近的 `2D Goal Pose` 才会被接受
+- 避免把普通导航目标误当成任务点朝向
+- RViz 里会显示蓝色朝向箭头和文本角度
+
+### 5. 确认并执行
+
+打开本机的 `robot_control_ui` 后：
+
+- 如果 UI 本地点位列表为空，点 `Start Mission`
+- UI 会询问是否使用 RViz 中已选择的任务点
+- 确认后，机器人会按规划顺序执行这些点
+
+### 6. 清空 RViz 任务点
+
+在 `robot_control_ui` 里点 `Clear RViz Points`，会清空：
+
+- 机器人端缓存的 RViz 任务点
+- RViz 中的任务点标记
+- 预览路径
+
+## UI 本地点位模式
+
+除了 RViz 模式，UI 里原来的任务点模式仍然保留：
+
+- `Add Current Pose` 把当前机器人位姿加入任务列表
+- `Optimize Order` 基于地图障碍计算访问顺序
+- `Current Order` 保持当前顺序，只刷新路径预览
+- `Sync Points` 把 UI 任务点同步到机器人
+- `Start Mission` 用 UI 里的任务点执行任务
+
 ## 本地电脑显示 UI
 
 推荐模式：
@@ -189,6 +274,13 @@ UI 当前集成：
 - 内嵌地图显示 `/map`、机器人位置和轨迹
 - 状态灯显示 `SSH / scan / odom / map`
 - 显示运行日志
+
+传感器说明：
+
+- `Start Mapping` 和 `Start Navigation` 现在只启动建图/导航主链路
+- 红外热成像和气体传感器不会跟着建图或导航一起启动
+- 需要时单独点 UI 里的 `Start Thermal`，会同时启动热成像和气体传感器
+- `Stop Thermal` 会同时停止这两个传感器节点
 
 ## 手动控制
 
