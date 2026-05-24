@@ -335,9 +335,10 @@ class MissionManager(Node):
             response.message = "Nav2 action server /navigate_through_poses is not ready"
             return response
 
-        ordered_points = self._order_points(points)
-        if source == "rviz" and self.rviz_ordered_points:
-            ordered_points = list(self.rviz_ordered_points)
+        # Execute waypoints in the exact order the user provided. Route preview
+        # may be optimized separately, but mission execution should not silently
+        # reorder points and skip the user's intended first stop.
+        ordered_points = list(points)
 
         goal = NavigateThroughPoses.Goal()
         goal.poses = [self._inspection_point_to_pose(point) for point in ordered_points]
