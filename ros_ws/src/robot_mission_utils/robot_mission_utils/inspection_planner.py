@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .bidirectional_astar import bidirectional_astar
 from .grid_map import GridMap
 from .lazy_theta_star import lazy_theta_star
-from .map_inflation import resolve_planning_map
+from .map_inflation import inflate_map, resolve_planning_map
 from .path_collision import bresenham_cells, validate_path_segments
 from .path_smoothing import smooth_path
 
@@ -39,6 +39,12 @@ class MissionPlan:
     raw_cost: float
     final_cost: float
     inflation_cells: int = 0
+
+
+@dataclass(frozen=True)
+class MissionValidation:
+    valid: bool
+    message: str
 
 
 def path_cost(path: Sequence[Point]) -> float:
@@ -360,3 +366,42 @@ def preview_current_order(map_msg, start_xy: Tuple[float, float], points: Sequen
         final_cost=path_cost(final_path),
         inflation_cells=inflation_cells,
     )
+
+
+
+def validate_mission_points(
+    map_msg,
+    start_xy: Tuple[float, float],
+    points: Sequence[object],
+    obstacle_margin_m: float = 0.12,
+    min_start_distance_m: float = 0.18,
+) -> MissionValidation:
+    if not points:
+        return MissionValidation(False, 'No mission points available')
+
+    grid_map = GridMap.from_occupancy_grid(map_msg)
+    start = grid_map.world_to_grid(start_xy[0], start_xy[1])
+    if not grid_map.is_valid(start[0], start[1]):
+        return MissionValidation(False, 'Robot pose is invalid on the current map. Re-localize before starting a mission.')
+
+    first_x, first_y = _extract_xy(points[0])
+    if math.hypot(first_x - start_xy[0], first_y - start_xy[1]) < min_start_distance_m:
+        name = getattr(points[0], 'point_name', '') or 'Unnamed'
+        return MissionValidation(False, f'Mission point {name} is too close to the robot start pose. Move it at least {min_start_distance_m:.2f} m away before starting navigation.')
+
+    inflated_map, _ = inflate_map(grid_map, radius_m=obstacle_margin_m)
+    for point in points:
+        gx, gy = grid_map.world_to_grid(*_extract_xy(point))
+        name = getattr(point, 'point_name', '') or 'Unnamed'
+        if not grid_map.in_bounds(gx, gy):
+            return MissionValidation(False, f'Mission point {name} is outside the current map bounds')
+        if not grid_map.is_valid(gx, gy):
+            return MissionValidation(False, f'Mission point {name} is in an obstacle or unknown area')
+        if not inflated_map.is_valid(gx, gy):
+            return MissionValidation(False, f'Mission point {name} is too close to an obstacle. Move it farther away before starting navigation.')
+
+    preview = preview_current_order(map_msg, start_xy, points, smooth=False)
+    if preview is None:
+        return MissionValidation(False, 'The selected mission points do not have a collision-free path in the current order. Adjust the points before starting navigation.')
+
+    return MissionValidation(True, f'Mission points validated: {len(points)} safe waypoint(s) ready')

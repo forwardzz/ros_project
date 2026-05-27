@@ -28,7 +28,7 @@ from std_srvs.srv import Trigger
 
 from robot_mission_utils.inspection_planner import plan_mission_order, preview_current_order as preview_order_route
 from robot_mission_utils.tsp_planner import TSPPlanner
-from robot_monitor_interfaces.msg import GasData, InspectionPoint
+from robot_monitor_interfaces.msg import GasData, InspectionPoint, RobotSafetyStatus
 from robot_monitor_interfaces.srv import ConfirmInspectionPoints, Localize, StartNavigation
 
 matplotlib.use("TkAgg")
@@ -65,6 +65,9 @@ class RosUiAdapter:
         self.gas_sub = self.node.create_subscription(
             GasData, "/gas_data", self._gas_cb, 10
         )
+        self.safety_sub = self.node.create_subscription(
+            RobotSafetyStatus, "/robot_safety_status", self._safety_cb, map_qos
+        )
         self.localize_client = self.node.create_client(Localize, "/localize_robot")
         self.confirm_points_client = self.node.create_client(
             ConfirmInspectionPoints, "/confirm_inspection_points"
@@ -74,6 +77,9 @@ class RosUiAdapter:
         )
         self.clear_rviz_points_client = self.node.create_client(
             Trigger, "/clear_rviz_points"
+        )
+        self.reset_safety_client = self.node.create_client(
+            Trigger, "/reset_safety_monitor"
         )
 
         self.robot_x = 0.0
@@ -103,6 +109,13 @@ class RosUiAdapter:
             "VOC": 0.0,
             "Smoke": 0.0,
         }
+        self.safety_level = 'WAITING'
+        self.safety_code = 'INIT'
+        self.safety_message = 'No safety data'
+        self.safety_mission_active = False
+        self.last_safety_stamp = 0.0
+        self.pending_safety_alert = None
+        self.last_safety_alert_signature = None
 
     def _odom_cb(self, msg):
         self.robot_x = msg.pose.pose.position.x
@@ -152,6 +165,17 @@ class RosUiAdapter:
             self.thermal_baseline_avg = self.thermal_avg
             self.thermal_baseline_time = now
         self.last_thermal_stamp = time.time()
+
+    def _safety_cb(self, msg):
+        self.safety_level = msg.level or 'WAITING'
+        self.safety_code = msg.code or 'UNKNOWN'
+        self.safety_message = msg.message or 'No details'
+        self.safety_mission_active = bool(msg.mission_active)
+        self.last_safety_stamp = time.time()
+        signature = (self.safety_level, self.safety_code, self.safety_message)
+        if self.safety_level in ('WARN', 'FAULT') and signature != self.last_safety_alert_signature:
+            self.pending_safety_alert = signature
+            self.last_safety_alert_signature = signature
 
     def publish_cmd_vel(self, linear_x=0.0, angular_z=0.0):
         msg = Twist()
@@ -430,7 +454,7 @@ class RobotControlApp:
             "remote_user", "yy"
         ).value
         self.remote_host = self.node.declare_parameter(
-            "remote_host", "192.168.43.16"
+            "remote_host", "192.168.43.21"
         ).value
         self.ros_setup_path = self.node.declare_parameter(
             "ros_setup_path", "/opt/ros/jazzy/setup.bash"
@@ -475,6 +499,7 @@ class RobotControlApp:
         self.odom_var = tk.StringVar(value="odom: no data")
         self.map_var_status = tk.StringVar(value="map: no data")
         self.mission_var = tk.StringVar(value="mission: 0 points")
+        self.safety_var = tk.StringVar(value="safety: waiting")
         self.thermal_var = tk.StringVar(value="thermal: no data")
         self.gas_var = tk.StringVar(value="gas: no data")
         self.gas_h2_var = tk.StringVar(value="H2: --")
@@ -572,6 +597,9 @@ class RobotControlApp:
         )
         ttk.Button(buttons, text="Save Map", style="Primary.TButton", command=self.save_map).pack(
             side=tk.LEFT, padx=10
+        )
+        ttk.Button(buttons, text="Reset Safety", command=self.reset_safety).pack(
+            side=tk.RIGHT, padx=(10, 0)
         )
         ttk.Button(buttons, text="Stop Launch", style="Danger.TButton", command=self.stop_launch).pack(
             side=tk.RIGHT
@@ -708,7 +736,7 @@ class RobotControlApp:
 
         lights = tk.Frame(frame, bg="#ebe6dc")
         lights.pack(fill=tk.X, padx=12, pady=(12, 6))
-        for name in ["SSH", "Laser", "Odom", "Map", "Thermal", "Gas"]:
+        for name in ["SSH", "Laser", "Odom", "Map", "Safety", "Thermal", "Gas"]:
             lamp = tk.Frame(lights, bg="#ebe6dc")
             lamp.pack(fill=tk.X, pady=4)
             canvas = tk.Canvas(lamp, width=18, height=18, bg="#ebe6dc", highlightthickness=0)
@@ -724,6 +752,7 @@ class RobotControlApp:
             ("Odometry", self.odom_var, "#bc4b51"),
             ("Map", self.map_var_status, "#6d597a"),
             ("Mission", self.mission_var, "#9c6644"),
+            ("Safety", self.safety_var, "#8b1e3f"),
             ("Thermal", self.thermal_var, "#6b705c"),
             ("Gas", self.gas_var, "#7c6a0a"),
         ]
@@ -1011,6 +1040,13 @@ class RobotControlApp:
         self.ros.call_service_async(self.ros.confirm_points_client, request, done)
 
     def start_mission(self):
+        if self.ros.safety_level == "FAULT":
+            messagebox.showerror(
+                "Start Mission",
+                f"Safety fault is latched: {self.ros.safety_message}\n\nReset Safety before starting a new mission.",
+            )
+            return
+
         request = StartNavigation.Request()
         if not self.mission_points:
             confirm = messagebox.askyesno(
@@ -1028,6 +1064,15 @@ class RobotControlApp:
             self.root.after(0, lambda: self._handle_start_mission_result(result, error))
 
         self.ros.call_service_async(self.ros.start_navigation_client, request, done, timeout_sec=10.0)
+
+    def reset_safety(self):
+        request = Trigger.Request()
+
+        def done(result, error):
+            self.root.after(0, lambda: self._handle_reset_safety_result(result, error))
+
+        self.log_queue.put("[SAFETY] reset requested")
+        self.ros.call_service_async(self.ros.reset_safety_client, request, done)
 
     def _apply_workspace(self):
         self.launch_manager.workspace_path = self.workspace_var.get().strip() or self.workspace_path
@@ -1067,6 +1112,17 @@ class RobotControlApp:
         else:
             messagebox.showwarning("Clear RViz Points", result.message)
 
+    def _handle_reset_safety_result(self, result, error):
+        if error is not None:
+            self.log_queue.put(f"[ERROR] reset safety failed: {error}")
+            messagebox.showerror("Reset Safety", error)
+            return
+        self.log_queue.put(f"[SAFETY] {result.message}")
+        if result.success:
+            messagebox.showinfo("Reset Safety", result.message)
+        else:
+            messagebox.showwarning("Reset Safety", result.message)
+
     def _handle_start_mission_result(self, result, error):
         if error is not None:
             self.log_queue.put(f"[ERROR] mission start failed: {error}")
@@ -1080,6 +1136,7 @@ class RobotControlApp:
 
     def _schedule_update(self):
         self._flush_logs()
+        self._handle_safety_alert()
         self._refresh_status()
         self.root.after(200, self._schedule_update)
 
@@ -1088,6 +1145,17 @@ class RobotControlApp:
             line = self.log_queue.get_nowait()
             self.log_text.insert(tk.END, line + "\n")
             self.log_text.see(tk.END)
+
+    def _handle_safety_alert(self):
+        if self.ros.pending_safety_alert is None:
+            return
+        level, code, message = self.ros.pending_safety_alert
+        self.ros.pending_safety_alert = None
+        self.log_queue.put(f"[SAFETY] {code}: {message}")
+        if level == "FAULT":
+            messagebox.showerror("Safety Fault", message)
+        elif level == "WARN":
+            messagebox.showwarning("Safety Warning", message)
 
     def _refresh_status(self):
         now = time.time()
@@ -1117,6 +1185,18 @@ class RobotControlApp:
         else:
             self.map_var_status.set("map timeout")
             self._set_indicator("map", False, "Map: timeout")
+
+        if now - self.ros.last_safety_stamp < 3.0:
+            self.safety_var.set(f"{self.ros.safety_level}: {self.ros.safety_message}")
+            if self.ros.safety_level == 'FAULT':
+                self._set_indicator_state('safety', '#d00000', f"Safety: {self.ros.safety_code}")
+            elif self.ros.safety_level == 'WARN':
+                self._set_indicator_state('safety', '#f77f00', f"Safety: {self.ros.safety_code}")
+            else:
+                self._set_indicator_state('safety', '#2dc653', f"Safety: {self.ros.safety_code}")
+        else:
+            self.safety_var.set('safety: waiting')
+            self._set_indicator_state('safety', '#8f8f8f', 'Safety: waiting')
 
         if now - self.ros.last_thermal_stamp < 2.0 and self.ros.thermal_frame:
             self.thermal_var.set(
@@ -1148,7 +1228,9 @@ class RobotControlApp:
         ssh_ok = self.launch_manager.last_exit_code in (None, 0) or self.launch_manager.is_running()
         self._set_indicator("ssh", ssh_ok, f"SSH: {self.ssh_var.get()}")
 
-        if self.launch_manager.is_running():
+        if self.ros.safety_level == 'FAULT':
+            self.status_var.set(f"FAULT: {self.ros.safety_code}")
+        elif self.launch_manager.is_running():
             self.status_var.set(f"Running: {self.launch_manager.active_name}")
         else:
             self.status_var.set("Idle")
@@ -1158,10 +1240,13 @@ class RobotControlApp:
         self._draw_thermal_view()
 
     def _set_indicator(self, key, ok, text):
+        color = '#2dc653' if ok else '#d00000'
+        self._set_indicator_state(key, color, text)
+
+    def _set_indicator_state(self, key, color, text):
         canvas, label = self.indicators[key]
-        color = "#2dc653" if ok else "#d00000"
-        canvas.delete("all")
-        canvas.create_oval(2, 2, 16, 16, fill=color, outline="")
+        canvas.delete('all')
+        canvas.create_oval(2, 2, 16, 16, fill=color, outline='')
         label.config(text=text)
 
     def _record_pose(self):

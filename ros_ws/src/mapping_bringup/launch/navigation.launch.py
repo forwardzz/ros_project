@@ -117,6 +117,13 @@ def generate_launch_description():
         ),
 
         Node(
+            package="mapping_bringup",
+            executable="safety_monitor",
+            name="safety_monitor",
+            output="screen",
+        ),
+
+        Node(
             package="nav2_map_server",
             executable="map_server",
             name="map_server",

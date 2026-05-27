@@ -13,6 +13,7 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GasData.msg"
   "msg/InspectionPoint.msg"
+  "msg/RobotSafetyStatus.msg"
   "srv/LoadMap.srv"
   "srv/ConfirmInspectionPoints.srv"
   "srv/Localize.srv"

@@ -162,7 +162,8 @@ rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rv
 - `2D Goal Pose (Nav)` 工具，发布到 `/goal_pose`
 - `2D Goal Pose (Mission Heading)` 工具，发布到 `/mission_goal_pose`
 - `/mission_points_markers` 任务点标记
-- `/mission_preview_path` 预览路径
+- `/mission_preview_path` 任务预览路径
+- `/plan` Nav2 实际全局路径
 
 两种 `2D Goal Pose` 的用途：
 
@@ -178,7 +179,8 @@ rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rv
 - `mission_manager` 会记录一个 RViz 任务点
 - RViz 中会显示编号标记
 - 系统会自动重新计算访问顺序
-- 绿色路径会显示当前预览路线
+- 绿色 `Mission Preview Path` 会显示任务级预览路线
+- 蓝色 `Nav2 Global Path` 会在真正导航时显示 Nav2 当前实际全局路径
 
 ### 4. 给任务点指定朝向
 
@@ -208,7 +210,13 @@ rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rv
 
 - 机器人端缓存的 RViz 任务点
 - RViz 中的任务点标记
-- 预览路径
+- 任务预览路径
+
+两条路径的区别：
+
+- `/mission_preview_path` 是 `mission_manager` 基于任务点和地图计算出的离线路径预览，不是 Nav2 的真实执行路径
+- `/plan` 是 Nav2 当前全局规划器给出的真实全局路径，更接近机器人接下来要走的路线
+- 两者不一致是正常现象，尤其在局部避障、重规划、控制器平滑之后会更明显
 
 ## UI 本地点位模式
 
@@ -263,7 +271,7 @@ export ROS_LOCALHOST_ONLY=0
 ```bash
 ros2 launch robot_control_ui ui.launch.py \
   remote_user:=yy \
-  remote_host:=192.168.43.16 \
+  remote_host:=192.168.43.21 \
   workspace_path:=/home/yy/ros2_ws \
   map_path:=/home/yy/ros2_ws/map_name.yaml
 ```
@@ -278,7 +286,7 @@ UI 当前集成：
 - 手动前进、后退、左转、右转、停止
 - 键盘控制 `W/A/S/D`、方向键、空格停止
 - 内嵌地图显示 `/map`、机器人位置和轨迹
-- 状态灯显示 `SSH / scan / odom / map`
+- 状态灯显示 `SSH / scan / odom / map / safety`
 - 显示运行日志
 
 传感器说明：
@@ -287,6 +295,14 @@ UI 当前集成：
 - 红外热成像和气体传感器不会跟着建图或导航一起启动
 - 需要时单独点 UI 里的 `Start Thermal`，会同时启动热成像和气体传感器
 - `Stop Thermal` 会同时停止这两个传感器节点
+
+安全保护说明：
+
+- 导航链路现在会启动 `safety_monitor`
+- UI 会显示 `Safety` 状态灯和安全状态卡片
+- 如果检测到掉压、连续碰撞恢复或连续无进展，系统会自动取消导航并发送零速度
+- 安全故障锁存时，UI 会阻止新的 `Start Mission`
+- 故障排除后，需要点 UI 里的 `Reset Safety` 才能重新开始任务
 
 ## 手动控制
 
@@ -395,6 +411,30 @@ ros2 daemon stop
 ros2 daemon start
 ```
 
+### 5. 导航安全保护
+
+`Start Mission` 现在会先做启动前检查：
+
+- 任务点不能落在障碍物或未知区
+- 任务点不能太贴近障碍物
+- 第一个点不能离机器人当前位置过近
+- 当前任务点顺序必须存在一条无碰撞预览路径
+
+如果不满足，UI 会直接弹出原因，不会把任务发给 Nav2。
+
+导航运行中还会持续监控：
+
+- 掉压 `undervoltage`
+- 连续 `collision ahead`
+- 连续 `failed to make progress`
+
+触发后行为是：
+
+- 自动取消当前导航任务
+- 发送零速度到 `/cmd_vel`
+- UI 弹出 `Safety Fault`
+- 任务锁存，直到手动 `Reset Safety`
+
 ## 关键话题
 
 - `/scan`：雷达扫描
@@ -434,6 +474,39 @@ RPLIDAR ROS 2 驱动，负责发布 `/scan`。
 - 纯雷达定位对环境特征较敏感，空旷区域、强动态干扰场景下稳定性会下降
 - `imu_ros2_device` 仍在仓库中，但没有物理清理
 - `use_rviz` 参数当前未接入启动逻辑
+- 当前运行时安全保护主要挂在导航链路；建图阶段如果主板直接掉压重启，UI 来不及弹出安全故障
+
+## 建图掉电说明
+
+如果建图时出现“雷达停转、SSH 断开、主板只能重启”，优先按供电问题处理，不要先怀疑 OOM。
+
+这台车当前已经确认过：
+
+- 出现过系统级 `Undervoltage detected!`
+- 最近几次异常结束没有正常关机记录
+- 异常时内存和温度都正常，因此不像 OOM 或过热关机
+
+建图链路当前只启动：
+
+- `sllidar_node`
+- `rf2o_laser_odometry`
+- `tracked_motor_driver`
+- `slam_toolbox`
+
+也就是说，建图掉电通常是“雷达 + 树莓派 + slam_toolbox 负载”把供电余量吃掉了，而不是红外或气体传感器被误启动。
+
+建议优先排查：
+
+- 树莓派 5V 电源是否足够硬
+- 供电线是否过长、过细
+- 电池和降压模块在雷达启动、CPU 升载时是否掉压
+- 雷达是否直接从树莓派 USB 口取电并拉低 5V 轨
+
+如果硬件暂时不改，软件侧可先降建图负载验证：
+
+- `slam.yaml` 的 `resolution` 从 `0.03` 降到 `0.05`
+- `throttle_scans` 从 `1` 改到 `2`
+- `enable_interactive_mode` 从 `true` 改到 `false`
 
 ## 建议排查项
 

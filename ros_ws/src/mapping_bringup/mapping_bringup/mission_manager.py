@@ -1,7 +1,7 @@
 import math
 
 import rclpy
-from geometry_msgs.msg import PointStamped, PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PointStamped, PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateThroughPoses
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.action import ActionClient
@@ -11,7 +11,11 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
-from robot_mission_utils.inspection_planner import plan_mission_order, preview_current_order
+from robot_mission_utils.inspection_planner import (
+    plan_mission_order,
+    preview_current_order,
+    validate_mission_points,
+)
 from robot_mission_utils.tsp_planner import TSPPlanner
 from robot_monitor_interfaces.msg import InspectionPoint
 from robot_monitor_interfaces.srv import ConfirmInspectionPoints, Localize, StartNavigation
@@ -54,6 +58,7 @@ class MissionManager(Node):
 
         self.preview_pub = self.create_publisher(Path, "/mission_preview_path", latched_qos)
         self.marker_pub = self.create_publisher(MarkerArray, "/mission_points_markers", latched_qos)
+        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
         self.create_service(Localize, "/localize_robot", self._handle_localize)
         self.create_service(
@@ -63,6 +68,7 @@ class MissionManager(Node):
         )
         self.create_service(StartNavigation, "/start_navigation", self._handle_start_navigation)
         self.create_service(Trigger, "/clear_rviz_points", self._handle_clear_rviz_points)
+        self.create_service(Trigger, "/abort_mission", self._handle_abort_mission)
 
         self.nav_client = ActionClient(self, NavigateThroughPoses, "/navigate_through_poses")
         self.get_logger().info("Mission manager ready")
@@ -304,6 +310,33 @@ class MissionManager(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _publish_zero_cmd(self):
+        stop = Twist()
+        self.cmd_vel_pub.publish(stop)
+
+    def _handle_abort_mission(self, _request, response):
+        self._publish_zero_cmd()
+        if self.goal_handle is not None:
+            try:
+                self.goal_handle.cancel_goal_async()
+            except Exception as exc:
+                response.success = False
+                response.message = f"Failed to cancel mission: {exc}"
+                self.get_logger().error(response.message)
+                return response
+            self.goal_handle = None
+            self.mission_active = False
+            response.success = True
+            response.message = "Mission abort requested and stop command sent"
+            self.get_logger().warn(response.message)
+            return response
+
+        self.mission_active = False
+        response.success = True
+        response.message = "No active mission. Stop command sent"
+        self.get_logger().warn(response.message)
+        return response
+
     def _handle_start_navigation(self, request, response):
         if self.mission_active:
             response.success = False
@@ -333,6 +366,17 @@ class MissionManager(Node):
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             response.success = False
             response.message = "Nav2 action server /navigate_through_poses is not ready"
+            return response
+
+        validation = validate_mission_points(
+            self.map_msg,
+            (self.current_map_pose["x"], self.current_map_pose["y"]),
+            points,
+        )
+        if not validation.valid:
+            response.success = False
+            response.message = validation.message
+            self.get_logger().warn(f"Mission request rejected: {validation.message}")
             return response
 
         # Execute waypoints in the exact order the user provided. Route preview
