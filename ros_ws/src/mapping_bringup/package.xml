@@ -17,6 +17,8 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
+  <depend>robot_localization</depend>
+  <depend>imu_ros2_device</depend>
   <depend>slam_toolbox</depend>
   <depend>sllidar_ros2</depend>
   <depend>rf2o_laser_odometry</depend>

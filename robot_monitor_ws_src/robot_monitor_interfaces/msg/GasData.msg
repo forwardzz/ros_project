@@ -1,5 +1,0 @@
-float32 hydrogen_concentration
-float32 co_concentration
-float32 voc_concentration
-float32 smoke_concentration
-float64 stamp

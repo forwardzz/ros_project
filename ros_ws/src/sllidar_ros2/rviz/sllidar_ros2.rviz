@@ -10,9 +10,9 @@ Panels:
         - /Map1/Topic1
         - /Nav2 Global Path1
         - /Nav2 Global Path1/Topic1
-        - /Mission Preview Path1
-        - /Mission Preview Path1/Topic1
-        - /Mission Preview Path1/Offset1
+        - /Actual Path1
+        - /Actual Path1/Topic1
+        - /Actual Path1/Offset1
         - /Mission Point Markers1/Topic1
         - /TF1
       Splitter Ratio: 0.5
@@ -147,7 +147,7 @@ Visualization Manager:
       Length: 0.10000000149011612
       Line Style: Lines
       Line Width: 0.05000000074505806
-      Name: Mission Preview Path
+      Name: Actual Path
       Offset:
         X: 0
         Y: 0
@@ -163,7 +163,7 @@ Visualization Manager:
         Filter size: 5
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /mission_preview_path
+        Value: /actual_path
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true

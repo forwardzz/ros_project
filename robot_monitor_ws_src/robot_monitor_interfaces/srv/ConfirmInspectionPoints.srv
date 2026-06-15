@@ -1,4 +1,0 @@
-robot_monitor_interfaces/InspectionPoint[] points
----
-bool success
-string message

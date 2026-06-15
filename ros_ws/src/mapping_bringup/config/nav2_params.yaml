@@ -16,29 +16,29 @@ amcl:
     do_beamskip: false
     global_frame_id: map
     lambda_short: 0.1
-    laser_likelihood_max_dist: 2.0
+    laser_likelihood_max_dist: 3.0
     laser_max_range: 12.0
     laser_min_range: 0.15
     laser_model_type: likelihood_field
     max_beams: 120
-    max_particles: 2000
-    min_particles: 500
+    max_particles: 3000
+    min_particles: 700
     odom_frame_id: odom
     pf_err: 0.05
     pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
     resample_interval: 1
     robot_model_type: nav2_amcl::DifferentialMotionModel
     save_pose_rate: 0.5
-    sigma_hit: 0.2
+    sigma_hit: 0.12
     tf_broadcast: true
     transform_tolerance: 0.5
-    update_min_a: 0.2
-    update_min_d: 0.15
-    z_hit: 0.5
+    update_min_a: 0.1
+    update_min_d: 0.08
+    z_hit: 0.75
     z_max: 0.05
-    z_rand: 0.5
+    z_rand: 0.2
     z_short: 0.05
     scan_topic: /scan
     set_initial_pose: false
@@ -83,14 +83,14 @@ controller_server:
     # ----------------------------------------------------------
     # 到达目标检查器
     # xy_goal_tolerance：位置容差（米），距目标在此范围内算到达
-    # yaw_goal_tolerance：朝向容差（rad），约 5.7°
-    # 如果机器人总在目标附近转圈到不了，调大这两个值
+    # yaw_goal_tolerance：朝向容差（rad）
+    # 履带车目标点附近原地找姿态会产生大电流，任务导航默认忽略最终朝向。
     # ----------------------------------------------------------
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.10
-      yaw_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.18
+      yaw_goal_tolerance: 6.28
 
     # ----------------------------------------------------------
     # Regulated Pure Pursuit 控制器
@@ -117,12 +117,12 @@ controller_server:
       lookahead_time: 1.5
 
       # 原地旋转到目标朝向时的角速度（rad/s）
-      rotate_to_heading_angular_vel: 0.3
+      rotate_to_heading_angular_vel: 0.2
       transform_tolerance: 0.5
       # true = 前视距离随速度缩放（速度越快看得越远）
-      use_velocity_scaled_lookahead_dist: true
+      use_velocity_scaled_lookahead_dist: false
       # 最大角速度（rad/s）：限制转向速度，防止打滑
-      max_angular_vel: 0.8
+      max_angular_vel: 0.45
       # 接近目标时的最小线速度
       min_approach_linear_velocity: 0.05
       # 距目标多远开始减速（米）
@@ -139,13 +139,13 @@ controller_server:
       max_allowed_time_to_collision_up_to_carrot: 1.0
 
       # 代价感知速度缩放：遇到高代价区域自动减速（当前关闭）
-      use_regulated_linear_velocity_scaling: true
+      use_regulated_linear_velocity_scaling: false
       # ----------------------------------------------------------
       # 代价代价速度缩放开关
       # true = 当路径经过代价地图的高代价区域时自动减速
       # false = 不因代价而降速（当前关闭，如果开了机器人可能在靠近障碍时走太慢）
       # ----------------------------------------------------------
-      use_cost_regulated_linear_velocity_scaling: false
+      use_cost_regulated_linear_velocity_scaling: true
       regulated_linear_scaling_min_radius: 0.3
       regulated_linear_scaling_min_speed: 0.08
 
@@ -154,14 +154,14 @@ controller_server:
       # true = 到达目标位置后会额外转到指定朝向
       # 如果不需要精确朝向，设 false 可以更快到达
       # ----------------------------------------------------------
-      use_rotate_to_heading: false
+      use_rotate_to_heading: true
       # 是否允许倒车（false = 始终正向行驶）
       allow_reversing: false
       # 偏差多少角度才触发原地旋转（rad），约 28.6°
-      rotate_to_heading_min_angle: 0.5
+      rotate_to_heading_min_angle: 0.78
       # 加速度限制
-      max_angular_accel: 1.5
-      max_linear_accel: 1.0
+      max_angular_accel: 0.7
+      max_linear_accel: 0.5
 
 # ============================================================
 # 局部代价地图 (Local Costmap)
@@ -191,11 +191,11 @@ local_costmap:
       # 滚动窗口高度（米）
       height: 4
       # 栅格分辨率（米/格）。越小避障越精细，但内存和计算量越大
-      resolution: 0.03
+      resolution: 0.05
 
       # ----------------------------------------------------------
       # 机器人外接矩形 footprint（米）
-      # 用接近实车 20cm x 25cm 的保守矩形，改善窄通道通过性。
+      # 用接近实车 20cm x 25cm 的保守矩形，避免圆形半径低估车体角落。
       # ----------------------------------------------------------
       footprint: "[[0.135, 0.11], [0.135, -0.11], [-0.135, -0.11], [-0.135, 0.11]]"
 
@@ -288,7 +288,7 @@ global_costmap:
       # 比局部代价地图的 0.05 更粗（0.03 会更精细但更慢）。
       # 调小 → 路径规划更精确但更慢；调大 → 更快但路径可能粗糙。
       # ----------------------------------------------------------
-      resolution: 0.03
+      resolution: 0.05
 
       # 机器人外接矩形 footprint（米）—— 和局部代价地图保持一致
       footprint: "[[0.135, 0.11], [0.135, -0.11], [-0.135, -0.11], [-0.135, 0.11]]"
@@ -302,7 +302,7 @@ global_costmap:
       inflation_radius: 0.01
 
       # 代价衰减速率，含义同局部代价地图
-      cost_scaling_factor: 3.0
+      cost_scaling_factor: 8.0
 
       # 全局代价地图插件：先加载静态地图层，再膨胀
       plugins: ["static_layer", "inflation_layer"]
@@ -343,7 +343,7 @@ planner_server:
       # 到达容差（米）：目标点周围多少范围内算"到达"
       # 0.5 表示距离目标 0.5m 以内就认为到了。如果机器人总到不了目标，调大这个值。
       # ----------------------------------------------------------
-      tolerance: 0.5
+      tolerance: 0.15
       # true = 用 A*（更快），false = 用 Dijkstra（更完整但更慢）
       use_astar: true
       # ----------------------------------------------------------
@@ -366,10 +366,7 @@ behavior_server:
     global_footprint_topic: global_costmap/published_footprint
     cycle_frequency: 10.0
     # 恢复行为插件列表
-    behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
-    # spin：原地旋转，用于清除代价地图中的"幽灵障碍"和重新定位
-    spin:
-      plugin: "nav2_behaviors::Spin"
+    behavior_plugins: ["backup", "drive_on_heading", "assisted_teleop", "wait"]
     # backup：后退，用于从死胡同退出
     backup:
       plugin: "nav2_behaviors::BackUp"
@@ -420,19 +417,19 @@ velocity_smoother:
     # ----------------------------------------------------------
     # 速度限制：[线速度x, 线速度y, 角速度z]
     # 履带车没有横向移动，y 始终为 0
-    # 当前最大前进 0.25 m/s，最大转向 0.8 rad/s
+    # 当前最大前进 0.18 m/s，最大转向 0.55 rad/s
     # ----------------------------------------------------------
-    max_velocity: [0.25, 0.0, 0.8]
-    min_velocity: [-0.25, 0.0, -0.8]
+    max_velocity: [0.18, 0.0, 0.55]
+    min_velocity: [-0.18, 0.0, -0.55]
     # ----------------------------------------------------------
     # 加速度限制：[线加速度x, 线加速度y, 角加速度z]
     # 值越大 → 加速越快（响应灵敏但可能打滑）
     # 值越小 → 加速越慢（更平滑但响应迟钝）
     # 如果小车起步或转向太猛，调小这些值
     # ----------------------------------------------------------
-    max_accel: [1.0, 0.0, 1.5]
+    max_accel: [0.35, 0.0, 0.7]
     # 减速度（负值）：越大 → 刹车越猛
-    max_decel: [-1.0, 0.0, -1.5]
+    max_decel: [-0.45, 0.0, -0.9]
     odom_topic: "odom"
     odom_duration: 0.1
     # ----------------------------------------------------------
