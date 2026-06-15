@@ -26,10 +26,13 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import Trigger
 
-from robot_mission_utils.inspection_planner import plan_mission_order, preview_current_order as preview_order_route
-from robot_mission_utils.tsp_planner import TSPPlanner
-from robot_monitor_interfaces.msg import GasData, InspectionPoint, RobotSafetyStatus
-from robot_monitor_interfaces.srv import ConfirmInspectionPoints, Localize, StartNavigation
+from robot_monitor_interfaces.msg import GasData, RobotSafetyStatus
+from robot_monitor_interfaces.srv import Localize, StartNavigation
+
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:
+    get_package_share_directory = None
 
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -69,9 +72,6 @@ class RosUiAdapter:
             RobotSafetyStatus, "/robot_safety_status", self._safety_cb, map_qos
         )
         self.localize_client = self.node.create_client(Localize, "/localize_robot")
-        self.confirm_points_client = self.node.create_client(
-            ConfirmInspectionPoints, "/confirm_inspection_points"
-        )
         self.start_navigation_client = self.node.create_client(
             StartNavigation, "/start_navigation"
         )
@@ -113,6 +113,11 @@ class RosUiAdapter:
         self.safety_code = 'INIT'
         self.safety_message = 'No safety data'
         self.safety_mission_active = False
+        self.safety_voltage_available = False
+        self.safety_measured_voltage_v = float('nan')
+        self.safety_undervoltage_now = False
+        self.safety_undervoltage_seen = False
+        self.safety_throttled_flags = 0
         self.last_safety_stamp = 0.0
         self.pending_safety_alert = None
         self.last_safety_alert_signature = None
@@ -171,6 +176,11 @@ class RosUiAdapter:
         self.safety_code = msg.code or 'UNKNOWN'
         self.safety_message = msg.message or 'No details'
         self.safety_mission_active = bool(msg.mission_active)
+        self.safety_voltage_available = bool(msg.voltage_available)
+        self.safety_measured_voltage_v = float(msg.measured_voltage_v)
+        self.safety_undervoltage_now = bool(msg.undervoltage_now)
+        self.safety_undervoltage_seen = bool(msg.undervoltage_seen)
+        self.safety_throttled_flags = int(msg.throttled_flags)
         self.last_safety_stamp = time.time()
         signature = (self.safety_level, self.safety_code, self.safety_message)
         if self.safety_level in ('WARN', 'FAULT') and signature != self.last_safety_alert_signature:
@@ -269,6 +279,7 @@ class LaunchManager:
             "rf2o_laser_odometry",
             "static_transform_publisher",
             "tracked_motor_driver",
+            "safety_monitor",
             "gas_sensor_node",
         ]
         if name == "mapping":
@@ -474,16 +485,13 @@ class RobotControlApp:
         self.manual_linear = 0.12
         self.manual_angular = 0.8
         self.pose_history = []
-        self.route_preview = []
-        self.mission_points = []
-        self.point_counter = 1
-        self.tsp_planner = TSPPlanner()
         self.last_map_render_key = None
         self.thermal_window = None
         self.thermal_popup_fig = None
         self.thermal_popup_ax = None
         self.thermal_popup_canvas = None
         self.thermal_popup_cbar = None
+        self.logo_image = None
 
         self.root.title("Tracked Robot Control UI")
         self.root.geometry("1280x760")
@@ -498,8 +506,9 @@ class RobotControlApp:
         self.scan_var = tk.StringVar(value="scan: no data")
         self.odom_var = tk.StringVar(value="odom: no data")
         self.map_var_status = tk.StringVar(value="map: no data")
-        self.mission_var = tk.StringVar(value="mission: 0 points")
+        self.mission_var = tk.StringVar(value="mission: RViz mode")
         self.safety_var = tk.StringVar(value="safety: waiting")
+        self.power_var = tk.StringVar(value="power: waiting")
         self.thermal_var = tk.StringVar(value="thermal: no data")
         self.gas_var = tk.StringVar(value="gas: no data")
         self.gas_h2_var = tk.StringVar(value="H2: --")
@@ -521,17 +530,18 @@ class RobotControlApp:
         style.configure("Card.TLabelframe.Label", font=("Helvetica", 12, "bold"))
         style.configure("Primary.TButton", font=("Helvetica", 11, "bold"), padding=10)
         style.configure("Danger.TButton", font=("Helvetica", 11, "bold"), padding=10)
-        style.configure("Drive.TButton", font=("Helvetica", 13, "bold"), padding=14)
+        style.configure("Drive.TButton", font=("Helvetica", 12, "bold"), padding=(6, 10))
 
         header = tk.Frame(self.root, bg="#153243", height=72)
         header.pack(fill=tk.X)
+        self._add_header_logo(header)
         tk.Label(
             header,
             text="Tracked Robot Control Center",
             bg="#153243",
             fg="#f4efe7",
             font=("Helvetica", 22, "bold"),
-        ).pack(side=tk.LEFT, padx=24, pady=18)
+        ).pack(side=tk.LEFT, padx=(8, 24), pady=18)
         tk.Label(
             header,
             textvariable=self.status_var,
@@ -543,20 +553,66 @@ class RobotControlApp:
         body = tk.Frame(self.root, bg="#ebe6dc")
         body.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
 
-        left = tk.Frame(body, bg="#ebe6dc", width=720)
+        left = tk.Frame(body, bg="#ebe6dc", width=800)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         left.pack_propagate(False)
-        right = tk.Frame(body, bg="#ebe6dc", width=500)
+        right = tk.Frame(body, bg="#ebe6dc", width=440)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(18, 0))
         right.pack_propagate(False)
 
         self._build_launch_panel(left)
         self._build_mission_panel(left)
-        self._build_log_panel(left)
+
+        lower = tk.Frame(left, bg="#ebe6dc")
+        lower.pack(fill=tk.BOTH, expand=True)
+        log_col = tk.Frame(lower, bg="#ebe6dc")
+        log_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        status_col = tk.Frame(lower, bg="#ebe6dc", width=380)
+        status_col.pack(side=tk.RIGHT, fill=tk.Y, padx=(18, 0))
+        status_col.pack_propagate(False)
+
+        self._build_log_panel(log_col)
+        self._build_status_panel(status_col)
         self._build_map_panel(right)
         self._build_thermal_panel(right)
-        self._build_status_panel(right)
         self._build_drive_panel(right)
+
+    def _asset_path(self, filename):
+        candidates = []
+        if get_package_share_directory is not None:
+            try:
+                candidates.append(
+                    os.path.join(get_package_share_directory("robot_control_ui"), "assets", filename)
+                )
+            except Exception:
+                pass
+        candidates.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets", filename)))
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _add_header_logo(self, parent):
+        logo_path = self._asset_path("wut_logo.png")
+        if logo_path:
+            try:
+                image = tk.PhotoImage(file=logo_path)
+                factor = max(1, math.ceil(max(image.width() / 48.0, image.height() / 48.0)))
+                self.logo_image = image.subsample(factor, factor)
+                tk.Label(parent, image=self.logo_image, bg="#153243").pack(
+                    side=tk.LEFT, padx=(18, 8), pady=10
+                )
+                return
+            except Exception:
+                self.logo_image = None
+
+        tk.Label(
+            parent,
+            text="武汉理工大学",
+            bg="#153243",
+            fg="#f4efe7",
+            font=("Helvetica", 13, "bold"),
+        ).pack(side=tk.LEFT, padx=(18, 8), pady=18)
 
     def _build_launch_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Mission Control", style="Card.TLabelframe")
@@ -610,7 +666,7 @@ class RobotControlApp:
         frame.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(
             frame,
-            height=18,
+            height=16,
             bg="#101820",
             fg="#d8f3dc",
             insertbackground="#d8f3dc",
@@ -620,52 +676,32 @@ class RobotControlApp:
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
     def _build_mission_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Mission Points", style="Card.TLabelframe")
+        frame = ttk.LabelFrame(parent, text="RViz Mission", style="Card.TLabelframe")
         frame.pack(fill=tk.X, pady=(0, 18))
 
         tk.Label(
             frame,
-            text="Use current pose to create inspection points, then optimize visit order.\nRViz mission heading: use 2D Goal Pose (Mission Heading) near a picked point.",
+            text=(
+                "Use RViz only for mission points.\n"
+                "1. Publish Point: add points\n"
+                "2. 2D Goal Pose (Mission Heading): set point heading\n"
+                "3. Start Mission: execute the RViz points"
+            ),
+            justify="left",
             bg="#ebe6dc",
             font=("Helvetica", 10),
-        ).pack(anchor="w", padx=12, pady=(12, 4))
-
-        list_row = tk.Frame(frame, bg="#ebe6dc")
-        list_row.pack(fill=tk.X, padx=12, pady=(6, 8))
-        self.point_listbox = tk.Listbox(list_row, height=6, font=("Courier New", 10))
-        self.point_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        scroll = ttk.Scrollbar(list_row, orient=tk.VERTICAL, command=self.point_listbox.yview)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.point_listbox.configure(yscrollcommand=scroll.set)
+        ).pack(anchor="w", padx=12, pady=(12, 8))
 
         buttons = tk.Frame(frame, bg="#ebe6dc")
         buttons.pack(fill=tk.X, padx=12, pady=(0, 8))
-        ttk.Button(buttons, text="Add Current Pose", command=self.add_current_pose_point).grid(
+        ttk.Button(buttons, text="Check Localization", command=self.check_localization).grid(
             row=0, column=0, padx=(0, 8), pady=4, sticky="ew"
         )
-        ttk.Button(buttons, text="Delete Selected", command=self.delete_selected_point).grid(
+        ttk.Button(buttons, text="Start Mission", command=self.start_mission).grid(
             row=0, column=1, padx=8, pady=4, sticky="ew"
         )
-        ttk.Button(buttons, text="Clear Points", command=self.clear_points).grid(
-            row=0, column=2, padx=(8, 0), pady=4, sticky="ew"
-        )
-        ttk.Button(buttons, text="Optimize Order", command=self.optimize_points).grid(
-            row=1, column=0, padx=(0, 8), pady=4, sticky="ew"
-        )
-        ttk.Button(buttons, text="Current Order", command=self.use_current_order).grid(
-            row=1, column=1, padx=8, pady=4, sticky="ew"
-        )
-        ttk.Button(buttons, text="Sync Points", command=self.sync_points_to_robot).grid(
-            row=1, column=2, padx=(8, 0), pady=4, sticky="ew"
-        )
-        ttk.Button(buttons, text="Check Localization", command=self.check_localization).grid(
-            row=2, column=0, padx=(0, 8), pady=4, sticky="ew"
-        )
-        ttk.Button(buttons, text="Start Mission", command=self.start_mission).grid(
-            row=2, column=1, padx=8, pady=4, sticky="ew"
-        )
         ttk.Button(buttons, text="Clear RViz Points", command=self.clear_rviz_points).grid(
-            row=2, column=2, padx=(8, 0), pady=4, sticky="ew"
+            row=0, column=2, padx=(8, 0), pady=4, sticky="ew"
         )
         for col in range(3):
             buttons.grid_columnconfigure(col, weight=1)
@@ -732,40 +768,57 @@ class RobotControlApp:
 
     def _build_status_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Robot Status", style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(18, 0))
+        frame.pack(fill=tk.BOTH, expand=True)
 
         lights = tk.Frame(frame, bg="#ebe6dc")
-        lights.pack(fill=tk.X, padx=12, pady=(12, 6))
-        for name in ["SSH", "Laser", "Odom", "Map", "Safety", "Thermal", "Gas"]:
+        lights.pack(fill=tk.X, padx=12, pady=(12, 8))
+        for idx, name in enumerate(["SSH", "Laser", "Odom", "Map", "Safety", "Thermal", "Gas"]):
             lamp = tk.Frame(lights, bg="#ebe6dc")
-            lamp.pack(fill=tk.X, pady=4)
+            row = idx // 2
+            col = idx % 2
+            lamp.grid(row=row, column=col, sticky="w", padx=(0, 10), pady=3)
             canvas = tk.Canvas(lamp, width=18, height=18, bg="#ebe6dc", highlightthickness=0)
             canvas.pack(side=tk.LEFT)
             canvas.create_oval(2, 2, 16, 16, fill="#8f8f8f", outline="")
-            label = tk.Label(lamp, text=f"{name}: waiting", bg="#ebe6dc", font=("Helvetica", 10))
-            label.pack(side=tk.LEFT, padx=8)
+            label = tk.Label(lamp, text=f"{name}: waiting", bg="#ebe6dc", font=("Helvetica", 9))
+            label.pack(side=tk.LEFT, padx=6)
             self.indicators[name.lower()] = (canvas, label)
+        for col in range(2):
+            lights.grid_columnconfigure(col, weight=1)
 
         cards = [
             ("Pose", self.pose_var, "#0f4c5c"),
             ("Laser", self.scan_var, "#437f97"),
             ("Odometry", self.odom_var, "#bc4b51"),
             ("Map", self.map_var_status, "#6d597a"),
-            ("Mission", self.mission_var, "#9c6644"),
             ("Safety", self.safety_var, "#8b1e3f"),
+            ("Power", self.power_var, "#4a5759"),
             ("Thermal", self.thermal_var, "#6b705c"),
             ("Gas", self.gas_var, "#7c6a0a"),
         ]
-        for title, variable, color in cards:
-            card = tk.Frame(frame, bg=color, width=440, height=64)
-            card.pack(fill=tk.X, padx=12, pady=10)
+        cards_frame = tk.Frame(frame, bg="#ebe6dc")
+        cards_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        for idx, (title, variable, color) in enumerate(cards):
+            row = idx // 2
+            col = idx % 2
+            card = tk.Frame(cards_frame, bg=color, width=0, height=64)
+            card.grid(row=idx, column=0, sticky="ew", padx=4, pady=4)
             card.pack_propagate(False)
             tk.Label(card, text=title, bg=color, fg="white", font=("Helvetica", 12, "bold")).pack(
-                anchor="w", padx=12, pady=(10, 4)
+                anchor="w", padx=8, pady=(6, 1)
             )
-            tk.Label(card, textvariable=variable, bg=color, fg="#f7f7f7", font=("Helvetica", 11)).pack(
-                anchor="w", padx=12
+            tk.Label(
+                card,
+                textvariable=variable,
+                bg=color,
+                fg="#f7f7f7",
+                font=("Helvetica", 10),
+                justify="left",
+                wraplength=300,
+            ).pack(
+                anchor="w", padx=8
             )
+        cards_frame.grid_columnconfigure(0, weight=1)
 
     def _build_drive_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Manual Drive", style="Card.TLabelframe")
@@ -781,11 +834,11 @@ class RobotControlApp:
         pad = tk.Frame(frame, bg="#ebe6dc")
         pad.pack(padx=14, pady=14)
 
-        ttk.Button(pad, text="↑", style="Drive.TButton", command=self.drive_forward).grid(row=0, column=1, padx=10, pady=10)
-        ttk.Button(pad, text="←", style="Drive.TButton", command=self.turn_left).grid(row=1, column=0, padx=10, pady=10)
-        ttk.Button(pad, text="STOP", style="Danger.TButton", command=self.stop_robot).grid(row=1, column=1, padx=10, pady=10)
-        ttk.Button(pad, text="→", style="Drive.TButton", command=self.turn_right).grid(row=1, column=2, padx=10, pady=10)
-        ttk.Button(pad, text="↓", style="Drive.TButton", command=self.drive_backward).grid(row=2, column=1, padx=10, pady=10)
+        ttk.Button(pad, text="↑", width=4, style="Drive.TButton", command=self.drive_forward).grid(row=0, column=1, padx=5, pady=8)
+        ttk.Button(pad, text="←", width=4, style="Drive.TButton", command=self.turn_left).grid(row=1, column=0, padx=5, pady=8)
+        ttk.Button(pad, text="STOP", width=6, style="Danger.TButton", command=self.stop_robot).grid(row=1, column=1, padx=5, pady=8)
+        ttk.Button(pad, text="→", width=4, style="Drive.TButton", command=self.turn_right).grid(row=1, column=2, padx=5, pady=8)
+        ttk.Button(pad, text="↓", width=4, style="Drive.TButton", command=self.drive_backward).grid(row=2, column=1, padx=5, pady=8)
 
         extra = tk.Frame(frame, bg="#ebe6dc")
         extra.pack(fill=tk.X, padx=12, pady=(0, 12))
@@ -909,104 +962,6 @@ class RobotControlApp:
         self.log_queue.put(f"[THERMAL] snapshot saved: {output_path}")
         messagebox.showinfo("Thermal Snapshot", f"Saved to:\n{output_path}")
 
-    def add_current_pose_point(self):
-        point = InspectionPoint()
-        point.point_name = f"P{self.point_counter}"
-        point.x = self.ros.robot_x
-        point.y = self.ros.robot_y
-        point.theta = self.ros.robot_yaw
-        point.is_confirmed = True
-        self.point_counter += 1
-        self.mission_points.append(point)
-        self._set_route_preview([])
-        self._sync_point_listbox()
-        self.log_queue.put(
-            f"[MISSION] add {point.point_name} -> ({point.x:.2f}, {point.y:.2f}, yaw={math.degrees(point.theta):.1f}deg)"
-        )
-
-    def delete_selected_point(self):
-        selection = self.point_listbox.curselection()
-        if not selection:
-            messagebox.showinfo("Mission Points", "Select a point to delete.")
-            return
-        index = selection[0]
-        point = self.mission_points.pop(index)
-        self._set_route_preview([])
-        self._sync_point_listbox()
-        self.log_queue.put(f"[MISSION] delete {point.point_name}")
-
-    def clear_points(self):
-        self.mission_points.clear()
-        self._set_route_preview([])
-        self._sync_point_listbox()
-        self.log_queue.put("[MISSION] cleared all points")
-
-    def optimize_points(self):
-        if len(self.mission_points) < 2:
-            self.log_queue.put("[MISSION] need at least 2 points to optimize order")
-            return
-
-        original_points = list(self.mission_points)
-        advanced_plan = None
-        if self.ros.map_data is not None:
-            advanced_plan = plan_mission_order(
-                self.ros.map_data,
-                (self.ros.robot_x, self.ros.robot_y),
-                original_points,
-            )
-
-        if advanced_plan:
-            self.mission_points = [original_points[index] for index in advanced_plan.ordered_indices]
-            self._set_route_preview(advanced_plan.preview_path)
-            self._sync_point_listbox()
-            names = " -> ".join(point.point_name for point in self.mission_points)
-            self.log_queue.put(
-                f"[MISSION] obstacle-aware order: {names} | cost={advanced_plan.final_cost:.1f}"
-            )
-            return
-
-        anchor = self._make_anchor_point()
-        points = [anchor, *original_points]
-        self.tsp_planner.calculate_distance_matrix(points)
-        order = self.tsp_planner.solve_tsp_dynamic_programming(points)
-        if not order:
-            self.log_queue.put("[WARN] mission order optimization returned no route")
-            self._set_route_preview([])
-            return
-        ordered = [points[idx] for idx in order if idx != 0]
-        self.mission_points = ordered
-        preview = self._preview_current_order_plan()
-        self._set_route_preview(preview.preview_path if preview else [])
-        self._sync_point_listbox()
-        names = " -> ".join(point.point_name for point in self.mission_points)
-        self.log_queue.put(f"[MISSION] fallback order: {names}")
-
-    def use_current_order(self):
-        if not self.mission_points:
-            self.log_queue.put("[MISSION] no points in current mission order")
-            return
-        preview = self._preview_current_order_plan()
-        if preview:
-            self._set_route_preview(preview.preview_path)
-            self.log_queue.put(
-                f"[MISSION] current order preview ready | cost={preview.final_cost:.1f}"
-            )
-        else:
-            self._set_route_preview([])
-            self.log_queue.put("[WARN] failed to preview current mission order on the map")
-        names = " -> ".join(point.point_name for point in self.mission_points)
-        self.log_queue.put(f"[MISSION] current order kept: {names}")
-
-    def log_navigation_request(self):
-        if not self.mission_points:
-            self.log_queue.put("[MISSION] no points to export")
-            return
-        request_text = ", ".join(
-            f"{point.point_name}({point.x:.2f},{point.y:.2f},{math.degrees(point.theta):.1f}deg)"
-            for point in self.mission_points
-        )
-        self.log_queue.put(f"[MISSION] StartNavigation request preview: {request_text}")
-
     def clear_rviz_points(self):
         request = Trigger.Request()
 
@@ -1025,20 +980,6 @@ class RobotControlApp:
         self.log_queue.put("[MISSION] querying localization status")
         self.ros.call_service_async(self.ros.localize_client, request, done)
 
-    def sync_points_to_robot(self):
-        if not self.mission_points:
-            messagebox.showinfo("Mission Points", "No mission points to sync.")
-            return
-
-        request = ConfirmInspectionPoints.Request()
-        request.points = self.mission_points
-
-        def done(result, error):
-            self.root.after(0, lambda: self._handle_confirm_result(result, error))
-
-        self.log_queue.put(f"[MISSION] syncing {len(self.mission_points)} points to robot")
-        self.ros.call_service_async(self.ros.confirm_points_client, request, done)
-
     def start_mission(self):
         if self.ros.safety_level == "FAULT":
             messagebox.showerror(
@@ -1048,17 +989,7 @@ class RobotControlApp:
             return
 
         request = StartNavigation.Request()
-        if not self.mission_points:
-            confirm = messagebox.askyesno(
-                "Start Mission",
-                "No local mission points in UI.\n\nUse the mission points picked in RViz and start execution?\n\nTip: Set point heading in RViz with 2D Goal Pose (Mission Heading).",
-            )
-            if not confirm:
-                return
-            self.log_queue.put("[MISSION] sending mission using RViz-picked points")
-        else:
-            request.waypoints = self.mission_points
-            self.log_queue.put(f"[MISSION] sending mission with {len(self.mission_points)} UI points")
+        self.log_queue.put("[MISSION] sending mission using RViz-picked points")
 
         def done(result, error):
             self.root.after(0, lambda: self._handle_start_mission_result(result, error))
@@ -1089,17 +1020,6 @@ class RobotControlApp:
             messagebox.showinfo("Localization", result.message)
         else:
             messagebox.showwarning("Localization", result.message)
-
-    def _handle_confirm_result(self, result, error):
-        if error is not None:
-            self.log_queue.put(f"[ERROR] point sync failed: {error}")
-            messagebox.showerror("Sync Points", error)
-            return
-        self.log_queue.put(f"[MISSION] {result.message}")
-        if result.success:
-            messagebox.showinfo("Sync Points", result.message)
-        else:
-            messagebox.showwarning("Sync Points", result.message)
 
     def _handle_clear_rviz_points_result(self, result, error):
         if error is not None:
@@ -1188,6 +1108,13 @@ class RobotControlApp:
 
         if now - self.ros.last_safety_stamp < 3.0:
             self.safety_var.set(f"{self.ros.safety_level}: {self.ros.safety_message}")
+            if self.ros.safety_voltage_available:
+                voltage_text = f"V={self.ros.safety_measured_voltage_v:.3f}V"
+            else:
+                voltage_text = "V=n/a"
+            self.power_var.set(
+                f"{voltage_text}  uv_now={int(self.ros.safety_undervoltage_now)}  uv_seen={int(self.ros.safety_undervoltage_seen)}  throttled=0x{self.ros.safety_throttled_flags:x}"
+            )
             if self.ros.safety_level == 'FAULT':
                 self._set_indicator_state('safety', '#d00000', f"Safety: {self.ros.safety_code}")
             elif self.ros.safety_level == 'WARN':
@@ -1196,6 +1123,7 @@ class RobotControlApp:
                 self._set_indicator_state('safety', '#2dc653', f"Safety: {self.ros.safety_code}")
         else:
             self.safety_var.set('safety: waiting')
+            self.power_var.set('power: waiting')
             self._set_indicator_state('safety', '#8f8f8f', 'Safety: waiting')
 
         if now - self.ros.last_thermal_stamp < 2.0 and self.ros.thermal_frame:
@@ -1256,45 +1184,11 @@ class RobotControlApp:
             if len(self.pose_history) > 80:
                 self.pose_history.pop(0)
 
-    def _sync_point_listbox(self):
-        self.point_listbox.delete(0, tk.END)
-        for index, point in enumerate(self.mission_points, start=1):
-            self.point_listbox.insert(
-                tk.END,
-                f"{index:>2}. {point.point_name:<6} x={point.x:>6.2f}  y={point.y:>6.2f}",
-            )
-        self.last_map_render_key = None
-
     def _refresh_mission_status(self):
-        if not self.mission_points:
-            self.mission_var.set("mission: 0 points")
+        if self.ros.safety_mission_active:
+            self.mission_var.set("mission: running from RViz")
         else:
-            names = " -> ".join(point.point_name for point in self.mission_points[:4])
-            if len(self.mission_points) > 4:
-                names += " ..."
-            self.mission_var.set(f"mission: {len(self.mission_points)} points | {names}")
-
-    def _make_anchor_point(self):
-        point = InspectionPoint()
-        point.point_name = "ROBOT"
-        point.x = self.ros.robot_x
-        point.y = self.ros.robot_y
-        point.theta = self.ros.robot_yaw
-        point.is_confirmed = True
-        return point
-
-    def _preview_current_order_plan(self):
-        if self.ros.map_data is None or not self.mission_points:
-            return None
-        return preview_order_route(
-            self.ros.map_data,
-            (self.ros.robot_x, self.ros.robot_y),
-            self.mission_points,
-        )
-
-    def _set_route_preview(self, preview_path):
-        self.route_preview = list(preview_path)
-        self.last_map_render_key = None
+            self.mission_var.set("mission: RViz mode")
 
     def _draw_map_view(self):
         map_msg = self.ros.map_data
@@ -1305,7 +1199,6 @@ class RobotControlApp:
             getattr(map_msg.info, "width", 0) if map_msg else 0,
             getattr(map_msg.info, "height", 0) if map_msg else 0,
             int(self.ros.last_map_stamp),
-            len(self.route_preview),
         )
         if key == self.last_map_render_key:
             return
@@ -1365,37 +1258,6 @@ class RobotControlApp:
         if len(trail) >= 4:
             canvas.create_line(*trail, fill="#3a86ff", width=2, smooth=True)
 
-        preview = []
-        for x, y in self.route_preview:
-            px, py = self._world_to_canvas(x, y, origin_x, origin_y, resolution, grid_w, grid_h, inner_w, inner_h)
-            preview.extend([px, py])
-        if len(preview) >= 4:
-            canvas.create_line(*preview, fill="#2a9d8f", width=3, smooth=True)
-
-        for index, point in enumerate(self.mission_points, start=1):
-            point_px, point_py = self._world_to_canvas(
-                point.x,
-                point.y,
-                origin_x,
-                origin_y,
-                resolution,
-                grid_w,
-                grid_h,
-                inner_w,
-                inner_h,
-            )
-            canvas.create_oval(
-                point_px - 4, point_py - 4, point_px + 4, point_py + 4, fill="#ff9f1c", outline=""
-            )
-            canvas.create_text(
-                point_px + 10,
-                point_py - 8,
-                text=f"{index}:{point.point_name}",
-                fill="#7f5539",
-                anchor="w",
-                font=("Helvetica", 9, "bold"),
-            )
-
         robot_px, robot_py = self._world_to_canvas(
             self.ros.robot_x,
             self.ros.robot_y,
@@ -1408,8 +1270,6 @@ class RobotControlApp:
             inner_h,
         )
         canvas.create_oval(robot_px - 5, robot_py - 5, robot_px + 5, robot_py + 5, fill="#e63946", outline="")
-        if self.route_preview:
-            canvas.create_text(18, 36, anchor="nw", text=f"Route preview points: {len(self.route_preview)}", fill="#2a9d8f", font=("Helvetica", 10, "bold"))
         canvas.create_text(18, 18, anchor="nw", text=f"Pose ({self.ros.robot_x:.2f}, {self.ros.robot_y:.2f})", fill="#153243", font=("Helvetica", 10, "bold"))
 
     def _world_to_canvas(self, x, y, origin_x, origin_y, resolution, grid_w, grid_h, inner_w, inner_h):

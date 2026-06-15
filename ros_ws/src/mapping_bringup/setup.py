@@ -16,6 +16,8 @@ setup(
             glob("launch/*.launch.py")),
         (os.path.join("share", package_name, "config"),
             glob("config/*.yaml")),
+        (os.path.join("share", package_name, "config"),
+            glob("config/*.xml")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -31,6 +33,7 @@ setup(
             "thermal_camera_node = mapping_bringup.thermal_camera_node:main",
             "gas_sensor_node = mapping_bringup.gas_sensor_node:main",
             "safety_monitor = mapping_bringup.safety_monitor:main",
+            "actual_path_recorder = mapping_bringup.actual_path_recorder:main",
         ],
     },
 )

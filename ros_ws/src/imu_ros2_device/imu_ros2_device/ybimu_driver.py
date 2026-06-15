@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import math
-import threading
 
 from YbImuLib import YbImuSerial
 
@@ -10,22 +9,47 @@ from rclpy.node import Node
 from sensor_msgs.msg import Imu, MagneticField
 from std_msgs.msg import Float32MultiArray
 
+
+DEFAULT_SERIAL_PORT = "/dev/serial/by-id/usb-ATK_ATK-HS-V4-CMSIS-DAP_ATK_20210914-if00"
+FALLBACK_SERIAL_PORTS = [
+    "/dev/myimu",
+    "/dev/ttyACM0",
+    "/dev/ttyACM1",
+    "/dev/ttyACM2",
+    "/dev/ttyACM3",
+    "/dev/ttyUSB0",
+    "/dev/ttyUSB1",
+    "/dev/ttyUSB2",
+    "/dev/ttyUSB3",
+]
+
+
 class ybimu_driver(Node):
     def __init__(self, name):
         super().__init__(name)
         self.robot = None
+        self.serial_port = None
+        self.samples_seen = 0
+        self.received_nonzero_data = False
+        self.zero_data_warning_sent = False
+        self.declare_parameter("serial_port", DEFAULT_SERIAL_PORT)
+        self.declare_parameter("fallback_serial_ports", FALLBACK_SERIAL_PORTS)
 
     def init_topic(self):
-        port_list = ["/dev/myimu", "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2","/dev/ttyUSB3"]
+        port_list = self._candidate_ports()
+        open_errors = []
         for port in port_list:
             try:
                 self.robot = YbImuSerial(port)
+                self.serial_port = port
                 self.get_logger().info("Open Ybimu Port OK:%s" % port)
                 break
-            except:
-                pass
+            except Exception as exc:
+                open_errors.append("%s: %s" % (port, exc))
         if self.robot is None:
-            self.get_logger().error("---------Fail To Open Ybimu Serial------------")
+            self.get_logger().error(
+                "Fail to open Ybimu serial. Tried: %s" % "; ".join(open_errors)
+            )
             return
         self.robot.create_receive_threading()
 
@@ -35,6 +59,15 @@ class ybimu_driver(Node):
         self.eulerPublisher = self.create_publisher(Float32MultiArray, "euler", 100)
 
         self.timer = self.create_timer(0.1, self.pub_data)
+
+    def _candidate_ports(self):
+        configured_port = self.get_parameter("serial_port").value
+        fallback_ports = list(self.get_parameter("fallback_serial_ports").value)
+        ports = []
+        if configured_port:
+            ports.append(configured_port)
+        ports.extend(fallback_ports)
+        return list(dict.fromkeys(ports))
 
     def pub_data(self):
         if self.robot is None:
@@ -52,6 +85,8 @@ class ybimu_driver(Node):
         [height, temperature, pressure, pressure_contrast] = self.robot.get_baro_data()
 
         [roll, pitch, yaw] = self.robot.get_imu_attitude_data(True)
+
+        self._track_receive_health([ax, ay, az, gx, gy, gz, mx, my, mz, roll, pitch, yaw])
 
         roll_rad = roll * (math.pi / 180.0)
         pitch_rad = pitch * (math.pi / 180.0)
@@ -75,10 +110,22 @@ class ybimu_driver(Node):
         imu.linear_acceleration.x = ax * 9.80665
         imu.linear_acceleration.y = ay * 9.80665
         imu.linear_acceleration.z = az * 9.80665
+        # 协方差：加速度测量噪声 (m/s^2)^2
+        imu.linear_acceleration_covariance = [0.01, 0.0, 0.0,
+                                               0.0, 0.01, 0.0,
+                                               0.0, 0.0, 0.01]
 
-        imu.angular_velocity.x = gx * (math.pi / 180.0)
-        imu.angular_velocity.y = gy * (math.pi / 180.0)
-        imu.angular_velocity.z = gz * (math.pi / 180.0)
+        imu.angular_velocity.x = gx
+        imu.angular_velocity.y = gy
+        imu.angular_velocity.z = gz
+        # 协方差：角速度测量噪声 (rad/s)^2
+        imu.angular_velocity_covariance = [0.001, 0.0, 0.0,
+                                            0.0, 0.001, 0.0,
+                                            0.0, 0.0, 0.001]
+        # 协方差：姿态四元数噪声
+        imu.orientation_covariance = [0.0025, 0.0, 0.0,
+                                       0.0, 0.0025, 0.0,
+                                       0.0, 0.0, 0.0025]
 
         mag.header.stamp = time_stamp.to_msg()
         mag.header.frame_id = "imu_link"
@@ -94,6 +141,18 @@ class ybimu_driver(Node):
         self.magPublisher.publish(mag)
         self.baroPublisher.publish(baro)
         self.eulerPublisher.publish(euler)
+
+    def _track_receive_health(self, values):
+        self.samples_seen += 1
+        if any(abs(value) > 1e-6 for value in values):
+            self.received_nonzero_data = True
+            return
+        if self.samples_seen >= 20 and not self.zero_data_warning_sent:
+            self.zero_data_warning_sent = True
+            self.get_logger().warning(
+                "IMU serial port is open but received only zero data from %s. "
+                "Check wiring, baudrate, and auto-report settings." % self.serial_port
+            )
 
     def ready(self):
         return self.robot is not None
@@ -113,7 +172,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
