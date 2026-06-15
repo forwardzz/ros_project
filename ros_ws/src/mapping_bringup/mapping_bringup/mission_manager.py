@@ -158,13 +158,24 @@ class MissionManager(Node):
             return
 
         if self.map_msg is not None and self.have_map_pose:
-            preview = preview_current_order(
+            advanced_plan = plan_mission_order(
                 self.map_msg,
                 (self.current_map_pose["x"], self.current_map_pose["y"]),
                 self.rviz_points,
             )
-            if preview:
-                self.rviz_preview_path = list(preview.preview_path)
+            if advanced_plan:
+                self.rviz_ordered_points = [
+                    self.rviz_points[index] for index in advanced_plan.ordered_indices
+                ]
+                self.rviz_preview_path = list(advanced_plan.preview_path)
+            else:
+                preview = preview_current_order(
+                    self.map_msg,
+                    (self.current_map_pose["x"], self.current_map_pose["y"]),
+                    self.rviz_points,
+                )
+                if preview:
+                    self.rviz_preview_path = list(preview.preview_path)
         self._publish_rviz_plan_visuals()
 
     def _publish_rviz_plan_visuals(self):
@@ -368,6 +379,9 @@ class MissionManager(Node):
             self.get_logger().warn(f"Mission request rejected: {validation.message}")
             return response
 
+        # Execute waypoints in the exact order the user provided. Route preview
+        # may be optimized separately, but mission execution should not silently
+        # reorder points and skip the user's intended first stop.
         ordered_points = list(points)
 
         goal = NavigateThroughPoses.Goal()

@@ -26,15 +26,6 @@ def generate_launch_description():
     nav2_param_path = PathJoinSubstitution(
         [FindPackageShare("mapping_bringup"), "config", "nav2_params.yaml"]
     )
-    ekf_config_path = PathJoinSubstitution(
-        [FindPackageShare("mapping_bringup"), "config", "ekf.yaml"]
-    )
-    nav_to_pose_bt_path = PathJoinSubstitution(
-        [FindPackageShare("mapping_bringup"), "config", "navigate_to_pose_no_spin.xml"]
-    )
-    nav_through_poses_bt_path = PathJoinSubstitution(
-        [FindPackageShare("mapping_bringup"), "config", "navigate_through_poses_no_spin.xml"]
-    )
     return LaunchDescription([
         SetEnvironmentVariable("CYCLONEDDS_URI", cyclone_uri),
         DeclareLaunchArgument(
@@ -72,21 +63,6 @@ def generate_launch_description():
             default_value="false",
             description="Launch RViz on the robot",
         ),
-        DeclareLaunchArgument(
-            name="imu_serial_port",
-            default_value="/dev/ttyAMA0",
-            description="YB IMU serial port",
-        ),
-        DeclareLaunchArgument(
-            name="imu_frame_id",
-            default_value="imu_link",
-            description="IMU frame id",
-        ),
-        DeclareLaunchArgument(
-            name="imu_z",
-            default_value="0.05",
-            description="IMU mounting height (m)",
-        ),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(sllidar_launch_path),
@@ -110,28 +86,6 @@ def generate_launch_description():
         ),
 
         Node(
-            package="tf2_ros",
-            executable="static_transform_publisher",
-            name="base_to_imu",
-            arguments=[
-                "--x", "0", "--y", "0", "--z", LaunchConfiguration("imu_z"),
-                "--roll", "0", "--pitch", "0", "--yaw", "0",
-                "--frame-id", "base_link",
-                "--child-frame-id", LaunchConfiguration("imu_frame_id"),
-            ],
-        ),
-
-        Node(
-            package="imu_ros2_device",
-            executable="ybimu_driver",
-            name="ybimu_node",
-            output="screen",
-            parameters=[{
-                "serial_port": LaunchConfiguration("imu_serial_port"),
-            }],
-        ),
-
-        Node(
             package="rf2o_laser_odometry",
             executable="rf2o_laser_odometry_node",
             name="rf2o_laser_odometry",
@@ -139,24 +93,13 @@ def generate_launch_description():
             arguments=["--ros-args", "--log-level", "error"],
             parameters=[{
                 "laser_scan_topic": "/scan",
-                "odom_topic": "/laser_odom",
-                "publish_tf": False,
+                "odom_topic": "/odom",
+                "publish_tf": True,
                 "base_frame_id": "base_link",
                 "odom_frame_id": "odom",
                 "init_pose_from_topic": "",
                 "freq": 20.0,
             }],
-        ),
-
-        Node(
-            package="robot_localization",
-            executable="ekf_node",
-            name="ekf_filter_node",
-            output="screen",
-            parameters=[ekf_config_path],
-            remappings=[
-                ("odometry/filtered", "/odom"),
-            ],
         ),
 
         Node(
@@ -175,19 +118,9 @@ def generate_launch_description():
 
         Node(
             package="mapping_bringup",
-            executable="actual_path_recorder",
-            name="actual_path_recorder",
-            output="screen",
-        ),
-
-        Node(
-            package="mapping_bringup",
             executable="safety_monitor",
             name="safety_monitor",
             output="screen",
-            parameters=[{
-                "fault_on_undervoltage_seen": False,
-            }],
         ),
 
         Node(
@@ -229,13 +162,7 @@ def generate_launch_description():
             executable="bt_navigator",
             name="bt_navigator",
             output="screen",
-            parameters=[
-                nav2_param_path,
-                {
-                    "default_nav_to_pose_bt_xml": nav_to_pose_bt_path,
-                    "default_nav_through_poses_bt_xml": nav_through_poses_bt_path,
-                },
-            ],
+            parameters=[nav2_param_path],
         ),
 
         Node(

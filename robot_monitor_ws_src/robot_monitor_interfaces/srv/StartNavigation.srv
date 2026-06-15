@@ -1,0 +1,4 @@
+robot_monitor_interfaces/InspectionPoint[] waypoints
+---
+bool success
+string message
