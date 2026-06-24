@@ -2,6 +2,7 @@ import math
 import os
 import re
 import subprocess
+import threading
 import time
 from collections import deque
 
@@ -243,12 +244,15 @@ class SafetyMonitor(Node):
             self._request_abort()
 
     def _request_abort(self):
-        request = Trigger.Request()
-        if not self.abort_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn("Abort mission service is unavailable during safety fault")
-            return
-        future = self.abort_client.call_async(request)
-        future.add_done_callback(self._abort_done)
+        def _worker():
+            request = Trigger.Request()
+            if not self.abort_client.wait_for_service(timeout_sec=1.0):
+                self.get_logger().warn("Abort mission service is unavailable during safety fault")
+                return
+            future = self.abort_client.call_async(request)
+            future.add_done_callback(self._abort_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _abort_done(self, future):
         try:

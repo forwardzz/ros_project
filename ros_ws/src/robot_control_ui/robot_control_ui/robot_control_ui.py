@@ -280,6 +280,12 @@ class LaunchManager:
             "static_transform_publisher",
             "tracked_motor_driver",
             "safety_monitor",
+            "mission_manager",
+            "actual_path_recorder",
+            "ekf_filter_node",
+            "ekf_node",
+            "ybimu_node",
+            "ybimu_driver",
             "gas_sensor_node",
         ]
         if name == "mapping":
@@ -326,6 +332,12 @@ class LaunchManager:
             "rf2o_laser_odometry",
             "tracked_motor_driver",
             "static_transform_publisher",
+            "mission_manager",
+            "actual_path_recorder",
+            "ekf_filter_node",
+            "ekf_node",
+            "ybimu_node",
+            "ybimu_driver",
             "thermal_camera_node",
             "gas_sensor_node",
         ]
