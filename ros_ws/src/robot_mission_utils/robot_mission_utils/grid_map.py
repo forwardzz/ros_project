@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence, Tuple
 
@@ -59,8 +60,8 @@ class GridMap:
         return value < self.occupied_threshold
 
     def world_to_grid(self, x: float, y: float) -> Point:
-        gx = int((x - self.origin_x) / self.resolution)
-        gy = int((y - self.origin_y) / self.resolution)
+        gx = int(math.floor((x - self.origin_x) / self.resolution))
+        gy = int(math.floor((y - self.origin_y) / self.resolution))
         return gx, gy
 
     def grid_to_world(self, x: int, y: int) -> Tuple[float, float]:

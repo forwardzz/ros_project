@@ -12,11 +12,9 @@ from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
 from robot_mission_utils.inspection_planner import (
-    plan_mission_order,
     preview_current_order,
     validate_mission_points,
 )
-from robot_mission_utils.tsp_planner import TSPPlanner
 from robot_monitor_interfaces.msg import InspectionPoint
 from robot_monitor_interfaces.srv import ConfirmInspectionPoints, Localize, StartNavigation
 
@@ -42,9 +40,10 @@ class MissionManager(Node):
         self.rviz_points = []
         self.rviz_ordered_points = []
         self.rviz_preview_path = []
+        self.rviz_recompute_throttle_sec = 0.5
+        self.last_rviz_recompute_time = 0.0
         self.goal_handle = None
         self.mission_active = False
-        self.tsp_planner = TSPPlanner()
 
         self.create_subscription(Odometry, "/odom", self._odom_cb, 10)
         self.create_subscription(
@@ -84,8 +83,11 @@ class MissionManager(Node):
         self.current_map_pose["y"] = msg.pose.pose.position.y
         self.current_map_pose["theta"] = self._quat_to_yaw(msg.pose.pose.orientation)
         self.have_map_pose = True
-        if self.rviz_points:
-            self._recompute_rviz_plan()
+        if self.rviz_points and not self.mission_active:
+            now_sec = self.get_clock().now().nanoseconds / 1e9
+            if now_sec - self.last_rviz_recompute_time >= self.rviz_recompute_throttle_sec:
+                self.last_rviz_recompute_time = now_sec
+                self._recompute_rviz_plan()
 
     def _map_cb(self, msg):
         self.have_map = True
@@ -384,44 +386,6 @@ class MissionManager(Node):
         response.message = f"Mission goal sent with {len(ordered_points)} points from {source}: {names}"
         self.get_logger().info(response.message)
         return response
-
-    def _order_points(self, points):
-        if len(points) < 2:
-            return points
-
-        advanced_plan = None
-        if self.map_msg is not None and self.have_map_pose:
-            advanced_plan = plan_mission_order(
-                self.map_msg,
-                (self.current_map_pose["x"], self.current_map_pose["y"]),
-                points,
-            )
-        if advanced_plan:
-            ordered = [points[index] for index in advanced_plan.ordered_indices]
-            self.get_logger().info(
-                "Advanced mission planner selected order: %s"
-                % " -> ".join(point.point_name for point in ordered)
-            )
-            return ordered
-
-        anchor = InspectionPoint()
-        anchor.point_name = "ROBOT"
-        anchor.x = self.current_map_pose["x"]
-        anchor.y = self.current_map_pose["y"]
-        anchor.theta = self.current_map_pose["theta"]
-        anchor.is_confirmed = True
-
-        candidates = [anchor, *points]
-        self.tsp_planner.calculate_distance_matrix(candidates)
-        order = self.tsp_planner.solve_tsp_dynamic_programming(candidates)
-        if not order:
-            self.get_logger().warn("Mission planner fallback kept the original point order")
-            return points
-        ordered = [candidates[index] for index in order if index != 0]
-        self.get_logger().warn(
-            "Advanced mission planner unavailable, falling back to Euclidean TSP order"
-        )
-        return ordered
 
     def _inspection_point_to_pose(self, point):
         pose = PoseStamped()

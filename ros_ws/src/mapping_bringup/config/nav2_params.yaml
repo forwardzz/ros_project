@@ -201,11 +201,11 @@ local_costmap:
 
       # ----------------------------------------------------------
       # 膨胀半径（米）—— 障碍物周围的"代价缓冲区"
-      # 值越大，机器人离障碍物越远。0.05 表示只在障碍物表面 5cm 内产生代价。
-      # 当前 0.05 很小，机器人几乎贴着障碍物走。如果经常碰撞，建议调到 0.15~0.25。
+      # 值越大，机器人离障碍物越远。当前 0.12，给 27cm 车体留出约一个半宽的离墙距离。
+      # 0.01 时机器人几乎贴着障碍物走，是 safety_monitor 频繁报碰撞的主因。
       # 调大后若小车不敢走（全红），配合降低 cost_scaling_factor 补偿。
       # ----------------------------------------------------------
-      inflation_radius: 0.01
+      inflation_radius: 0.12
 
       # ----------------------------------------------------------
       # 代价衰减速率
@@ -213,8 +213,8 @@ local_costmap:
       # 值越大 → 代价下降越快 → 机器人更敢靠近障碍物
       # 值越小 → 代价下降越慢 → 机器人离障碍物越远
       # 推荐范围：2.0（保守）~ 10.0（激进）
-      # 当前 8.0 比较激进，配合小 inflation_radius 使用。
-      # 如果调大 inflation_radius 后小车不动，把这个值也调小（比如 3.0~5.0）。
+      # 当前 3.0 偏保守，配合 0.12 的 inflation_radius 让车体离墙约一个半宽。
+      # 如果调大 inflation_radius 后小车不动，把这个值再调小。
       # ----------------------------------------------------------
       cost_scaling_factor: 3.0
 
@@ -296,13 +296,13 @@ global_costmap:
       # ----------------------------------------------------------
       # 全局膨胀半径（米）
       # 这个值影响 NavFn 规划器的路径选择。
-      # 当前 0.05 非常小，全局路径几乎不考虑障碍物安全距离。
-      # 建议至少 0.10~0.18，让规划路径远离墙壁。
+      # 当前 0.15，略大于局部，让全局规划路径远离墙壁。
       # ----------------------------------------------------------
-      inflation_radius: 0.01
+      inflation_radius: 0.15
 
       # 代价衰减速率，含义同局部代价地图
-      cost_scaling_factor: 8.0
+      # 8.0 衰减过快，配合大 inflation 时机器人仍贴墙；降到 3.0 让代价梯度更平缓。
+      cost_scaling_factor: 3.0
 
       # 全局代价地图插件：先加载静态地图层，再膨胀
       plugins: ["static_layer", "inflation_layer"]
@@ -441,14 +441,3 @@ velocity_smoother:
     deadband_velocity: [0.05, 0.0, 0.05]
     # 收不到新速度命令超过此时间（秒）后自动停车
     velocity_timeout: 1.0
-
-waypoint_follower:
-  ros__parameters:
-    use_sim_time: false
-    loop_rate: 20
-    stop_on_failure: false
-    waypoint_task_executor_plugin: "wait_at_waypoint"
-    wait_at_waypoint:
-      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
-      enabled: true
-      waypoint_pause_duration: 200
