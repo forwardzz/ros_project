@@ -24,7 +24,7 @@ from rclpy.qos import (
 )
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 
 from robot_monitor_interfaces.msg import GasData, RobotSafetyStatus
 from robot_monitor_interfaces.srv import Localize, StartNavigation
@@ -77,6 +77,18 @@ class RosUiAdapter:
         )
         self.clear_rviz_points_client = self.node.create_client(
             Trigger, "/clear_rviz_points"
+        )
+        self.set_region_mode_client = self.node.create_client(
+            SetBool, "/set_region_mode"
+        )
+        self.clear_inspection_regions_client = self.node.create_client(
+            Trigger, "/clear_inspection_regions"
+        )
+        self.save_inspection_regions_client = self.node.create_client(
+            Trigger, "/save_inspection_regions"
+        )
+        self.load_inspection_regions_client = self.node.create_client(
+            Trigger, "/load_inspection_regions"
         )
         self.reset_safety_client = self.node.create_client(
             Trigger, "/reset_safety_monitor"
@@ -507,6 +519,7 @@ class RobotControlApp:
         self.odom_var = tk.StringVar(value="odom: no data")
         self.map_var_status = tk.StringVar(value="map: no data")
         self.mission_var = tk.StringVar(value="mission: RViz mode")
+        self.region_mode_var = tk.BooleanVar(value=False)
         self.safety_var = tk.StringVar(value="safety: waiting")
         self.power_var = tk.StringVar(value="power: waiting")
         self.thermal_var = tk.StringVar(value="thermal: no data")
@@ -702,6 +715,21 @@ class RobotControlApp:
         )
         ttk.Button(buttons, text="Clear RViz Points", command=self.clear_rviz_points).grid(
             row=0, column=2, padx=(8, 0), pady=4, sticky="ew"
+        )
+        ttk.Checkbutton(
+            buttons,
+            text="Region Mode",
+            variable=self.region_mode_var,
+            command=self.set_region_mode,
+        ).grid(row=1, column=0, padx=(0, 8), pady=4, sticky="ew")
+        ttk.Button(buttons, text="Save Regions", command=self.save_regions).grid(
+            row=1, column=1, padx=8, pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Load Regions", command=self.load_regions).grid(
+            row=1, column=2, padx=(8, 0), pady=4, sticky="ew"
+        )
+        ttk.Button(buttons, text="Clear Regions", command=self.clear_regions).grid(
+            row=2, column=0, columnspan=3, padx=0, pady=4, sticky="ew"
         )
         for col in range(3):
             buttons.grid_columnconfigure(col, weight=1)
@@ -971,6 +999,50 @@ class RobotControlApp:
         self.log_queue.put("[MISSION] clearing RViz-picked mission points on robot")
         self.ros.call_service_async(self.ros.clear_rviz_points_client, request, done)
 
+    def set_region_mode(self):
+        request = SetBool.Request()
+        request.data = bool(self.region_mode_var.get())
+
+        def done(result, error):
+            self.root.after(0, lambda: self._handle_region_mode_result(result, error))
+
+        mode = "enabled" if request.data else "disabled"
+        self.log_queue.put(f"[MISSION] region mode {mode}")
+        self.ros.call_service_async(self.ros.set_region_mode_client, request, done)
+
+    def save_regions(self):
+        self._call_region_trigger(
+            self.ros.save_inspection_regions_client,
+            "Save Regions",
+            "[MISSION] saving inspection regions on robot",
+        )
+
+    def load_regions(self):
+        self._call_region_trigger(
+            self.ros.load_inspection_regions_client,
+            "Load Regions",
+            "[MISSION] loading inspection regions on robot",
+        )
+
+    def clear_regions(self):
+        self._call_region_trigger(
+            self.ros.clear_inspection_regions_client,
+            "Clear Regions",
+            "[MISSION] clearing inspection regions on robot",
+        )
+
+    def _call_region_trigger(self, client, title, log_message):
+        request = Trigger.Request()
+
+        def done(result, error):
+            self.root.after(
+                0,
+                lambda: self._handle_region_trigger_result(title, result, error),
+            )
+
+        self.log_queue.put(log_message)
+        self.ros.call_service_async(client, request, done)
+
     def check_localization(self):
         request = Localize.Request()
 
@@ -989,7 +1061,10 @@ class RobotControlApp:
             return
 
         request = StartNavigation.Request()
-        self.log_queue.put("[MISSION] sending mission using RViz-picked points")
+        if self.region_mode_var.get():
+            self.log_queue.put("[MISSION] sending region inspection mission")
+        else:
+            self.log_queue.put("[MISSION] sending mission using RViz-picked points")
 
         def done(result, error):
             self.root.after(0, lambda: self._handle_start_mission_result(result, error))
@@ -1031,6 +1106,31 @@ class RobotControlApp:
             messagebox.showinfo("Clear RViz Points", result.message)
         else:
             messagebox.showwarning("Clear RViz Points", result.message)
+
+    def _handle_region_mode_result(self, result, error):
+        if error is not None:
+            self.region_mode_var.set(not self.region_mode_var.get())
+            self.log_queue.put(f"[ERROR] set region mode failed: {error}")
+            messagebox.showerror("Region Mode", error)
+            return
+        self.log_queue.put(f"[MISSION] {result.message}")
+        self.mission_var.set(
+            "mission: region mode" if self.region_mode_var.get() else "mission: RViz point mode"
+        )
+        if not result.success:
+            self.region_mode_var.set(not self.region_mode_var.get())
+            messagebox.showwarning("Region Mode", result.message)
+
+    def _handle_region_trigger_result(self, title, result, error):
+        if error is not None:
+            self.log_queue.put(f"[ERROR] {title.lower()} failed: {error}")
+            messagebox.showerror(title, error)
+            return
+        self.log_queue.put(f"[MISSION] {result.message}")
+        if result.success:
+            messagebox.showinfo(title, result.message)
+        else:
+            messagebox.showwarning(title, result.message)
 
     def _handle_reset_safety_result(self, result, error):
         if error is not None:

@@ -2,6 +2,7 @@ import math
 import os
 import re
 import subprocess
+import threading
 import time
 from collections import deque
 
@@ -40,6 +41,7 @@ class SafetyMonitor(Node):
 
         self.status_pub = self.create_publisher(RobotSafetyStatus, "/robot_safety_status", latched_qos)
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.cmd_vel_nav_pub = self.create_publisher(Twist, "/cmd_vel_nav", 10)
         self.abort_client = self.create_client(Trigger, "/abort_mission")
         self.create_service(Trigger, "/reset_safety_monitor", self._handle_reset)
 
@@ -243,12 +245,15 @@ class SafetyMonitor(Node):
             self._request_abort()
 
     def _request_abort(self):
-        request = Trigger.Request()
-        if not self.abort_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn("Abort mission service is unavailable during safety fault")
-            return
-        future = self.abort_client.call_async(request)
-        future.add_done_callback(self._abort_done)
+        def _worker():
+            request = Trigger.Request()
+            if not self.abort_client.wait_for_service(timeout_sec=1.0):
+                self.get_logger().warn("Abort mission service is unavailable during safety fault")
+                return
+            future = self.abort_client.call_async(request)
+            future.add_done_callback(self._abort_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _abort_done(self, future):
         try:
@@ -283,6 +288,7 @@ class SafetyMonitor(Node):
 
     def _publish_zero_cmd(self):
         stop = Twist()
+        self.cmd_vel_nav_pub.publish(stop)
         self.cmd_vel_pub.publish(stop)
 
     def _publish_status(self):

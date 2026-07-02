@@ -1,4 +1,5 @@
 import heapq
+import math
 
 import numpy as np
 
@@ -23,8 +24,8 @@ class AStarPlanner:
         self.map_resolution = map_msg.info.resolution
 
     def world_to_grid(self, x, y):
-        grid_x = int((x - self.map_origin_x) / self.map_resolution)
-        grid_y = int((y - self.map_origin_y) / self.map_resolution)
+        grid_x = int(math.floor((x - self.map_origin_x) / self.map_resolution))
+        grid_y = int(math.floor((y - self.map_origin_y) / self.map_resolution))
         return grid_x, grid_y
 
     def grid_to_world(self, grid_x, grid_y):

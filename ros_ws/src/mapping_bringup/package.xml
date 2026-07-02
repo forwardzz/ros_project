@@ -35,6 +35,7 @@
   <depend>nav2_bringup</depend>
   <depend>robot_monitor_interfaces</depend>
   <depend>robot_mission_utils</depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>
