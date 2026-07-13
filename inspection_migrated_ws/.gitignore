@@ -1,0 +1,10 @@
+build/
+install/
+log/
+__pycache__/
+*.py[cod]
+
+# Runtime-generated maps and region files are intentionally not source assets.
+maps/*.pgm
+maps/*.yaml
+maps/*.yml

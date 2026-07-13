@@ -1,0 +1,5 @@
+robot_monitor_interfaces/InspectionPoint[] waypoints
+float64 waypoint_pause_sec
+---
+bool success
+string message

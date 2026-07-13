@@ -1,0 +1,9 @@
+string level
+string code
+string message
+bool mission_active
+bool voltage_available
+float32 measured_voltage_v
+bool undervoltage_now
+bool undervoltage_seen
+uint32 throttled_flags
