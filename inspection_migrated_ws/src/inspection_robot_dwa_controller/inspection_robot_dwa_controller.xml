@@ -1,0 +1,10 @@
+<library path="inspection_robot_dwa_controller">
+  <class
+    name="inspection_robot_dwa_controller::DWAController"
+    type="inspection_robot_dwa_controller::DWAController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Dynamic Window Approach controller for the migrated inspection robot Nav2 stack.
+    </description>
+  </class>
+</library>

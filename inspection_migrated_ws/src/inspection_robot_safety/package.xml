@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>inspection_robot_safety</name>
+  <version>0.1.0</version>
+  <description>Safety supervisor and velocity arbitration for the migrated inspection robot.</description>
+  <maintainer email="zjy@example.com">zjy</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>action_msgs</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>robot_monitor_interfaces</depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
