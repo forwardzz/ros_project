@@ -5,12 +5,19 @@ import struct
 import time
 import threading
 import math
-from smbus2 import SMBus
+try:
+    from smbus2 import SMBus
+except ImportError:
+    SMBus = None
 
 # V1.0.0
 class YbImuI2c(object):
 
     def __init__(self, port=7, debug=False):
+        if SMBus is None:
+            raise RuntimeError(
+                "YbImuI2c requires the optional 'smbus2' Python package"
+            )
 
         self._port = int(port)
 

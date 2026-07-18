@@ -16,10 +16,11 @@ setup(
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
     ],
     install_requires=["setuptools"],
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="zjy",
     maintainer_email="zjy@example.com",
-    description="Real sensor and GPIO/PWM adapters",
+    description="Real sensor and V4.0 motor-board adapters",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [

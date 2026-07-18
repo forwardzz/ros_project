@@ -7,9 +7,10 @@ MODE="${1:-all}"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 WS_SETUP="${WS_SETUP:-${SCRIPT_DIR}/install/setup.bash}"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
-ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
+ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}"
+RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 REMOTE_USER="${REMOTE_USER:-yy}"
-REMOTE_HOST="${REMOTE_HOST:-192.168.43.21}"
+REMOTE_HOST="${REMOTE_HOST:-192.168.43.24}"
 ROBOT_WS="${ROBOT_WS:-/home/yy/inspection_migrated_ws}"
 MAP_FILE="${MAP_FILE:-${ROBOT_WS}/maps/inspection_map.yaml}"
 RVIZ_CONFIG="${RVIZ_CONFIG:-${SCRIPT_DIR}/install/inspection_robot_bringup/share/inspection_robot_bringup/rviz/sllidar_ros2.rviz}"
@@ -33,7 +34,10 @@ fi
 
 source "${ROS_SETUP}"
 source "${WS_SETUP}"
-export ROS_DOMAIN_ID ROS_LOCALHOST_ONLY
+# ROS_LOCALHOST_ONLY is deprecated in Jazzy and can silently block the
+# cross-host GUI workflow when inherited as 1. Use the current discovery knob.
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID ROS_AUTOMATIC_DISCOVERY_RANGE RMW_IMPLEMENTATION
 
 gui_args=(
     launch inspection_robot_gui gui.launch.py
@@ -48,23 +52,43 @@ pids=()
 cleanup() {
     trap - EXIT INT TERM
     for pid in "${pids[@]:-}"; do
-        if kill -0 "${pid}" 2>/dev/null; then
-            kill "${pid}" 2>/dev/null || true
+        if kill -0 -- "-${pid}" 2>/dev/null; then
+            kill -TERM -- "-${pid}" 2>/dev/null || true
         fi
     done
-    wait 2>/dev/null || true
+    for _ in {1..30}; do
+        any_running=false
+        for pid in "${pids[@]:-}"; do
+            if kill -0 -- "-${pid}" 2>/dev/null; then
+                any_running=true
+                break
+            fi
+        done
+        if [[ "${any_running}" == "false" ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    for pid in "${pids[@]:-}"; do
+        if kill -0 -- "-${pid}" 2>/dev/null; then
+            kill -KILL -- "-${pid}" 2>/dev/null || true
+        fi
+    done
+    for pid in "${pids[@]:-}"; do
+        wait "${pid}" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT INT TERM
 
 start_gui() {
     echo "[start] GUI: ros2 ${gui_args[*]}"
-    ros2 "${gui_args[@]}" &
+    setsid ros2 "${gui_args[@]}" &
     pids+=("$!")
 }
 
 start_rviz() {
     echo "[start] RViz: ${RVIZ_CONFIG}"
-    rviz2 -d "${RVIZ_CONFIG}" &
+    setsid rviz2 -d "${RVIZ_CONFIG}" &
     pids+=("$!")
 }
 

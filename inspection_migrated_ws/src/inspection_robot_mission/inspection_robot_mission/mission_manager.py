@@ -1,5 +1,6 @@
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
@@ -19,7 +20,9 @@ from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from robot_mission_utils.inspection_planner import (
-    preview_current_order,
+    RegionRouteOption,
+    plan_mission_order,
+    plan_region_mission_order,
     validate_mission_points,
 )
 from robot_mission_utils.grid_map import GridMap
@@ -115,6 +118,18 @@ class MissionManager(Node):
         self.chassis_obstacle_distance = float(
             self.declare_parameter("chassis_obstacle_distance", 0.28).value
         )
+        self.region_obstacle_wait_sec = max(
+            0.1,
+            float(self.declare_parameter("region_obstacle_wait_sec", 3.0).value),
+        )
+        self.region_obstacle_clear_frames = max(
+            1,
+            int(self.declare_parameter("region_obstacle_clear_frames", 10).value),
+        )
+        self.region_obstacle_max_retries = max(
+            0,
+            int(self.declare_parameter("region_obstacle_max_retries", 2).value),
+        )
         self.region_obstacle_inset = float(
             self.declare_parameter("region_obstacle_inset", 0.02).value
         )
@@ -139,6 +154,15 @@ class MissionManager(Node):
                 INSPECTION_REGIONS_PATH,
             ).value
         )
+        self.mission_home_x = float(
+            self.declare_parameter("mission_home_x", 0.0).value
+        )
+        self.mission_home_y = float(
+            self.declare_parameter("mission_home_y", 0.0).value
+        )
+        self.mission_home_yaw = float(
+            self.declare_parameter("mission_home_yaw", 0.0).value
+        )
 
         self.current_odom = {"x": 0.0, "y": 0.0, "theta": 0.0}
         self.current_map_pose = {"x": 0.0, "y": 0.0, "theta": 0.0}
@@ -150,6 +174,27 @@ class MissionManager(Node):
         self.rviz_points = []
         self.rviz_ordered_points = []
         self.rviz_preview_path = []
+        self.rviz_solving_method = ""
+        self.rviz_plan_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rviz_tsp"
+        )
+        self.rviz_plan_generation = 0
+        self.rviz_plan_future = None
+        self.rviz_plan_running_request = None
+        self.rviz_plan_queued_request = None
+        self.pending_rviz_start = None
+        self.region_plan_generation = 0
+        self.region_plan_future = None
+        self.region_plan_running_request = None
+        self.region_plan_queued_request = None
+        self.pending_region_start = None
+        self.region_ordered_indices = []
+        self.region_ordered_paths = []
+        self.region_ordered_staging_points = []
+        self.region_transition_paths = []
+        self.region_return_path = []
+        self.region_solving_method = ""
+        self.region_preview_path = []
         self.rviz_recompute_throttle_sec = 0.5
         self.last_rviz_recompute_time = 0.0
         self.region_mode = False
@@ -165,9 +210,12 @@ class MissionManager(Node):
         self.mission_wait_timer = None
         self.mission_run_id = 0
         self.mission_waypoint_pause_sec = self.DEFAULT_WAYPOINT_PAUSE_SEC
+        self.mission_return_to_start = False
+        self.mission_returning_home = False
         self.last_mission_feedback_log_time = 0.0
         self.mission_early_transition_goal = None
         self.region_paths = []
+        self.mission_regions = []
         self.region_path_index = 0
         self.region_phase = ""
         self.cached_region_plan = {}
@@ -179,6 +227,12 @@ class MissionManager(Node):
         self.clearance_started_time = None
         self.clearance_obstacle_frames = 0
         self.clearance_last_scan_stamp = None
+        self.region_obstacle_wait_started = None
+        self.region_obstacle_resume_phase = ""
+        self.region_obstacle_clear_count = 0
+        self.region_obstacle_retry_count = 0
+        self.region_obstacle_reason = ""
+        self.region_obstacle_last_scan_stamp = None
         self.latest_scan = None
         self.last_scan_time = None
         self.tf_consecutive_failures = 0
@@ -250,6 +304,7 @@ class MissionManager(Node):
         self.mission_position_timer = self.create_timer(
             0.25, self._check_mission_early_transition
         )
+        self.rviz_plan_poll_timer = self.create_timer(0.05, self._poll_mission_plans)
         self.get_logger().info("Mission manager ready")
 
     def _odom_cb(self, msg):
@@ -266,9 +321,7 @@ class MissionManager(Node):
         now_sec = self.get_clock().now().nanoseconds / 1e9
         if now_sec - self.last_rviz_recompute_time >= self.rviz_recompute_throttle_sec:
             self.last_rviz_recompute_time = now_sec
-            if self.rviz_points and not self.mission_active:
-                self._recompute_rviz_plan()
-            elif self.inspection_regions and self.have_map and self.map_msg is not None and not self.mission_active:
+            if self.inspection_regions and self.have_map and self.map_msg is not None and not self.mission_active:
                 self._publish_rviz_plan_visuals()
 
     def _scan_cb(self, msg):
@@ -278,10 +331,17 @@ class MissionManager(Node):
     def _map_cb(self, msg):
         self.have_map = True
         self.map_msg = msg
+        if self.inspection_regions and not self.mission_active:
+            self._cancel_pending_region_start(
+                "Region mission planning cancelled because the map changed"
+            )
+            self._recompute_region_preview()
         if self.rviz_points:
+            self._cancel_pending_rviz_start(
+                "RViz mission planning cancelled because the map changed"
+            )
             self._recompute_rviz_plan()
         elif self.inspection_regions and not self.mission_active:
-            self._recompute_region_preview()
             self._publish_rviz_plan_visuals()
 
     def _clicked_point_cb(self, msg):
@@ -295,6 +355,11 @@ class MissionManager(Node):
         if self.region_mode:
             self._add_region_corner(float(msg.point.x), float(msg.point.y))
             return
+        if self.pending_rviz_start is not None:
+            self.get_logger().warn(
+                "Ignoring RViz point while mission planning is pending; cancel the task first"
+            )
+            return
 
         point = make_inspection_point(
             f"RVIZ_{len(self.rviz_points) + 1}",
@@ -303,7 +368,7 @@ class MissionManager(Node):
             0.0,
         )
         valid, reason = self._validate_points_for_setting(
-            self.rviz_points + [point],
+            [point],
             f"RViz mission point {point.point_name}",
         )
         if not valid:
@@ -417,6 +482,16 @@ class MissionManager(Node):
                 "Ignoring RViz navigation goal because an inspection mission is already running"
             )
             return
+        if self.pending_rviz_start is not None:
+            self.get_logger().warn(
+                "Ignoring RViz navigation goal while multi-point mission planning is pending"
+            )
+            return
+        if self.pending_region_start is not None:
+            self.get_logger().warn(
+                "Ignoring RViz navigation goal while region mission planning is pending"
+            )
+            return
 
         if not self.have_map_pose:
             self.get_logger().warn(
@@ -471,22 +546,449 @@ class MissionManager(Node):
     def _recompute_rviz_plan(self):
         self.rviz_ordered_points = list(self.rviz_points)
         self.rviz_preview_path = []
+        self.rviz_solving_method = ""
         if not self.rviz_points:
+            self._invalidate_rviz_plans()
             self._publish_rviz_plan_visuals()
             return
 
         if self.map_msg is not None and self.have_map_pose:
-            preview = preview_current_order(
-                self.map_msg,
-                (self.current_map_pose["x"], self.current_map_pose["y"]),
-                self.rviz_points,
-            )
-            if preview:
-                self.rviz_preview_path = list(preview.preview_path)
+            self._queue_rviz_plan()
         self._publish_rviz_plan_visuals()
 
+    def _invalidate_rviz_plans(self):
+        self.rviz_plan_generation += 1
+        self.rviz_plan_queued_request = None
+
+    def _cancel_pending_rviz_start(self, reason, publish=True):
+        if self.pending_rviz_start is None:
+            return False
+        self.pending_rviz_start = None
+        self._invalidate_rviz_plans()
+        self._publish_zero_cmd()
+        self.get_logger().warn(reason)
+        if publish:
+            self._publish_mission_status(reason, safety=True)
+        return True
+
+    def _queue_rviz_plan(self, start_request=None):
+        self.rviz_plan_generation += 1
+        generation = self.rviz_plan_generation
+        request = {
+            "generation": generation,
+            "map_msg": self.map_msg,
+            "start_xy": (
+                self.current_map_pose["x"],
+                self.current_map_pose["y"],
+            ),
+            "points": list(self.rviz_points),
+            "start_request": start_request,
+        }
+        self.rviz_plan_queued_request = request
+        if start_request is not None:
+            self.pending_rviz_start = request
+        if self.rviz_plan_future is None:
+            self._start_queued_rviz_plan()
+        return generation
+
+    def _start_queued_rviz_plan(self):
+        request = self.rviz_plan_queued_request
+        if request is None or self.rviz_plan_future is not None:
+            return
+        self.rviz_plan_queued_request = None
+        generation = request["generation"]
+        self.rviz_plan_running_request = request
+        self.rviz_plan_future = self.rviz_plan_executor.submit(
+            plan_mission_order,
+            request["map_msg"],
+            request["start_xy"],
+            request["points"],
+            True,
+            lambda: generation != self.rviz_plan_generation,
+        )
+
+    def _poll_rviz_plan(self):
+        future = self.rviz_plan_future
+        if future is None or not future.done():
+            return
+
+        request = self.rviz_plan_running_request
+        self.rviz_plan_future = None
+        self.rviz_plan_running_request = None
+        plan = None
+        error = None
+        try:
+            plan = future.result()
+        except Exception as exc:
+            error = exc
+
+        if request is not None and request["generation"] == self.rviz_plan_generation:
+            if error is not None:
+                self.get_logger().error(f"RViz TSP planning failed: {error}")
+            self._apply_completed_rviz_plan(request, plan)
+
+        self._start_queued_rviz_plan()
+
+    def _poll_mission_plans(self):
+        self._poll_rviz_plan()
+        self._poll_region_plan()
+
+    def _apply_completed_rviz_plan(self, request, plan):
+        points = request["points"]
+        ordered_points = []
+        if plan is not None:
+            try:
+                ordered_points = [points[index] for index in plan.ordered_indices]
+            except (IndexError, TypeError):
+                plan = None
+
+        if plan is None:
+            self.rviz_ordered_points = list(points)
+            self.rviz_preview_path = []
+            self.rviz_solving_method = ""
+            message = "RViz mission has no complete collision-free TSP route"
+            self.get_logger().warn(message)
+        else:
+            self.rviz_ordered_points = ordered_points
+            self.rviz_preview_path = list(plan.preview_path)
+            self.rviz_solving_method = plan.solving_method
+            names = " -> ".join(point.point_name for point in ordered_points)
+            self.get_logger().info(
+                f"RViz mission preview optimized with {plan.solving_method}: {names}"
+            )
+        self._publish_rviz_plan_visuals()
+
+        if request["start_request"] is not None:
+            self._finish_pending_rviz_start(request, plan, ordered_points)
+
+    def _finish_pending_rviz_start(self, request, plan, ordered_points):
+        pending = self.pending_rviz_start
+        if pending is None or pending["generation"] != request["generation"]:
+            return
+        self.pending_rviz_start = None
+
+        if plan is None:
+            self._publish_zero_cmd()
+            self._warn_safety(
+                "RViz mission rejected: no complete collision-free TSP route is "
+                "available from the requested robot pose"
+            )
+            return
+
+        validation = validate_mission_points(
+            request["map_msg"],
+            request["start_xy"],
+            request["points"],
+            optimize_order=True,
+            mission_plan=plan,
+        )
+        if not validation.valid:
+            self._publish_zero_cmd()
+            self._warn_safety(f"RViz mission rejected: {validation.message}")
+            return
+        if self.mission_active or self.direct_nav_active:
+            self._publish_zero_cmd()
+            self._warn_safety(
+                "RViz mission planning completed, but another navigation task is active"
+            )
+            return
+        if not self.nav_to_pose_client.server_is_ready():
+            self._publish_zero_cmd()
+            self._warn_safety(
+                "RViz mission planning completed, but /navigate_to_pose is no longer ready"
+            )
+            return
+
+        pause_sec = request["start_request"]["pause_sec"]
+        return_to_start = request["start_request"].get("return_to_start", False)
+        if not self._start_sequential_mission(
+            ordered_points,
+            "rviz",
+            pause_sec,
+            return_to_start=return_to_start,
+        ):
+            self._publish_zero_cmd()
+            self._warn_safety("Failed to start the planned RViz mission")
+            return
+
+        names = " -> ".join(point.point_name for point in ordered_points[:12])
+        if len(ordered_points) > 12:
+            names += f" -> ... ({len(ordered_points)} total)"
+        message = (
+            f"Sequential mission started with {len(ordered_points)} points from rviz, "
+            f"pause={pause_sec:.1f}s, ordering={plan.solving_method}, "
+            f"return_to_start={str(return_to_start).lower()}: {names}"
+        )
+        self.get_logger().info(message)
+        self._publish_mission_status(message)
+
     def _recompute_region_preview(self):
+        self._cancel_pending_region_start(
+            "Pending region mission cancelled because its regions changed"
+        )
+        self._invalidate_region_plans()
         self.region_preview_points = self._generate_region_points()
+        self.region_ordered_indices = list(range(len(self.inspection_regions)))
+        self.region_ordered_paths = []
+        self.region_ordered_staging_points = []
+        self.region_transition_paths = []
+        self.region_return_path = []
+        self.region_solving_method = ""
+        self.region_preview_path = []
+        if (
+            self.region_generation_error is None
+            and self.inspection_regions
+            and self.have_map
+            and self.map_msg is not None
+            and self.have_map_pose
+            and not self.mission_active
+        ):
+            self._queue_region_plan()
+
+    def _invalidate_region_plans(self):
+        self.region_plan_generation += 1
+        self.region_plan_queued_request = None
+
+    def _cancel_pending_region_start(self, reason, publish=True):
+        if self.pending_region_start is None:
+            return False
+        self.pending_region_start = None
+        self._invalidate_region_plans()
+        self._publish_zero_cmd()
+        self.get_logger().warn(reason)
+        if publish:
+            self._publish_mission_status(reason, safety=True)
+        return True
+
+    def _clone_region_route(self, route, reverse=False):
+        source = reversed(route) if reverse else route
+        cloned = [
+            make_inspection_point(point.point_name, point.x, point.y, point.theta)
+            for point in source
+        ]
+        assign_path_headings(cloned)
+        return cloned
+
+    def _build_region_route_options(self):
+        base_paths = generate_chassis_region_paths(
+            self.inspection_regions, self.sweep_spacing, self.region_margin
+        )
+        if not base_paths or any(not path for path in base_paths):
+            return None
+        grid = GridMap.from_occupancy_grid(self.map_msg)
+        option_groups = []
+        route_groups = []
+        staging_groups = []
+        offset = self.region_margin + self.region_staging_distance
+        for region, route in zip(self.inspection_regions, base_paths):
+            options = []
+            routes = []
+            stagings = []
+            for reverse in (False, True):
+                ordered = self._clone_region_route(route, reverse=reverse)
+                if len(ordered) < 2:
+                    continue
+                first, second = ordered[0], ordered[1]
+                dx, dy = second.x - first.x, second.y - first.y
+                length = math.hypot(dx, dy)
+                if length < 1e-6:
+                    continue
+                ux, uy = dx / length, dy / length
+                sx, sy = first.x - ux * offset, first.y - uy * offset
+                gx, gy = grid.world_to_grid(sx, sy)
+                if not grid.is_valid(gx, gy):
+                    continue
+                staging_heading = math.atan2(first.y - sy, first.x - sx)
+                staging = make_inspection_point(
+                    f"{region.name}_STAGING", sx, sy, staging_heading
+                )
+                last = ordered[-1]
+                options.append(
+                    RegionRouteOption(
+                        entry_xy=(sx, sy),
+                        exit_xy=(last.x, last.y),
+                        entry_heading=staging_heading,
+                        exit_heading=last.theta,
+                    )
+                )
+                routes.append(ordered)
+                stagings.append(staging)
+            if not options:
+                return None
+            option_groups.append(options)
+            route_groups.append(routes)
+            staging_groups.append(stagings)
+        return option_groups, route_groups, staging_groups
+
+    def _queue_region_plan(self, start_request=None):
+        built = self._build_region_route_options()
+        if built is None:
+            if start_request is not None:
+                self._warn_safety(
+                    "Region mission rejected: one or more regions have no valid staging direction"
+                )
+            return None
+        option_groups, route_groups, staging_groups = built
+        self.region_plan_generation += 1
+        generation = self.region_plan_generation
+        return_to_start = bool(
+            start_request and start_request.get("return_to_start", False)
+        )
+        request = {
+            "generation": generation,
+            "map_msg": self.map_msg,
+            "start_pose": (
+                self.current_map_pose["x"],
+                self.current_map_pose["y"],
+                self.current_map_pose["theta"],
+            ),
+            "end_pose": (
+                self.mission_home_x,
+                self.mission_home_y,
+                self.mission_home_yaw,
+            )
+            if return_to_start
+            else None,
+            "regions": list(self.inspection_regions),
+            "option_groups": option_groups,
+            "route_groups": route_groups,
+            "staging_groups": staging_groups,
+            "start_request": start_request,
+        }
+        self.region_plan_queued_request = request
+        if start_request is not None:
+            self.pending_region_start = request
+        if self.region_plan_future is None:
+            self._start_queued_region_plan()
+        return generation
+
+    def _start_queued_region_plan(self):
+        request = self.region_plan_queued_request
+        if request is None or self.region_plan_future is not None:
+            return
+        self.region_plan_queued_request = None
+        generation = request["generation"]
+        self.region_plan_running_request = request
+        self.region_plan_future = self.rviz_plan_executor.submit(
+            plan_region_mission_order,
+            request["map_msg"],
+            request["start_pose"],
+            request["option_groups"],
+            request["end_pose"],
+            True,
+            lambda: generation != self.region_plan_generation,
+        )
+
+    def _poll_region_plan(self):
+        future = self.region_plan_future
+        if future is None or not future.done():
+            return
+        request = self.region_plan_running_request
+        self.region_plan_future = None
+        self.region_plan_running_request = None
+        plan = None
+        error = None
+        try:
+            plan = future.result()
+        except Exception as exc:
+            error = exc
+        if request is not None and request["generation"] == self.region_plan_generation:
+            if error is not None:
+                self.get_logger().error(f"Region TSP planning failed: {error}")
+            self._apply_completed_region_plan(request, plan)
+        self._start_queued_region_plan()
+
+    def _compose_region_preview_path(self, paths, transitions, return_path):
+        combined = []
+        for index, route in enumerate(paths):
+            if index < len(transitions):
+                combined.extend(transitions[index])
+            combined.extend((point.x, point.y) for point in route)
+        combined.extend(return_path)
+        return combined
+
+    def _apply_completed_region_plan(self, request, plan):
+        if plan is None:
+            self.region_ordered_indices = list(range(len(request["regions"])))
+            self.region_ordered_paths = []
+            self.region_ordered_staging_points = []
+            self.region_transition_paths = []
+            self.region_return_path = []
+            self.region_solving_method = ""
+            self.region_preview_path = []
+            self.get_logger().warn(
+                "Region mission has no complete collision-free TSP route"
+            )
+        else:
+            paths = []
+            stagings = []
+            for region_index, option_index in zip(
+                plan.ordered_indices, plan.option_indices
+            ):
+                paths.append(request["route_groups"][region_index][option_index])
+                stagings.append(request["staging_groups"][region_index][option_index])
+            self.region_ordered_indices = list(plan.ordered_indices)
+            self.region_ordered_paths = paths
+            self.region_ordered_staging_points = stagings
+            self.region_transition_paths = list(plan.transition_paths)
+            self.region_return_path = list(plan.return_path)
+            self.region_solving_method = plan.solving_method
+            self.region_preview_path = self._compose_region_preview_path(
+                paths, plan.transition_paths, plan.return_path
+            )
+            names = " -> ".join(
+                request["regions"][index].name for index in plan.ordered_indices
+            )
+            self.get_logger().info(
+                f"Region mission preview optimized with {plan.solving_method}: {names}"
+            )
+        self._publish_rviz_plan_visuals()
+        if request["start_request"] is not None:
+            self._finish_pending_region_start(request, plan)
+
+    def _finish_pending_region_start(self, request, plan):
+        pending = self.pending_region_start
+        if pending is None or pending["generation"] != request["generation"]:
+            return
+        self.pending_region_start = None
+        if plan is None:
+            self._publish_zero_cmd()
+            self._warn_safety(
+                "Region mission rejected: no complete collision-free region TSP route is available"
+            )
+            return
+        if self.mission_active or self.direct_nav_active:
+            self._publish_zero_cmd()
+            self._warn_safety(
+                "Region mission planning completed, but another navigation task is active"
+            )
+            return
+        if not self.nav_to_pose_client.server_is_ready():
+            self._publish_zero_cmd()
+            self._warn_safety(
+                "Region mission planning completed, but /navigate_to_pose is no longer ready"
+            )
+            return
+        regions = [request["regions"][index] for index in plan.ordered_indices]
+        if not self._start_region_path_mission(
+            regions,
+            self.region_ordered_paths,
+            self.region_ordered_staging_points,
+            self.region_transition_paths,
+            plan.solving_method,
+            return_to_start=request["start_request"].get("return_to_start", False),
+        ):
+            self._publish_zero_cmd()
+            self._warn_safety("Failed to start the planned region mission")
+            return
+        names = " -> ".join(region.name for region in regions)
+        message = (
+            f"Region mission started with {len(regions)} region(s), "
+            f"ordering={plan.solving_method}, "
+            f"return_to_start={str(self.mission_return_to_start).lower()}: {names}"
+        )
+        self.get_logger().info(message)
+        self._publish_mission_status(message)
 
     def _generate_region_points(self):
         paths = generate_chassis_region_paths(
@@ -518,6 +1020,7 @@ class MissionManager(Node):
             self.map_msg,
             (self.current_map_pose["x"], self.current_map_pose["y"]),
             points,
+            check_route=False,
         )
         if not validation.valid:
             return False, f"{context} rejected: {validation.message}"
@@ -667,7 +1170,7 @@ class MissionManager(Node):
             text.color.g = 0.85
             text.color.b = 0.30
             text.color.a = 1.0
-            text.text = str(index)
+            text.text = str(index) if self.rviz_solving_method else "…"
             marker_array.markers.append(text)
 
         if self.pending_region_corner is not None:
@@ -736,8 +1239,21 @@ class MissionManager(Node):
             marker_array.markers.append(dot)
 
         region_base_id = next_marker_id + 100
-        for index, region in enumerate(self.inspection_regions, start=1):
-            self._append_region_markers(marker_array, stamp, index, region, region_base_id)
+        order_by_original_index = {
+            original_index: order_index + 1
+            for order_index, original_index in enumerate(self.region_ordered_indices)
+        }
+        for original_index, region in enumerate(self.inspection_regions):
+            self._append_region_markers(
+                marker_array,
+                stamp,
+                original_index + 1,
+                region,
+                region_base_id,
+                order_by_original_index.get(original_index)
+                if self.region_solving_method
+                else None,
+            )
 
         self.marker_pub.publish(marker_array)
 
@@ -771,19 +1287,11 @@ class MissionManager(Node):
         self.preview_pub.publish(path_msg)
 
     def _compute_inter_region_preview_path(self):
-        if not self.region_preview_points or not self.have_map or self.map_msg is None or not self.have_map_pose:
-            return []
-        start_xy = (self.current_map_pose["x"], self.current_map_pose["y"])
-        preview = preview_current_order(
-            self.map_msg,
-            start_xy,
-            self.region_preview_points,
-        )
-        if preview:
-            return preview.preview_path
-        return []
+        return list(self.region_preview_path)
 
-    def _append_region_markers(self, marker_array, stamp, index, region, base_id):
+    def _append_region_markers(
+        self, marker_array, stamp, index, region, base_id, display_order=None
+    ):
         width = region.max_x - region.min_x
         height = region.max_y - region.min_y
         region_marker_id = base_id + (index - 1) * 20
@@ -870,10 +1378,11 @@ class MissionManager(Node):
         label.color.g = 0.78
         label.color.b = 0.95
         label.color.a = 1.0
+        order_text = str(display_order) if display_order is not None else "\u2026"
         label.text = (
-            f"\u533a\u57df {index} \u53d7\u963b"
+            f"{order_text}. {region.name} \u53d7\u963b"
             if blocked
-            else f"\u533a\u57df {index} ({width:.1f}\u00d7{height:.1f})"
+            else f"{order_text}. {region.name} ({width:.1f}\u00d7{height:.1f})"
         )
         marker_array.markers.append(label)
 
@@ -968,9 +1477,14 @@ class MissionManager(Node):
 
     def _handle_clear_rviz_points(self, _request, response):
         count = len(self.rviz_points)
+        self._cancel_pending_rviz_start(
+            "Pending RViz mission cancelled because its points were cleared"
+        )
+        self._invalidate_rviz_plans()
         self.rviz_points = []
         self.rviz_ordered_points = []
         self.rviz_preview_path = []
+        self.rviz_solving_method = ""
         self._publish_rviz_plan_visuals()
         response.success = True
         response.message = f"Cleared {count} RViz mission points"
@@ -992,9 +1506,21 @@ class MissionManager(Node):
 
     def _handle_clear_inspection_regions(self, _request, response):
         count = len(self.inspection_regions)
+        self._cancel_pending_region_start(
+            "Pending region mission planning aborted because regions were cleared",
+            publish=False,
+        )
+        self._invalidate_region_plans()
         self.inspection_regions = []
         self.region_preview_points = []
         self.region_generation_error = None
+        self.region_ordered_indices = []
+        self.region_ordered_paths = []
+        self.region_ordered_staging_points = []
+        self.region_transition_paths = []
+        self.region_return_path = []
+        self.region_solving_method = ""
+        self.region_preview_path = []
         self.pending_region_corner = None
         self.region_blocked_names = []
         self._publish_rviz_plan_visuals()
@@ -1023,6 +1549,9 @@ class MissionManager(Node):
                 "chassis_position_tolerance": self.chassis_position_tolerance,
                 "chassis_angle_tolerance": self.chassis_angle_tolerance,
                 "chassis_obstacle_distance": self.chassis_obstacle_distance,
+                "region_obstacle_wait_sec": self.region_obstacle_wait_sec,
+                "region_obstacle_clear_frames": self.region_obstacle_clear_frames,
+                "region_obstacle_max_retries": self.region_obstacle_max_retries,
                 "region_obstacle_inset": self.region_obstacle_inset,
                 "region_staging_distance": self.region_staging_distance,
                 "clearance_cluster_distance": self.clearance_cluster_distance,
@@ -1095,6 +1624,28 @@ class MissionManager(Node):
             self.chassis_obstacle_distance = float(
                 data.get("chassis_obstacle_distance", self.chassis_obstacle_distance)
             )
+            self.region_obstacle_wait_sec = max(
+                0.1,
+                float(data.get("region_obstacle_wait_sec", self.region_obstacle_wait_sec)),
+            )
+            self.region_obstacle_clear_frames = max(
+                1,
+                int(
+                    data.get(
+                        "region_obstacle_clear_frames",
+                        self.region_obstacle_clear_frames,
+                    )
+                ),
+            )
+            self.region_obstacle_max_retries = max(
+                0,
+                int(
+                    data.get(
+                        "region_obstacle_max_retries",
+                        self.region_obstacle_max_retries,
+                    )
+                ),
+            )
             self.region_obstacle_inset = float(
                 data.get("region_obstacle_inset", self.region_obstacle_inset)
             )
@@ -1143,12 +1694,30 @@ class MissionManager(Node):
         stop = Twist()
         self.cmd_vel_nav_pub.publish(stop)
 
+    def _handle_region_sensor_failure(self, reason):
+        """Stop immediately and skip the region after repeated sensor failures."""
+        self._publish_zero_cmd()
+        self.tf_consecutive_failures += 1
+        if self.tf_consecutive_failures >= 5:
+            self._skip_current_region(reason)
+            return True
+        return False
+
     def _handle_abort_mission(self, _request, response):
         self._publish_zero_cmd()
         aborted = []
         errors = []
         mission_was_active = self.mission_active
         self.mission_run_id += 1
+
+        if self._cancel_pending_rviz_start(
+            "Pending RViz mission planning aborted", publish=False
+        ):
+            aborted.append("RViz mission planning")
+        if self._cancel_pending_region_start(
+            "Pending region mission planning aborted", publish=False
+        ):
+            aborted.append("region mission planning")
 
         if self.mission_wait_timer is not None:
             self._clear_mission_wait_timer()
@@ -1188,6 +1757,10 @@ class MissionManager(Node):
             response.success = True
             response.message = f"Abort requested for {', '.join(aborted)} and stop command sent"
             self.get_logger().warn(response.message)
+        else:
+            response.success = True
+            response.message = "No active mission; stop command sent"
+            self.get_logger().info(response.message)
         self._publish_mission_status(response.message)
         return response
 
@@ -1217,9 +1790,11 @@ class MissionManager(Node):
             response.success = False
             response.message = "No RViz points to undo"
             return response
+        self._cancel_pending_rviz_start(
+            "Pending RViz mission cancelled because its points changed"
+        )
         removed = self.rviz_points.pop()
         self._recompute_rviz_plan()
-        self._publish_rviz_plan_visuals()
         response.success = True
         response.message = f"Undone point {removed.point_name}. {len(self.rviz_points)} point(s) remaining"
         self.get_logger().info(response.message)
@@ -1233,6 +1808,14 @@ class MissionManager(Node):
         if self.direct_nav_active:
             response.success = False
             response.message = "A direct RViz navigation goal is already running"
+            return response
+        if self.pending_rviz_start is not None:
+            response.success = False
+            response.message = "RViz mission planning is already in progress"
+            return response
+        if self.pending_region_start is not None:
+            response.success = False
+            response.message = "Region mission planning is already in progress"
             return response
 
         region_points = []
@@ -1282,6 +1865,81 @@ class MissionManager(Node):
         pause_sec = self._clamp_waypoint_pause(
             getattr(request, "waypoint_pause_sec", self.DEFAULT_WAYPOINT_PAUSE_SEC)
         )
+        return_to_start = bool(getattr(request, "return_to_start", False))
+        if return_to_start:
+            home_valid, home_message = self._validate_mission_home()
+            if not home_valid:
+                response.success = False
+                response.message = home_message
+                self.get_logger().warn(f"Mission request rejected: {response.message}")
+                self._publish_mission_status(response.message, safety=True)
+                return response
+
+        if source == "region":
+            location_validation = validate_mission_points(
+                self.map_msg,
+                (self.current_map_pose["x"], self.current_map_pose["y"]),
+                points,
+                check_route=False,
+            )
+            if not location_validation.valid:
+                response.success = False
+                response.message = (
+                    f"Inspection region mission rejected: {location_validation.message}"
+                )
+                self.get_logger().warn(response.message)
+                self._publish_mission_status(response.message, safety=True)
+                return response
+            self._publish_zero_cmd()
+            generation = self._queue_region_plan(
+                start_request={"return_to_start": return_to_start}
+            )
+            if generation is None:
+                response.success = False
+                response.message = (
+                    "Inspection region mission rejected: one or more regions have no valid staging direction"
+                )
+                return response
+            response.success = True
+            response.message = (
+                f"Region TSP planning accepted for {len(self.inspection_regions)} region(s); "
+                "the robot will remain stopped until a current plan is ready; "
+                f"return_to_start={str(return_to_start).lower()}"
+            )
+            self.get_logger().info(response.message)
+            self._publish_mission_status(response.message)
+            return response
+
+        if source == "rviz":
+            location_validation = validate_mission_points(
+                self.map_msg,
+                (self.current_map_pose["x"], self.current_map_pose["y"]),
+                points,
+                check_route=False,
+            )
+            if not location_validation.valid:
+                response.success = False
+                response.message = location_validation.message
+                self.get_logger().warn(response.message)
+                self._publish_mission_status(response.message, safety=True)
+                return response
+
+            self._publish_zero_cmd()
+            self._queue_rviz_plan(
+                start_request={
+                    "pause_sec": pause_sec,
+                    "return_to_start": return_to_start,
+                }
+            )
+            response.success = True
+            response.message = (
+                f"RViz TSP planning accepted for {len(points)} points; "
+                "the robot will remain stopped until a current plan is ready; "
+                f"return_to_start={str(return_to_start).lower()}"
+            )
+            self.get_logger().info(response.message)
+            self._publish_mission_status(response.message)
+            return response
 
         validation = validate_mission_points(
             self.map_msg,
@@ -1299,19 +1957,9 @@ class MissionManager(Node):
             return response
 
         ordered_points = list(points)
-        if source == "region":
-            region_paths = generate_chassis_region_paths(
-                self.inspection_regions, self.sweep_spacing, self.region_margin
-            )
-            if not region_paths or any(not path for path in region_paths):
-                response.success = False
-                response.message = "Failed to generate one or more chassis inspection paths"
-                return response
-            if not self._start_region_path_mission(region_paths):
-                response.success = False
-                response.message = "Failed to start continuous region mission"
-                return response
-        elif not self._start_sequential_mission(ordered_points, source, pause_sec):
+        if not self._start_sequential_mission(
+            ordered_points, source, pause_sec, return_to_start=return_to_start
+        ):
             response.success = False
             response.message = "Failed to start sequential mission"
             return response
@@ -1320,16 +1968,10 @@ class MissionManager(Node):
         if len(ordered_points) > 12:
             names += f" -> ... ({len(ordered_points)} total)"
         response.success = True
-        if source == "region":
-            response.message = (
-                f"Chassis-program region mission started with {len(ordered_points)} waypoints "
-                f"from {len(self.inspection_regions)} region(s), spacing={self.sweep_spacing:.2f}m"
-            )
-        else:
-            response.message = (
-                f"Sequential mission started with {len(ordered_points)} points from {source}, "
-                f"pause={pause_sec:.1f}s: {names}"
-            )
+        response.message = (
+            f"Sequential mission started with {len(ordered_points)} points from {source}, "
+            f"pause={pause_sec:.1f}s, return_to_start={str(return_to_start).lower()}: {names}"
+        )
         self.get_logger().info(response.message)
         self._publish_mission_status(response.message)
         return response
@@ -1350,103 +1992,76 @@ class MissionManager(Node):
             pause_sec = self.DEFAULT_WAYPOINT_PAUSE_SEC
         return max(0.0, min(self.MAX_WAYPOINT_PAUSE_SEC, pause_sec))
 
-    def _start_region_path_mission(self, region_paths):
+    def _validate_mission_home(self):
+        values = (self.mission_home_x, self.mission_home_y, self.mission_home_yaw)
+        if not all(math.isfinite(value) for value in values):
+            return False, "Return-to-start is unavailable: fixed initial pose is invalid"
+        grid_map = GridMap.from_occupancy_grid(self.map_msg)
+        gx, gy = grid_map.world_to_grid(self.mission_home_x, self.mission_home_y)
+        if not grid_map.in_bounds(gx, gy):
+            return (
+                False,
+                "Return-to-start is unavailable: fixed initial pose "
+                f"({self.mission_home_x:.2f}, {self.mission_home_y:.2f}) is outside map bounds",
+            )
+        if not grid_map.is_valid(gx, gy):
+            return (
+                False,
+                "Return-to-start is unavailable: fixed initial pose "
+                f"({self.mission_home_x:.2f}, {self.mission_home_y:.2f}) is occupied or unknown",
+            )
+        return True, "Fixed mission start pose is valid"
+
+    def _start_region_path_mission(
+        self,
+        regions,
+        region_paths,
+        staging_points,
+        transition_paths,
+        solving_method,
+        return_to_start=False,
+    ):
         self._clear_mission_wait_timer()
-        # A new mission must not inherit blocked regions from an earlier run.
         self.region_blocked_names = []
-        prepared_paths = []
-        staging_points = []
-        for region, route in zip(self.inspection_regions, region_paths):
-            prepared = self._select_region_staging(region, route)
-            if prepared is None:
-                self.get_logger().warn(f"No valid staging point found for {region.name}")
-                prepared_paths.append(list(route))
-                staging_points.append(None)
-            else:
-                selected_route, staging = prepared
-                prepared_paths.append(selected_route)
-                staging_points.append(staging)
+        if (
+            not regions
+            or len(regions) != len(region_paths)
+            or len(regions) != len(staging_points)
+            or len(regions) != len(transition_paths)
+        ):
+            return False
         self.mission_active = True
         self.mission_source = "region"
+        self.mission_return_to_start = bool(return_to_start)
+        self.mission_returning_home = False
         self.mission_run_id += 1
-        self.region_paths = prepared_paths
-        self.region_staging_points = staging_points
+        self.mission_regions = list(regions)
+        self.region_paths = [list(path) for path in region_paths]
+        self.region_staging_points = list(staging_points)
         self.region_path_index = 0
         self.region_phase = "approach"
+        self._reset_region_obstacle_recovery()
+        self.region_solving_method = solving_method
 
         entries = []
-        for i, (region, route, staging) in enumerate(
-            zip(self.inspection_regions, prepared_paths, staging_points)
+        for region, route, staging, nav2_path in zip(
+            self.mission_regions,
+            self.region_paths,
+            self.region_staging_points,
+            transition_paths,
         ):
-            entry = {
-                "region_name": region.name,
-                "staging_point": staging,
-                "chassis_route": route,
-                "nav2_approach_path": [],
-            }
-            if i == 0:
-                if staging is not None and self.have_map_pose:
-                    pose_x = self.current_map_pose["x"]
-                    pose_y = self.current_map_pose["y"]
-                    if self.have_map and self.map_msg is not None:
-                        preview = preview_current_order(
-                            self.map_msg,
-                            (pose_x, pose_y),
-                            [staging],
-                        )
-                        if preview:
-                            entry["nav2_approach_path"] = list(preview.preview_path)
-            else:
-                prev_route = prepared_paths[i - 1]
-                if prev_route and staging is not None:
-                    last_prev = prev_route[-1]
-                    if self.have_map and self.map_msg is not None:
-                        preview = preview_current_order(
-                            self.map_msg,
-                            (last_prev.x, last_prev.y),
-                            [staging],
-                        )
-                        if preview:
-                            entry["nav2_approach_path"] = list(preview.preview_path)
-            entries.append(entry)
+            entries.append(
+                {
+                    "region_name": region.name,
+                    "staging_point": staging,
+                    "chassis_route": route,
+                    "nav2_approach_path": list(nav2_path),
+                }
+            )
 
         self.cached_region_plan = {"entries": entries}
         self._publish_mission_snapshot()
         return self._send_region_approach_goal()
-
-    def _select_region_staging(self, region, route):
-        if len(route) < 2 or self.map_msg is None:
-            return None
-        candidates = []
-        for ordered in (list(route), list(reversed(route))):
-            if ordered is not route:
-                ordered = [
-                    make_inspection_point(p.point_name, p.x, p.y, p.theta) for p in ordered
-                ]
-                assign_path_headings(ordered)
-            first, second = ordered[0], ordered[1]
-            dx, dy = second.x - first.x, second.y - first.y
-            length = math.hypot(dx, dy)
-            if length < 1e-6:
-                continue
-            ux, uy = dx / length, dy / length
-            offset = self.region_margin + self.region_staging_distance
-            sx, sy = first.x - ux * offset, first.y - uy * offset
-            theta = math.atan2(first.y - sy, first.x - sx)
-            grid = GridMap.from_occupancy_grid(self.map_msg)
-            gx, gy = grid.world_to_grid(sx, sy)
-            if not grid.is_valid(gx, gy):
-                continue
-            distance = math.hypot(
-                sx - self.current_map_pose["x"], sy - self.current_map_pose["y"]
-            )
-            candidates.append(
-                (distance, ordered, make_inspection_point(f"{region.name}_STAGING", sx, sy, theta))
-            )
-        if not candidates:
-            return None
-        _, selected_route, staging = min(candidates, key=lambda item: item[0])
-        return selected_route, staging
 
     def _send_region_approach_goal(self):
         if not self.mission_active or self.region_path_index >= len(self.region_paths):
@@ -1501,8 +2116,9 @@ class MissionManager(Node):
             self._finish_mission_failed(f"Region approach result failed: {exc}")
             return
         if result.error_code != NavigateToPose.Result.NONE:
-            self._finish_mission_failed(
-                f"Global approach to region {self.region_path_index + 1} failed: {result.error_msg}"
+            self._skip_current_region(
+                f"Nav2 approach failed with code {result.error_code}: "
+                f"{result.error_msg or 'no error details'}"
             )
             return
         static_obstacle = self._region_static_obstacle()
@@ -1517,6 +2133,7 @@ class MissionManager(Node):
         self.clearance_obstacle_frames = 0
         self.clearance_last_scan_stamp = None
         self.tf_consecutive_failures = 0
+        self._reset_region_obstacle_recovery()
         self._publish_mission_snapshot()
         self._start_region_control_timer()
         self.get_logger().info(
@@ -1593,7 +2210,7 @@ class MissionManager(Node):
         return points
 
     def _point_in_current_region(self, x, y):
-        region = self.inspection_regions[self.region_path_index]
+        region = self.mission_regions[self.region_path_index]
         inset = max(0.0, self.region_obstacle_inset)
         return (
             region.min_x + inset < x < region.max_x - inset
@@ -1610,7 +2227,7 @@ class MissionManager(Node):
         if self.map_msg is None:
             return None
         grid = GridMap.from_occupancy_grid(self.map_msg)
-        region = self.inspection_regions[self.region_path_index]
+        region = self.mission_regions[self.region_path_index]
         inset = max(0.0, self.region_obstacle_inset)
         min_gx, min_gy = grid.world_to_grid(region.min_x + inset, region.min_y + inset)
         max_gx, max_gy = grid.world_to_grid(region.max_x - inset, region.max_y - inset)
@@ -1663,14 +2280,12 @@ class MissionManager(Node):
 
     def _clearance_tick(self):
         if not self._laser_fresh():
-            self.tf_consecutive_failures += 1
-            if self.tf_consecutive_failures >= 5:
-                self._skip_current_region("laser timeout")
+            self._handle_region_sensor_failure("laser timeout")
             return
         if not self._update_pose_from_tf():
-            self.tf_consecutive_failures += 1
-            if self.tf_consecutive_failures >= 5:
-                self._skip_current_region("map to base_link transform unavailable")
+            self._handle_region_sensor_failure(
+                "map to base_link transform unavailable"
+            )
             return
         self.tf_consecutive_failures = 0
         stamp = self.latest_scan.header.stamp
@@ -1687,7 +2302,7 @@ class MissionManager(Node):
                 if self.clearance_obstacle_frames >= self.clearance_required_frames:
                     cx = sum(point[0] for point in cluster) / len(cluster)
                     cy = sum(point[1] for point in cluster) / len(cluster)
-                    self._skip_current_region(
+                    self._begin_region_obstacle_recovery(
                         f"laser obstacle cluster inside region: points={len(cluster)}, "
                         f"frames={self.clearance_obstacle_frames}, center=({cx:.2f}, {cy:.2f})"
                     )
@@ -1696,6 +2311,7 @@ class MissionManager(Node):
                 self.clearance_obstacle_frames = 0
         elapsed = (self.get_clock().now() - self.clearance_started_time).nanoseconds / 1e9
         if elapsed >= self.clearance_observation_sec:
+            self._reset_region_obstacle_recovery()
             self.region_phase = "rotate"
             self._publish_mission_snapshot()
             self.get_logger().info(
@@ -1732,22 +2348,121 @@ class MissionManager(Node):
         nearby = [(x, y) for x, y in points if math.hypot(x - px, y - py) < radius]
         return len(self._largest_scan_cluster(nearby)) >= 2
 
+    def _reset_region_obstacle_recovery(self, reset_retries=True):
+        self.region_obstacle_wait_started = None
+        self.region_obstacle_resume_phase = ""
+        self.region_obstacle_clear_count = 0
+        self.region_obstacle_reason = ""
+        self.region_obstacle_last_scan_stamp = None
+        if reset_retries:
+            self.region_obstacle_retry_count = 0
+
+    def _begin_region_obstacle_recovery(self, reason):
+        self._publish_zero_cmd()
+        if self.region_phase == "obstacle_wait":
+            return True
+        if self.region_obstacle_retry_count >= self.region_obstacle_max_retries:
+            self._skip_current_region(
+                f"obstacle recovery exhausted after {self.region_obstacle_retry_count} "
+                f"attempt(s): {reason}"
+            )
+            return False
+        self.region_obstacle_retry_count += 1
+        self.region_obstacle_resume_phase = self.region_phase
+        self.region_obstacle_wait_started = self.get_clock().now()
+        self.region_obstacle_clear_count = 0
+        self.region_obstacle_reason = reason
+        self.region_phase = "obstacle_wait"
+        self._warn_safety(
+            f"Region {self.mission_regions[self.region_path_index].name} obstacle detected; "
+            f"stopped for clearance observation "
+            f"({self.region_obstacle_retry_count}/{self.region_obstacle_max_retries})"
+        )
+        self._publish_mission_snapshot()
+        return True
+
+    def _region_obstacle_still_blocked(self):
+        resume_phase = self.region_obstacle_resume_phase
+        if resume_phase == "clearance":
+            points = self._scan_points_in_current_region()
+            if points is None:
+                return True
+            return len(self._largest_scan_cluster(points)) >= self.clearance_min_points
+        if resume_phase == "rotate":
+            return self._nearby_obstacle()
+        if resume_phase == "drive":
+            route = self.region_paths[self.region_path_index]
+            if self.region_target_index >= len(route):
+                return False
+            return self._motion_corridor_blocked(route[self.region_target_index])
+        return True
+
+    def _region_obstacle_recovery_tick(self):
+        self._publish_zero_cmd()
+        if self.region_obstacle_wait_started is None:
+            self._skip_current_region("obstacle recovery state is invalid")
+            return
+
+        elapsed = (
+            self.get_clock().now() - self.region_obstacle_wait_started
+        ).nanoseconds / 1e9
+        stamp = self.latest_scan.header.stamp
+        stamp_key = (stamp.sec, stamp.nanosec)
+        if self._region_obstacle_still_blocked():
+            self.region_obstacle_clear_count = 0
+            self.region_obstacle_last_scan_stamp = stamp_key
+            if elapsed >= self.region_obstacle_wait_sec:
+                self._skip_current_region(
+                    f"obstacle remained for {self.region_obstacle_wait_sec:.1f}s: "
+                    f"{self.region_obstacle_reason}"
+                )
+            return
+
+        if stamp_key == self.region_obstacle_last_scan_stamp:
+            return
+        self.region_obstacle_last_scan_stamp = stamp_key
+        self.region_obstacle_clear_count += 1
+        if elapsed >= self.region_obstacle_wait_sec:
+            self._skip_current_region(
+                f"obstacle clearance was not stable for "
+                f"{self.region_obstacle_clear_frames} consecutive frame(s)"
+            )
+            return
+        if self.region_obstacle_clear_count < self.region_obstacle_clear_frames:
+            return
+
+        resume_phase = self.region_obstacle_resume_phase
+        region_name = self.mission_regions[self.region_path_index].name
+        self._reset_region_obstacle_recovery(reset_retries=False)
+        self.region_phase = resume_phase
+        if resume_phase == "clearance":
+            self.clearance_started_time = self.get_clock().now()
+            self.clearance_obstacle_frames = 0
+            self.clearance_last_scan_stamp = None
+        self.get_logger().info(
+            f"Region {region_name} obstacle cleared; resuming {resume_phase} phase"
+        )
+        self._publish_mission_status(
+            f"Region {region_name} obstacle cleared; resuming inspection"
+        )
+        self._publish_mission_snapshot()
+
     def _region_control_tick(self):
         if not self.mission_active or self.mission_source != "region":
             self._stop_region_control_timer()
             return
         if not self._laser_fresh():
-            self.tf_consecutive_failures += 1
-            if self.tf_consecutive_failures >= 5:
-                self._skip_current_region("laser timeout")
+            self._handle_region_sensor_failure("laser timeout")
             return
         if not self._update_pose_from_tf():
-            self._publish_zero_cmd()
-            self.tf_consecutive_failures += 1
-            if self.tf_consecutive_failures >= 5:
-                self._skip_current_region("map to base_link transform unavailable")
+            self._handle_region_sensor_failure(
+                "map to base_link transform unavailable"
+            )
             return
         self.tf_consecutive_failures = 0
+        if self.region_phase == "obstacle_wait":
+            self._region_obstacle_recovery_tick()
+            return
         if self.region_phase == "clearance":
             self._clearance_tick()
             return
@@ -1764,7 +2479,9 @@ class MissionManager(Node):
         command = Twist()
         if self.region_phase == "rotate":
             if self._nearby_obstacle():
-                self._skip_current_region("obstacle detected while turning")
+                self._begin_region_obstacle_recovery(
+                    "obstacle detected while turning"
+                )
                 return
             if abs(error) <= self.chassis_angle_tolerance:
                 self.region_phase = "drive"
@@ -1779,10 +2496,13 @@ class MissionManager(Node):
             self._publish_zero_cmd()
             self.region_target_index += 1
             self.region_phase = "rotate"
+            self._reset_region_obstacle_recovery()
             self._publish_mission_snapshot()
             return
         if self._motion_corridor_blocked(target):
-            self._skip_current_region("obstacle detected in chassis motion corridor")
+            self._begin_region_obstacle_recovery(
+                "obstacle detected in chassis motion corridor"
+            )
             return
         command.linear.x = min(self.chassis_linear_speed, max(0.02, 0.8 * distance))
         command.angular.z = max(-0.20, min(0.20, 1.5 * error))
@@ -1791,8 +2511,9 @@ class MissionManager(Node):
     def _skip_current_region(self, reason):
         self._stop_region_control_timer()
         self._publish_zero_cmd()
-        region_name = self.inspection_regions[self.region_path_index].name
+        region_name = self.mission_regions[self.region_path_index].name
         self.region_blocked_names.append(region_name)
+        self._reset_region_obstacle_recovery()
         self._publish_mission_snapshot()
         self._warn_safety(f"Region {region_name} blocked: {reason}; navigating to next region")
         self._publish_rviz_plan_visuals()
@@ -1820,7 +2541,9 @@ class MissionManager(Node):
             return
         self._send_region_approach_goal()
 
-    def _start_sequential_mission(self, ordered_points, source, pause_sec):
+    def _start_sequential_mission(
+        self, ordered_points, source, pause_sec, return_to_start=False
+    ):
         self._clear_mission_wait_timer()
         self.goal_handle = None
         self.mission_points = list(ordered_points)
@@ -1828,6 +2551,8 @@ class MissionManager(Node):
         self.mission_source = source
         self.mission_run_id += 1
         self.mission_waypoint_pause_sec = pause_sec
+        self.mission_return_to_start = bool(return_to_start)
+        self.mission_returning_home = False
         self.last_mission_feedback_log_time = 0.0
         self.mission_early_transition_goal = None
         self.mission_active = True
@@ -2051,9 +2776,12 @@ class MissionManager(Node):
         self.mission_index = 0
         self.mission_source = ""
         self.mission_waypoint_pause_sec = self.DEFAULT_WAYPOINT_PAUSE_SEC
+        self.mission_return_to_start = False
+        self.mission_returning_home = False
         self.last_mission_feedback_log_time = 0.0
         self.mission_early_transition_goal = None
         self.region_paths = []
+        self.mission_regions = []
         self.region_path_index = 0
         self.region_phase = ""
         self.region_approach_goal_handle = None
@@ -2062,6 +2790,7 @@ class MissionManager(Node):
         self.clearance_started_time = None
         self.clearance_obstacle_frames = 0
         self.clearance_last_scan_stamp = None
+        self._reset_region_obstacle_recovery()
         self.tf_consecutive_failures = 0
         self.cached_region_plan = {}
         self._last_mission_snapshot_time = None
@@ -2235,7 +2964,7 @@ class MissionManager(Node):
 
         self._publish_region_mission_markers(target_array=marker_array)
 
-        for index, region in enumerate(self.inspection_regions, start=1):
+        for index, region in enumerate(self.mission_regions, start=1):
             width = region.max_x - region.min_x
             height = region.max_y - region.min_y
             blocked = region.name in self.region_blocked_names
@@ -2334,18 +3063,141 @@ class MissionManager(Node):
             label.color.g = 0.78
             label.color.b = 0.95
             label.color.a = 1.0
-            label.text = f"\u533a\u57df {index} ({width:.1f}\u00d7{height:.1f})"
+            label.text = f"{index}. {region.name} ({width:.1f}\u00d7{height:.1f})"
             marker_array.markers.append(label)
 
         self.marker_pub.publish(marker_array)
 
     def _finish_mission_success(self):
+        if self.mission_return_to_start and not self.mission_returning_home:
+            self._start_return_to_start()
+            return
+        self._finalize_mission_success("Mission completed successfully")
+
+    def _start_return_to_start(self):
+        self.goal_handle = None
+        self._clear_mission_wait_timer()
+        self._stop_region_control_timer()
+        self._publish_zero_cmd()
+        self.mission_returning_home = True
+        run_id = self.mission_run_id
+        home = self._make_inspection_point(
+            "MISSION_HOME",
+            self.mission_home_x,
+            self.mission_home_y,
+            self.mission_home_yaw,
+        )
+        goal = NavigateToPose.Goal()
+        goal.pose = self._inspection_point_to_pose(home)
+        goal.behavior_tree = ""
+        message = (
+            "Inspection completed successfully; returning to fixed start pose "
+            f"({self.mission_home_x:.2f}, {self.mission_home_y:.2f}, "
+            f"{math.degrees(self.mission_home_yaw):.1f} deg)"
+        )
+        self.get_logger().info(message)
+        self._publish_mission_status(message)
+        try:
+            future = self.nav_to_pose_client.send_goal_async(
+                goal,
+                feedback_callback=lambda feedback_msg, rid=run_id: (
+                    self._return_home_feedback_cb(feedback_msg, rid)
+                ),
+            )
+        except Exception as exc:
+            self._finish_mission_failed(
+                f"Inspection completed, but return-to-start request failed: {exc}"
+            )
+            return
+        future.add_done_callback(
+            lambda done, rid=run_id: self._return_home_goal_response_cb(done, rid)
+        )
+
+    def _return_home_goal_response_cb(self, future, run_id):
+        try:
+            handle = future.result()
+        except Exception as exc:
+            if self._is_current_return_home(run_id):
+                self._finish_mission_failed(
+                    f"Inspection completed, but return-to-start request failed: {exc}"
+                )
+            return
+
+        if not self._is_current_return_home(run_id):
+            if handle.accepted:
+                try:
+                    handle.cancel_goal_async()
+                except Exception as exc:
+                    self.get_logger().warn(
+                        f"Failed to cancel stale return-to-start goal: {exc}"
+                    )
+            return
+        if not handle.accepted:
+            self._finish_mission_failed(
+                "Inspection completed, but return-to-start goal was rejected by Nav2"
+            )
+            return
+
+        self.goal_handle = handle
+        result_future = handle.get_result_async()
+        result_future.add_done_callback(
+            lambda done, rid=run_id, expected=handle: self._return_home_result_cb(
+                done, rid, expected
+            )
+        )
+        self.get_logger().info("Return-to-start goal accepted by Nav2")
+
+    def _return_home_feedback_cb(self, feedback_msg, run_id):
+        if not self._is_current_return_home(run_id):
+            return
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        if now_sec - self.last_mission_feedback_log_time < 2.0:
+            return
+        self.last_mission_feedback_log_time = now_sec
+        self.get_logger().info(
+            "Return-to-start feedback: "
+            f"{feedback_msg.feedback.distance_remaining:.2f} m left"
+        )
+
+    def _return_home_result_cb(self, future, run_id, expected_handle):
+        if not self._is_current_return_home(run_id):
+            return
+        if expected_handle is not self.goal_handle:
+            return
+        self.goal_handle = None
+        try:
+            result = future.result().result
+        except Exception as exc:
+            self._finish_mission_failed(
+                f"Inspection completed, but return-to-start result failed: {exc}"
+            )
+            return
+        if result.error_code != NavigateToPose.Result.NONE:
+            detail = getattr(result, "error_msg", "")
+            self._finish_mission_failed(
+                "Inspection completed, but return-to-start navigation failed with "
+                f"code {result.error_code}: {detail}"
+            )
+            return
+        self._publish_zero_cmd()
+        self._finalize_mission_success(
+            "Mission completed successfully and robot returned to start"
+        )
+
+    def _is_current_return_home(self, run_id):
+        return (
+            self.mission_active
+            and self.mission_returning_home
+            and run_id == self.mission_run_id
+        )
+
+    def _finalize_mission_success(self, message):
         self.goal_handle = None
         self.mission_active = False
         self._clear_mission_wait_timer()
         self._publish_zero_cmd()
-        self.get_logger().info("Mission completed successfully")
-        self._publish_mission_status("Mission completed successfully")
+        self.get_logger().info(message)
+        self._publish_mission_status(message)
         self._clear_mission_state()
 
     def _finish_mission_failed(self, message):
@@ -2408,13 +3260,21 @@ class MissionManager(Node):
             self._publish_zero_cmd()
 
     def destroy_node(self):
+        self.pending_rviz_start = None
+        self.pending_region_start = None
+        self._invalidate_rviz_plans()
+        self._invalidate_region_plans()
+        self.rviz_plan_poll_timer.cancel()
+        self.rviz_plan_executor.shutdown(wait=False, cancel_futures=True)
         # A launcher shutdown or an unhandled exception must not leave the
         # last navigation command active while the downstream gate is still up.
-        self._publish_zero_cmd()
+        context_ok = rclpy.ok()
+        if context_ok:
+            self._publish_zero_cmd()
         self._stop_region_control_timer()
-        if self.goal_handle is not None:
+        if context_ok and self.goal_handle is not None:
             self.goal_handle.cancel_goal_async()
-        if self.direct_goal_handle is not None:
+        if context_ok and self.direct_goal_handle is not None:
             self.direct_goal_handle.cancel_goal_async()
         self._clear_mission_wait_timer()
         super().destroy_node()
@@ -2432,6 +3292,9 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+        except (KeyboardInterrupt, ExternalShutdownException):
+            pass

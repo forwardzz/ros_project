@@ -42,5 +42,7 @@ SERVICE_UNDO_LAST_RVIZ_POINT = "/undo_last_rviz_point"
 
 MAX_LINEAR_SPEED_MPS = 0.18
 MAX_ANGULAR_SPEED_RADPS = 0.55
-DEFAULT_LINEAR_SPEED_MPS = 0.10
-DEFAULT_ANGULAR_SPEED_RADPS = 0.35
+# Conservative raised-track defaults. Operators may increase them only after
+# the low-speed direction, dead-zone, and braking checks have passed.
+DEFAULT_LINEAR_SPEED_MPS = 0.02
+DEFAULT_ANGULAR_SPEED_RADPS = 0.10

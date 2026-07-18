@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed GPIO driver for the tracked inspection vehicle.
-
-The driver is intentionally the final hardware boundary: it accepts only a
-bounded ``geometry_msgs/Twist`` command and immediately de-energizes both
-motors when the command stream is invalid or stale.  It provides no odometry;
-all RPM values below are open-loop estimates.
-"""
+"""Fail-closed V4.0 expansion-board driver for the tracked robot."""
 
 import fcntl
 import math
@@ -15,26 +9,38 @@ import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
 
-try:
-    import RPi.GPIO as GPIO
-    HAS_GPIO = True
-except ImportError:
-    HAS_GPIO = False
+from .motor_board import (
+    BcmGpio,
+    DirectGpioMotorBoard,
+    MOTOR_PAIRS,
+    MotorHardwareError,
+    Pca9685,
+    V40MotorBoard,
+)
+from .motor_control import MotorControllerCore
 
 
 class TrackedMotorDriver(Node):
-    """Direct differential-drive GPIO controller with a watchdog interlock."""
+    """Differential-drive controller with explicit hardware enable interlocks."""
 
-    # Do not make a physical vehicle faster by modifying a launch parameter.
     HARD_MAX_PWM = 70.0
-    HARD_MAX_LINEAR_SPEED = 0.18       # m/s
-    HARD_MAX_ANGULAR_SPEED = 0.55      # rad/s
-    HARD_MAX_LINEAR_ACCEL = 0.35       # m/s²
-    HARD_MAX_ANGULAR_ACCEL = 0.70      # rad/s²
+    HARD_MAX_LINEAR_SPEED = 0.18
+    HARD_MAX_ANGULAR_SPEED = 0.55
+    HARD_MAX_LINEAR_ACCEL = 0.35
+    HARD_MAX_ANGULAR_ACCEL = 0.70
 
     def __init__(self):
         super().__init__("tracked_motor_driver")
-
+        self.declare_parameter("motor_pair", "disabled")
+        # Raised-track single-channel tests confirmed both logical forward
+        # directions match the validated C/left and D/right GPIO interface.
+        self.declare_parameter("left_inverted", False)
+        self.declare_parameter("right_inverted", False)
+        self.declare_parameter("actuation_enabled", False)
+        self.declare_parameter("pca_i2c_bus", 1)
+        self.declare_parameter("pca_i2c_address", 0x40)
+        self.declare_parameter("pca_pwm_frequency_hz", 100.0)
+        self.declare_parameter("gpio_pwm_frequency_hz", 100.0)
         self.declare_parameter("max_rpm", 80.0)
         self.declare_parameter("wheel_radius", 0.025)
         self.declare_parameter("track_width", 0.155)
@@ -52,14 +58,19 @@ class TrackedMotorDriver(Node):
         )
 
         self._driver_lock = None
-        self.gpio_initialized = False
+        self.board = None
+        self.controller = None
         self.actuation_enabled = False
 
         self.max_rpm = self._safe_parameter("max_rpm", 80.0, 1.0, 500.0)
         self.wheel_radius = self._safe_parameter("wheel_radius", 0.025, 0.001, 1.0)
         self.track_width = self._safe_parameter("track_width", 0.155, 0.001, 2.0)
-        self.min_breakout_pwm = self._safe_parameter("min_breakout_pwm", 28.0, 0.0, self.HARD_MAX_PWM)
-        self.max_pwm = self._safe_parameter("max_pwm", 70.0, self.min_breakout_pwm, self.HARD_MAX_PWM)
+        self.min_breakout_pwm = self._safe_parameter(
+            "min_breakout_pwm", 28.0, 0.0, self.HARD_MAX_PWM
+        )
+        self.max_pwm = self._safe_parameter(
+            "max_pwm", 70.0, self.min_breakout_pwm, self.HARD_MAX_PWM
+        )
         self.max_linear_speed = self._safe_parameter(
             "max_linear_speed", 0.18, 0.0, self.HARD_MAX_LINEAR_SPEED
         )
@@ -72,63 +83,143 @@ class TrackedMotorDriver(Node):
         self.max_angular_accel = self._safe_parameter(
             "max_angular_accel", 0.70, 0.0, self.HARD_MAX_ANGULAR_ACCEL
         )
-        self.control_period_sec = self._safe_parameter("control_period_sec", 0.05, 0.01, 0.20)
-        self.command_timeout = self._safe_parameter("command_timeout_sec", 0.35, 0.05, 2.0)
-        self.watchdog_period = self._safe_parameter("watchdog_period_sec", 0.05, 0.02, 0.20)
+        self.control_period_sec = self._safe_parameter(
+            "control_period_sec", 0.05, 0.01, 0.20
+        )
+        self.command_timeout = self._safe_parameter(
+            "command_timeout_sec", 0.35, 0.05, 2.0
+        )
+        self.watchdog_period = self._safe_parameter(
+            "watchdog_period_sec", 0.05, 0.02, 0.20
+        )
 
-        # BCM GPIO pins. Positive rpm is the assumed physical forward direction;
-        # it must be confirmed with wheels suspended before floor testing.
-        self.PWMA, self.AIN1, self.AIN2 = 18, 22, 27   # left motor
-        self.PWMB, self.BIN1, self.BIN2 = 23, 25, 24   # right motor
-
+        requested_enable = bool(self.get_parameter("actuation_enabled").value)
+        motor_pair = str(self.get_parameter("motor_pair").value).strip().lower()
         self._acquire_driver_lock()
-        if self._driver_lock is not None and HAS_GPIO:
-            try:
-                GPIO.setwarnings(False)
-                GPIO.setmode(GPIO.BCM)
-                for pin in [self.PWMA, self.AIN1, self.AIN2,
-                            self.PWMB, self.BIN1, self.BIN2]:
-                    GPIO.setup(pin, GPIO.OUT)
-                self.L_Motor = GPIO.PWM(self.PWMA, 100)
-                self.R_Motor = GPIO.PWM(self.PWMB, 100)
-                self.L_Motor.start(0)
-                self.R_Motor.start(0)
-                self.gpio_initialized = True
-                self.actuation_enabled = True
-                self.get_logger().info(
-                    "GPIO motor pins initialized (hard limits: %.2f m/s, %.2f rad/s, %.0f%% PWM)"
-                    % (self.max_linear_speed, self.max_angular_speed, self.max_pwm)
-                )
-            except Exception as exc:
-                self.get_logger().error("GPIO initialization failed; actuation disabled: %s" % exc)
-                self._release_driver_lock()
-        elif not HAS_GPIO:
-            self.get_logger().error("RPi.GPIO is unavailable; actuation disabled")
-
-        self.left_rpm = 0.0
-        self.right_rpm = 0.0
-        self.target_vx = 0.0
-        self.target_vz = 0.0
-        self.current_vx = 0.0
-        self.current_vz = 0.0
-        self.last_cmd_time = self.get_clock().now()
-
-        self.cmd_vel_sub = self.create_subscription(Twist, "/cmd_vel", self.cmd_vel_cb, 10)
-        self.watchdog_timer = self.create_timer(self.watchdog_period, self.watchdog_cb)
-        self.control_timer = self.create_timer(self.control_period_sec, self.control_cb)
-        if self.actuation_enabled:
-            self.get_logger().info("Motor driver ready; stale or invalid /cmd_vel stops both motors")
+        if self._driver_lock is None:
+            self.get_logger().error("Motor driver lock unavailable; remaining disabled")
+        elif requested_enable and motor_pair in ("ab", "cd"):
+            self._initialize_hardware(motor_pair)
+        elif requested_enable:
+            self.get_logger().error(
+                "Actuation requested but motor_pair is not 'ab' or 'cd'; remaining disabled"
+            )
         else:
-            self.get_logger().error("Motor driver remains non-actuating (fail closed)")
+            self.get_logger().warn(
+                "Motor actuation is disabled by default; outputs will not be initialized"
+            )
+
+        self.cmd_vel_sub = self.create_subscription(
+            Twist, "/cmd_vel", self.cmd_vel_cb, 10
+        )
+        self.watchdog_timer = self.create_timer(
+            self.watchdog_period, self.watchdog_cb
+        )
+        self.control_timer = self.create_timer(
+            self.control_period_sec, self.control_cb
+        )
+
+    def _initialize_hardware(self, motor_pair):
+        pca = None
+        gpio = None
+        try:
+            if motor_pair == "cd":
+                gpio = BcmGpio()
+                self.board = DirectGpioMotorBoard(
+                    gpio,
+                    frequency_hz=self._safe_parameter(
+                        "gpio_pwm_frequency_hz", 100.0, 1.0, 5000.0
+                    ),
+                    left_inverted=bool(
+                        self.get_parameter("left_inverted").value
+                    ),
+                    right_inverted=bool(
+                        self.get_parameter("right_inverted").value
+                    ),
+                )
+                backend = "validated GPIO18/22/27 + GPIO23/25/24"
+            else:
+                channels_to_clear = sorted({
+                    pin.number
+                    for port in MOTOR_PAIRS[motor_pair]
+                    for pin in (port.enable, port.forward, port.reverse)
+                    if pin.kind == "pca"
+                })
+                pca = Pca9685(
+                    bus_number=int(self.get_parameter("pca_i2c_bus").value),
+                    address=int(self.get_parameter("pca_i2c_address").value),
+                    frequency_hz=self._safe_parameter(
+                        "pca_pwm_frequency_hz", 100.0, 24.0, 1526.0
+                    ),
+                    channels_to_clear=channels_to_clear,
+                )
+                self.board = V40MotorBoard(
+                    motor_pair,
+                    pca,
+                    left_inverted=bool(
+                        self.get_parameter("left_inverted").value
+                    ),
+                    right_inverted=bool(
+                        self.get_parameter("right_inverted").value
+                    ),
+                )
+                backend = "PCA9685"
+            self.controller = MotorControllerCore(
+                self.board,
+                max_rpm=self.max_rpm,
+                wheel_radius=self.wheel_radius,
+                track_width=self.track_width,
+                min_breakout_pwm=self.min_breakout_pwm,
+                max_pwm=self.max_pwm,
+                max_linear_speed=self.max_linear_speed,
+                max_angular_speed=self.max_angular_speed,
+                max_linear_accel=self.max_linear_accel,
+                max_angular_accel=self.max_angular_accel,
+                control_period_sec=self.control_period_sec,
+                command_timeout_sec=self.command_timeout,
+                now_sec=self._now_sec(),
+            )
+            self.actuation_enabled = True
+            self.get_logger().warn(
+                "MOTOR ACTUATION ENABLED on pair %s via %s "
+                "(left_inverted=%s, right_inverted=%s)"
+                % (
+                    motor_pair,
+                    backend,
+                    self.get_parameter("left_inverted").value,
+                    self.get_parameter("right_inverted").value,
+                )
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                "Motor board initialization failed; actuation disabled: %s" % exc
+            )
+            if gpio is not None:
+                try:
+                    gpio.close()
+                except Exception:
+                    pass
+            if pca is not None:
+                try:
+                    pca.close()
+                except Exception:
+                    pass
+            self.board = None
+            self.controller = None
+            self._release_driver_lock()
 
     def _safe_parameter(self, name, default, lower, upper):
         try:
             value = float(self.get_parameter(name).value)
         except (TypeError, ValueError):
-            self.get_logger().error("Invalid %s; using safe default %s" % (name, default))
+            self.get_logger().error(
+                "Invalid %s; using safe default %s" % (name, default)
+            )
             value = default
         if not math.isfinite(value):
-            self.get_logger().error("Non-finite %s; using safe default %s" % (name, default))
+            self.get_logger().error(
+                "Non-finite %s; using safe default %s" % (name, default)
+            )
             value = default
         return max(lower, min(upper, value))
 
@@ -142,7 +233,7 @@ class TrackedMotorDriver(Node):
             self._driver_lock = lock
         except OSError as exc:
             self.get_logger().error(
-                "Another motor driver owns GPIO (%s); this instance is non-actuating: %s"
+                "Another motor driver owns the board (%s); remaining disabled: %s"
                 % (path, exc)
             )
             try:
@@ -160,95 +251,54 @@ class TrackedMotorDriver(Node):
             pass
         self._driver_lock = None
 
-    def set_motor(self, is_left, target_rpm):
-        """Control one motor; any invalid request de-energizes that motor."""
-        if not self.actuation_enabled or not self.gpio_initialized:
+    def _now_sec(self):
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _hardware_call(self, callback):
+        if not self.actuation_enabled or self.controller is None:
             return
-        if not math.isfinite(target_rpm):
-            target_rpm = 0.0
-
-        if is_left:
-            in1_pin, in2_pin, pwm_obj = self.AIN1, self.AIN2, self.L_Motor
-        else:
-            in1_pin, in2_pin, pwm_obj = self.BIN1, self.BIN2, self.R_Motor
-
-        abs_rpm = abs(target_rpm)
-        if abs_rpm <= 0.5:
-            pwm_obj.ChangeDutyCycle(0)
-            GPIO.output(in1_pin, False)
-            GPIO.output(in2_pin, False)
-            return
-
-        abs_rpm = min(abs_rpm, self.max_rpm)
-        duty = self.min_breakout_pwm + (self.max_pwm - self.min_breakout_pwm) * (abs_rpm / self.max_rpm)
-        if target_rpm > 0:
-            GPIO.output(in1_pin, True)
-            GPIO.output(in2_pin, False)
-        else:
-            GPIO.output(in1_pin, False)
-            GPIO.output(in2_pin, True)
-        pwm_obj.ChangeDutyCycle(duty)
-
-    def _force_stop(self):
-        self.target_vx = self.target_vz = 0.0
-        self.current_vx = self.current_vz = 0.0
-        self.left_rpm = self.right_rpm = 0.0
-        self.set_motor(True, 0.0)
-        self.set_motor(False, 0.0)
+        try:
+            callback()
+        except (MotorHardwareError, OSError, ValueError) as exc:
+            self.get_logger().fatal(
+                "Motor hardware fault; outputs commanded to zero and actuation latched off: %s"
+                % exc
+            )
+            self.actuation_enabled = False
+            if self.board is not None:
+                try:
+                    self.board.stop()
+                except Exception:
+                    pass
 
     def cmd_vel_cb(self, msg):
         linear_x = float(msg.linear.x)
         angular_z = float(msg.angular.z)
         if not math.isfinite(linear_x) or not math.isfinite(angular_z):
             self.get_logger().error("Invalid /cmd_vel received; stopping motors")
-            self._force_stop()
+            self._hardware_call(self.controller.stop if self.controller else lambda: None)
             return
-        self.last_cmd_time = self.get_clock().now()
-        self.target_vx = max(-self.max_linear_speed, min(self.max_linear_speed, linear_x))
-        self.target_vz = max(-self.max_angular_speed, min(self.max_angular_speed, angular_z))
+        self._hardware_call(
+            lambda: self.controller.set_command(linear_x, angular_z, self._now_sec())
+        )
 
     def control_cb(self):
-        if not self.actuation_enabled:
-            return
-        if self._command_is_stale():
-            self._force_stop()
-            return
-        self.current_vx = self._step_toward(
-            self.current_vx, self.target_vx, self.max_linear_accel * self.control_period_sec
-        )
-        self.current_vz = self._step_toward(
-            self.current_vz, self.target_vz, self.max_angular_accel * self.control_period_sec
-        )
-        left_rad_s = (self.current_vx - self.current_vz * self.track_width / 2.0) / self.wheel_radius
-        right_rad_s = (self.current_vx + self.current_vz * self.track_width / 2.0) / self.wheel_radius
-        self.left_rpm = left_rad_s * 60.0 / (2.0 * math.pi)
-        self.right_rpm = right_rad_s * 60.0 / (2.0 * math.pi)
-        self.set_motor(True, self.left_rpm)
-        self.set_motor(False, self.right_rpm)
-
-    def _command_is_stale(self):
-        return (self.get_clock().now() - self.last_cmd_time).nanoseconds / 1e9 > self.command_timeout
+        self._hardware_call(lambda: self.controller.tick(self._now_sec()))
 
     def watchdog_cb(self):
-        if self._command_is_stale():
-            self._force_stop()
-
-    @staticmethod
-    def _step_toward(current, target, max_step):
-        if target > current:
-            return min(target, current + max_step)
-        if target < current:
-            return max(target, current - max_step)
-        return current
+        self._hardware_call(lambda: self.controller.watchdog(self._now_sec()))
 
     def destroy_node(self):
-        self._force_stop()
-        if self.gpio_initialized:
+        if self.controller is not None:
             try:
-                GPIO.cleanup()
+                self.controller.stop()
             except Exception:
                 pass
-            self.gpio_initialized = False
+        if self.board is not None:
+            try:
+                self.board.close()
+            except Exception:
+                pass
         self.actuation_enabled = False
         self._release_driver_lock()
         super().destroy_node()

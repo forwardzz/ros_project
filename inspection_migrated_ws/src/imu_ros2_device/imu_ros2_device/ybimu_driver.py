@@ -2,25 +2,24 @@
 
 import math
 
-from YbImuLib import YbImuSerial
-
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, MagneticField
 from std_msgs.msg import Float32MultiArray
+from YbImuLib import YbImuSerial
 
 
-DEFAULT_SERIAL_PORT = "/dev/serial/by-id/usb-ATK_ATK-HS-V4-CMSIS-DAP_ATK_20210914-if00"
+DEFAULT_SERIAL_PORT = '/dev/serial/by-id/usb-ATK_ATK-HS-V4-CMSIS-DAP_ATK_20210914-if00'
 FALLBACK_SERIAL_PORTS = [
-    "/dev/myimu",
-    "/dev/ttyACM0",
-    "/dev/ttyACM1",
-    "/dev/ttyACM2",
-    "/dev/ttyACM3",
-    "/dev/ttyUSB0",
-    "/dev/ttyUSB1",
-    "/dev/ttyUSB2",
-    "/dev/ttyUSB3",
+    '/dev/myimu',
+    '/dev/ttyACM0',
+    '/dev/ttyACM1',
+    '/dev/ttyACM2',
+    '/dev/ttyACM3',
+    '/dev/ttyUSB0',
+    '/dev/ttyUSB1',
+    '/dev/ttyUSB2',
+    '/dev/ttyUSB3',
 ]
 
 
@@ -32,8 +31,8 @@ class ybimu_driver(Node):
         self.samples_seen = 0
         self.received_nonzero_data = False
         self.zero_data_warning_sent = False
-        self.declare_parameter("serial_port", DEFAULT_SERIAL_PORT)
-        self.declare_parameter("fallback_serial_ports", FALLBACK_SERIAL_PORTS)
+        self.declare_parameter('serial_port', DEFAULT_SERIAL_PORT)
+        self.declare_parameter('fallback_serial_ports', FALLBACK_SERIAL_PORTS)
 
     def init_topic(self):
         port_list = self._candidate_ports()
@@ -42,27 +41,27 @@ class ybimu_driver(Node):
             try:
                 self.robot = YbImuSerial(port)
                 self.serial_port = port
-                self.get_logger().info("Open Ybimu Port OK:%s" % port)
+                self.get_logger().info('Open Ybimu Port OK:%s' % port)
                 break
             except Exception as exc:
-                open_errors.append("%s: %s" % (port, exc))
+                open_errors.append('%s: %s' % (port, exc))
         if self.robot is None:
             self.get_logger().error(
-                "Fail to open Ybimu serial. Tried: %s" % "; ".join(open_errors)
+                'Fail to open Ybimu serial. Tried: %s' % '; '.join(open_errors)
             )
             return
         self.robot.create_receive_threading()
 
-        self.imuPublisher = self.create_publisher(Imu, "imu/data_raw", 100)
-        self.magPublisher = self.create_publisher(MagneticField, "imu/mag", 100)
-        self.baroPublisher = self.create_publisher(Float32MultiArray, "baro", 100)
-        self.eulerPublisher = self.create_publisher(Float32MultiArray, "euler", 100)
+        self.imuPublisher = self.create_publisher(Imu, 'imu/data_raw', 100)
+        self.magPublisher = self.create_publisher(MagneticField, 'imu/mag', 100)
+        self.baroPublisher = self.create_publisher(Float32MultiArray, 'baro', 100)
+        self.eulerPublisher = self.create_publisher(Float32MultiArray, 'euler', 100)
 
         self.timer = self.create_timer(0.1, self.pub_data)
 
     def _candidate_ports(self):
-        configured_port = self.get_parameter("serial_port").value
-        fallback_ports = list(self.get_parameter("fallback_serial_ports").value)
+        configured_port = self.get_parameter('serial_port').value
+        fallback_ports = list(self.get_parameter('fallback_serial_ports').value)
         ports = []
         if configured_port:
             ports.append(configured_port)
@@ -105,30 +104,36 @@ class ybimu_driver(Node):
         imu.orientation.z = cr * cp * sy - sr * sp * cy
 
         imu.header.stamp = time_stamp.to_msg()
-        imu.header.frame_id = "imu_link"
+        imu.header.frame_id = 'imu_link'
 
         imu.linear_acceleration.x = ax * 9.80665
         imu.linear_acceleration.y = ay * 9.80665
         imu.linear_acceleration.z = az * 9.80665
         # 协方差：加速度测量噪声 (m/s^2)^2
-        imu.linear_acceleration_covariance = [0.01, 0.0, 0.0,
-                                               0.0, 0.01, 0.0,
-                                               0.0, 0.0, 0.01]
+        imu.linear_acceleration_covariance = [
+            0.01, 0.0, 0.0,
+            0.0, 0.01, 0.0,
+            0.0, 0.0, 0.01,
+        ]
 
         imu.angular_velocity.x = gx
         imu.angular_velocity.y = gy
         imu.angular_velocity.z = gz
         # 协方差：角速度测量噪声 (rad/s)^2
-        imu.angular_velocity_covariance = [0.001, 0.0, 0.0,
-                                            0.0, 0.001, 0.0,
-                                            0.0, 0.0, 0.001]
+        imu.angular_velocity_covariance = [
+            0.001, 0.0, 0.0,
+            0.0, 0.001, 0.0,
+            0.0, 0.0, 0.001,
+        ]
         # 协方差：姿态四元数噪声
-        imu.orientation_covariance = [0.0025, 0.0, 0.0,
-                                       0.0, 0.0025, 0.0,
-                                       0.0, 0.0, 0.0025]
+        imu.orientation_covariance = [
+            0.0025, 0.0, 0.0,
+            0.0, 0.0025, 0.0,
+            0.0, 0.0, 0.0025,
+        ]
 
         mag.header.stamp = time_stamp.to_msg()
-        mag.header.frame_id = "imu_link"
+        mag.header.frame_id = 'imu_link'
         # Y-axis sign inverted per IMU mounting orientation
         mag.magnetic_field.x = mx * 1.0
         mag.magnetic_field.y = -my * 1.0
@@ -150,19 +155,20 @@ class ybimu_driver(Node):
         if self.samples_seen >= 20 and not self.zero_data_warning_sent:
             self.zero_data_warning_sent = True
             self.get_logger().warning(
-                "IMU serial port is open but received only zero data from %s. "
-                "Check wiring, baudrate, and auto-report settings." % self.serial_port
+                'IMU serial port is open but received only zero data from %s. '
+                'Check wiring, baudrate, and auto-report settings.' % self.serial_port
             )
 
     def ready(self):
         return self.robot is not None
 
+
 def main(args=None):
     rclpy.init(args=args)
-    node = ybimu_driver("ybimu_node")
+    node = ybimu_driver('ybimu_node')
     node.init_topic()
     if not node.ready():
-        node.get_logger().error("IMU not ready, shutting down")
+        node.get_logger().error('IMU not ready, shutting down')
         node.destroy_node()
         rclpy.shutdown()
         return
@@ -175,5 +181,6 @@ def main(args=None):
         if rclpy.ok():
             rclpy.shutdown()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

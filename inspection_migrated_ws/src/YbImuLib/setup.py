@@ -5,6 +5,7 @@ setup(
     version="1.0.0",
     author="Yahboom Team",
     packages=find_packages(),
+    tests_require=["pytest"],
 )
 
 # pip3 install -e .

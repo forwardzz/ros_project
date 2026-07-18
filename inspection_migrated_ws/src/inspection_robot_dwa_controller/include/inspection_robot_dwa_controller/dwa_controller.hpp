@@ -201,4 +201,4 @@ private:
 
 }  // namespace inspection_robot_dwa_controller
 
-#endif  // INSPECTION_SIM_DWA_CONTROLLER__DWA_CONTROLLER_HPP_
+#endif  // INSPECTION_ROBOT_DWA_CONTROLLER__DWA_CONTROLLER_HPP_

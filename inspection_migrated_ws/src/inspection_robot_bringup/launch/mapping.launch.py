@@ -10,7 +10,7 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
-LIDAR_PORT = "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0"
+LIDAR_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 BRINGUP_LOCK_PATH = "/tmp/inspection_robot_bringup.lock"
 _BRINGUP_LOCK = None
 
@@ -67,6 +67,10 @@ def generate_launch_description():
         DeclareLaunchArgument("imu_serial_port", default_value="/dev/ttyAMA0"),
         DeclareLaunchArgument("imu_frame_id", default_value="imu_link"),
         DeclareLaunchArgument("imu_z", default_value="0.05"),
+        DeclareLaunchArgument("motor_pair", default_value="disabled"),
+        DeclareLaunchArgument("left_inverted", default_value="false"),
+        DeclareLaunchArgument("right_inverted", default_value="false"),
+        DeclareLaunchArgument("actuation_enabled", default_value="false"),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(sllidar_launch),
             launch_arguments={
@@ -130,6 +134,12 @@ def generate_launch_description():
             executable="tracked_motor_driver",
             name="motor_driver",
             output="screen",
+            parameters=[{
+                "motor_pair": LaunchConfiguration("motor_pair"),
+                "left_inverted": LaunchConfiguration("left_inverted"),
+                "right_inverted": LaunchConfiguration("right_inverted"),
+                "actuation_enabled": LaunchConfiguration("actuation_enabled"),
+            }],
         ),
         Node(
             package="inspection_robot_safety",

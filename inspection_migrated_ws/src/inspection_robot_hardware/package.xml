@@ -2,7 +2,7 @@
 <package format="3">
   <name>inspection_robot_hardware</name>
   <version>0.1.0</version>
-  <description>Real sensor and GPIO/PWM adapters used by the migrated inspection robot.</description>
+  <description>Real sensor and V4.0 motor-board adapters used by the migrated inspection robot.</description>
   <maintainer email="zjy@example.com">zjy</maintainer>
   <license>Apache-2.0</license>
 
@@ -14,6 +14,10 @@
   <depend>std_srvs</depend>
   <depend>robot_monitor_interfaces</depend>
   <exec_depend>python3-serial</exec_depend>
+  <exec_depend>python3-smbus</exec_depend>
+  <exec_depend>python3-rpi.gpio</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

@@ -2,7 +2,6 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -27,7 +26,7 @@ def generate_launch_description():
             description="ROS setup.bash sourced by GUI launch controls",
         ),
         DeclareLaunchArgument("remote_user", default_value="yy"),
-        DeclareLaunchArgument("remote_host", default_value="192.168.43.21"),
+        DeclareLaunchArgument("remote_host", default_value="192.168.43.24"),
         Node(
             package="inspection_robot_gui",
             executable="inspection_robot_gui",

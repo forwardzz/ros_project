@@ -1,4 +1,3 @@
-from glob import glob
 import math
 import os
 import re
@@ -20,6 +19,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -52,6 +52,88 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+
+MOTOR_CALIBRATION_PROFILE = "gpio_cd_both_forward_20260718"
+MAX_WINDOW_WIDTH = 1200
+MAX_WINDOW_HEIGHT = 720
+MIN_WINDOW_WIDTH = 960
+MIN_WINDOW_HEIGHT = 640
+MAP_SAVE_MAX_AGE_SEC = 3.0
+
+
+def recommended_window_size(available_width, available_height):
+    """Return a laptop-friendly logical window size that never exceeds the screen."""
+    available_width = max(1, int(available_width))
+    available_height = max(1, int(available_height))
+    width = min(
+        available_width,
+        MAX_WINDOW_WIDTH,
+        max(MIN_WINDOW_WIDTH, int(available_width * 0.90)),
+    )
+    height = min(
+        available_height,
+        MAX_WINDOW_HEIGHT,
+        max(MIN_WINDOW_HEIGHT, int(available_height * 0.90)),
+    )
+    return width, height
+
+
+def normalize_remote_map_path(workspace_path, path):
+    """Return a YAML path inside the configured remote workspace maps directory."""
+    workspace = os.path.normpath(str(workspace_path).strip() or DEFAULT_WORKSPACE_PATH)
+    maps_dir = os.path.join(workspace, "maps")
+    raw_path = str(path).strip() or "inspection_map.yaml"
+    candidate = (
+        os.path.join(maps_dir, raw_path)
+        if os.path.basename(raw_path) == raw_path
+        else os.path.normpath(raw_path)
+    )
+    if not os.path.isabs(candidate) or os.path.dirname(candidate) != maps_dir:
+        raise ValueError(f"地图必须保存在远端目录 {maps_dir} 中。")
+    root, extension = os.path.splitext(candidate)
+    if extension.lower() not in ("", ".yaml", ".yml"):
+        raise ValueError("地图文件名必须使用 .yaml 扩展名。")
+    if not os.path.basename(root) or os.path.basename(candidate).startswith("."):
+        raise ValueError("地图文件名不能为空。")
+    return root + ".yaml"
+
+
+def map_save_block_reason(launch_running, active_name, map_age):
+    """Explain why the current GUI state cannot safely save a SLAM map."""
+    if not launch_running or str(active_name) != "mapping":
+        return "请先通过 GUI 启动建图模式，再保存地图。"
+    if not math.isfinite(float(map_age)) or float(map_age) > MAP_SAVE_MAX_AGE_SEC:
+        return "尚未收到新鲜的 /map 数据，请等待地图显示正常后重试。"
+    return ""
+
+
+def manual_control_block_reason(
+    launch_running,
+    actuation_enabled,
+    motor_pair,
+    teleop_subscribers,
+    safety_level,
+    safety_age,
+    scan_age,
+):
+    """Explain why a non-zero GUI command cannot reach an enabled motor."""
+    if not launch_running:
+        return "请先点击“开始建图”或“开始导航”，启动树莓派底层节点。"
+    if not actuation_enabled or str(motor_pair).lower() not in ("ab", "cd"):
+        return (
+            "当前启动项未启用电机输出。架空履带并确认物理急停后，选择 cd、"
+            "勾选“启用电机输出”，再重新开始建图或导航。"
+        )
+    if int(teleop_subscribers) < 1:
+        return "未发现 /cmd_vel_teleop 安全门订阅者，请等待启动完成或检查网络。"
+    if not math.isfinite(float(safety_age)) or float(safety_age) > 0.60:
+        return "安全状态尚未到达或已超时，手动速度被禁止。"
+    if str(safety_level).upper() != "SAFE":
+        return f"当前安全状态为 {safety_level or 'UNKNOWN'}，手动速度被禁止。"
+    if not math.isfinite(float(scan_age)) or float(scan_age) > 0.60:
+        return "雷达扫描尚未到达或已超时，手动速度被禁止。"
+    return ""
 
 
 class GuiSignals(QObject):
@@ -317,19 +399,29 @@ class MainWindow(QMainWindow):
         self.ros = ros_adapter
         self.signals = signals
         self.settings = QSettings("inspection_robot", "inspection_robot_gui")
+        if self.settings.value("motor_calibration_profile", "") != MOTOR_CALIBRATION_PROFILE:
+            # Migrate the temporary left-inverted setting from the first
+            # raised-track trial to the independently verified C/D polarities.
+            self.settings.setValue("left_inverted", "false")
+            self.settings.setValue("right_inverted", "false")
+            self.settings.setValue("motor_calibration_profile", MOTOR_CALIBRATION_PROFILE)
 
         node = self.ros.node
         workspace_default = node.declare_parameter("workspace_path", DEFAULT_WORKSPACE_PATH).value
         map_default = node.declare_parameter("map_path", DEFAULT_MAP_PATH).value
         ros_setup_default = node.declare_parameter("ros_setup_path", DEFAULT_ROS_SETUP_PATH).value
         remote_user = node.declare_parameter("remote_user", "yy").value
-        remote_host = node.declare_parameter("remote_host", "192.168.43.21").value
+        remote_host = node.declare_parameter("remote_host", "192.168.43.24").value
 
         self.launch_manager = LaunchManager(
             workspace_default, ros_setup_default, remote_user, remote_host
         )
         self.launch_manager.log_line.connect(self.append_log)
         self.launch_manager.state_changed.connect(self._launch_state_changed)
+        self.launch_manager.map_preflight_finished.connect(
+            self._map_preflight_finished
+        )
+        self.launch_manager.map_save_finished.connect(self._map_save_finished)
         self.signals.log.connect(self.append_log)
         self.signals.nav_feedback.connect(self.append_log)
         self.signals.nav_result.connect(self._nav_result)
@@ -338,6 +430,12 @@ class MainWindow(QMainWindow):
         self._pending_initial_pose = None
         self._initial_pose_retries_remaining = 0
         self._last_manual_takeover_request = 0.0
+        self._last_manual_block_reason = ""
+        self._last_manual_block_warning = 0.0
+        self._active_motor_pair = "disabled"
+        self._active_actuation_enabled = False
+        self._manual_command = (0.0, 0.0)
+        self._pending_map_save_path = ""
         self.pose_history = []
         self._last_system_status_update = 0.0
         self._system_status_cache = {
@@ -349,7 +447,6 @@ class MainWindow(QMainWindow):
         self.thermal_view = ThermalView()
 
         self.setWindowTitle("巡检小车实车巡检控制台")
-        self.resize(1260, 780)
 
         self.workspace_edit = QLineEdit(
             self.settings.value("workspace_path", workspace_default)
@@ -370,13 +467,28 @@ class MainWindow(QMainWindow):
         # wider than the thermal/status column on a normal laptop display.
         self.map_combo.setMinimumContentsLength(14)
         self.map_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.use_rviz_check = QCheckBox("启动 RViz")
-        self.use_rviz_check.setChecked(self.settings.value("use_rviz", "true") == "true")
-        self.headless_check = QCheckBox("远程无界面")
-        self.headless_check.setChecked(self.settings.value("headless", "false") == "true")
-
-        self.linear_spin = self._double_spin(0.0, MAX_LINEAR_SPEED_MPS, DEFAULT_LINEAR_SPEED_MPS, 0.01)
-        self.angular_spin = self._double_spin(0.0, MAX_ANGULAR_SPEED_RADPS, DEFAULT_ANGULAR_SPEED_RADPS, 0.01)
+        self.motor_pair_combo = QComboBox()
+        self.motor_pair_combo.addItems(["disabled", "ab", "cd"])
+        saved_motor_pair = str(self.settings.value("motor_pair", "disabled")).lower()
+        if saved_motor_pair not in ("disabled", "ab", "cd"):
+            saved_motor_pair = "disabled"
+        self.motor_pair_combo.setCurrentText(saved_motor_pair)
+        self.left_inverted_check = QCheckBox("左电机反向")
+        self.left_inverted_check.setChecked(
+            self.settings.value("left_inverted", "false") == "true"
+        )
+        self.right_inverted_check = QCheckBox("右电机反向")
+        self.right_inverted_check.setChecked(
+            self.settings.value("right_inverted", "false") == "true"
+        )
+        self.actuation_enabled_check = QCheckBox("启用电机输出（仅架空轮）")
+        self.actuation_enabled_check.setChecked(False)
+        self.linear_spin = self._double_spin(
+            0.0, MAX_LINEAR_SPEED_MPS, DEFAULT_LINEAR_SPEED_MPS, 0.01
+        )
+        self.angular_spin = self._double_spin(
+            0.0, MAX_ANGULAR_SPEED_RADPS, DEFAULT_ANGULAR_SPEED_RADPS, 0.01
+        )
         self.linear_slider = self._speed_slider(self.linear_spin, MAX_LINEAR_SPEED_MPS)
         self.angular_slider = self._speed_slider(self.angular_spin, MAX_ANGULAR_SPEED_RADPS)
 
@@ -388,6 +500,13 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             pause_default = 2.0
         self.waypoint_pause_spin = self._double_spin(0.0, 60.0, pause_default, 0.5)
+        self.return_to_start_check = QCheckBox("任务完成后返回起点")
+        self.return_to_start_check.setChecked(
+            self.settings.value("return_to_start", "false") == "true"
+        )
+        self.return_to_start_check.setToolTip(
+            "仅在任务正常完成后返回启动导航时设置的初始位姿"
+        )
 
         self.pose_label = QLabel("里程计: 等待数据")
         self.velocity_label = QLabel("速度: 等待数据")
@@ -428,6 +547,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_style()
         self._connect()
+        self._fit_to_screen()
 
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self._refresh_status)
@@ -435,6 +555,10 @@ class MainWindow(QMainWindow):
 
         self.initial_pose_retry_timer = QTimer(self)
         self.initial_pose_retry_timer.timeout.connect(self._retry_initial_pose)
+
+        self.manual_command_timer = QTimer(self)
+        self.manual_command_timer.setInterval(100)
+        self.manual_command_timer.timeout.connect(self._publish_manual_command)
 
     def _build_ui(self):
         central = QWidget()
@@ -456,16 +580,22 @@ class MainWindow(QMainWindow):
         header.addWidget(title, 1)
         root.addLayout(header)
 
-        splitter = QSplitter(Qt.Horizontal)
-        root.addWidget(splitter, 1)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(self.main_splitter, 1)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
         left_layout.addWidget(self._build_launch_group())
         left_layout.addWidget(self._build_pose_group())
         left_layout.addWidget(self._build_log_group(), 1)
-        splitter.addWidget(left)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QScrollArea.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setWidget(left)
+        self.main_splitter.addWidget(left_scroll)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -481,11 +611,27 @@ class MainWindow(QMainWindow):
         right_scroll.setFrameShape(QScrollArea.NoFrame)
         right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         right_scroll.setWidget(right)
-        splitter.addWidget(right_scroll)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setChildrenCollapsible(False)
-        splitter.setSizes([int(1260 * 0.6), int(1260 * 0.4)])
+        self.main_splitter.addWidget(right_scroll)
+        self.main_splitter.setStretchFactor(0, 4)
+        self.main_splitter.setStretchFactor(1, 3)
+        self.main_splitter.setChildrenCollapsible(False)
+
+    def _fit_to_screen(self):
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            width, height = MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT
+        else:
+            available = screen.availableGeometry()
+            width, height = recommended_window_size(
+                available.width(), available.height()
+            )
+        self.setMinimumSize(
+            min(width, MIN_WINDOW_WIDTH),
+            min(height, MIN_WINDOW_HEIGHT),
+        )
+        self.resize(width, height)
+        left_width = int(width * 0.57)
+        self.main_splitter.setSizes([left_width, width - left_width])
 
     def _build_launch_group(self):
         group = QGroupBox("启动控制")
@@ -517,8 +663,11 @@ class MainWindow(QMainWindow):
         browse_map.clicked.connect(self._browse_map)
         layout.addWidget(browse_map, 3, 4)
 
-        layout.addWidget(self.use_rviz_check, 4, 1)
-        layout.addWidget(self.headless_check, 4, 2)
+        layout.addWidget(QLabel("电机端口"), 4, 0)
+        layout.addWidget(self.motor_pair_combo, 4, 1)
+        layout.addWidget(self.left_inverted_check, 4, 2)
+        layout.addWidget(self.right_inverted_check, 4, 3)
+        layout.addWidget(self.actuation_enabled_check, 4, 4)
 
         buttons = QHBoxLayout()
         for text, handler in [
@@ -530,6 +679,8 @@ class MainWindow(QMainWindow):
         ]:
             button = QPushButton(text)
             button.clicked.connect(handler)
+            if text == "保存地图":
+                self.save_map_button = button
             buttons.addWidget(button)
         layout.addLayout(buttons, 5, 0, 1, 5)
         return group
@@ -557,7 +708,7 @@ class MainWindow(QMainWindow):
         group = QGroupBox("任务与区域")
         layout = QVBoxLayout(group)
 
-        top = QHBoxLayout()
+        top = QGridLayout()
         check_localization = QPushButton("检查定位")
         check_localization.clicked.connect(self.check_localization)
         start_mission = QPushButton("开始任务")
@@ -571,19 +722,22 @@ class MainWindow(QMainWindow):
         reset_emergency_stop.clicked.connect(self.reset_emergency_stop)
         clear_points = QPushButton("清空点位")
         clear_points.clicked.connect(self.clear_rviz_points)
-        top.addWidget(check_localization)
-        top.addWidget(start_mission)
-        top.addWidget(stop_all)
-        top.addWidget(emergency_stop)
-        top.addWidget(reset_emergency_stop)
-        top.addWidget(clear_points)
+        top.addWidget(check_localization, 0, 0)
+        top.addWidget(start_mission, 0, 1)
+        top.addWidget(stop_all, 0, 2)
+        top.addWidget(emergency_stop, 1, 0)
+        top.addWidget(reset_emergency_stop, 1, 1)
+        top.addWidget(clear_points, 1, 2)
+        for column in range(3):
+            top.setColumnStretch(column, 1)
         layout.addLayout(top)
 
         params = QFormLayout()
         params.addRow("点位停留时间 s", self.waypoint_pause_spin)
+        params.addRow("", self.return_to_start_check)
         layout.addLayout(params)
 
-        region = QHBoxLayout()
+        region = QGridLayout()
         self.region_mode_check.clicked.connect(self.set_region_mode)
         save_regions = QPushButton("保存区域")
         save_regions.clicked.connect(self.save_regions)
@@ -591,21 +745,19 @@ class MainWindow(QMainWindow):
         load_regions.clicked.connect(self.load_regions)
         clear_regions = QPushButton("清空区域")
         clear_regions.clicked.connect(self.clear_regions)
-        region.addWidget(self.region_mode_check)
-        region.addWidget(save_regions)
-        region.addWidget(load_regions)
-        region.addWidget(clear_regions)
-        layout.addLayout(region)
-
-        undo_row = QHBoxLayout()
         undo_region = QPushButton("撤销区域")
         undo_region.clicked.connect(self.undo_last_region)
         undo_point_btn = QPushButton("撤销点位")
         undo_point_btn.clicked.connect(self.undo_last_rviz_point)
-        undo_row.addWidget(undo_region)
-        undo_row.addWidget(undo_point_btn)
-        undo_row.addStretch(1)
-        layout.addLayout(undo_row)
+        region.addWidget(self.region_mode_check, 0, 0)
+        region.addWidget(save_regions, 0, 1)
+        region.addWidget(load_regions, 0, 2)
+        region.addWidget(clear_regions, 1, 0)
+        region.addWidget(undo_region, 1, 1)
+        region.addWidget(undo_point_btn, 1, 2)
+        for column in range(3):
+            region.setColumnStretch(column, 1)
+        layout.addLayout(region)
 
         self.mission_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.mission_label)
@@ -652,24 +804,30 @@ class MainWindow(QMainWindow):
 
         pad = QGridLayout()
         buttons = {
-            (0, 1): ("W", self.drive_forward),
-            (1, 0): ("A", self.turn_left),
-            (1, 1): ("Space 空格", self.stop_robot),
-            (1, 2): ("D", self.turn_right),
-            (2, 1): ("S", self.drive_backward),
+            (0, 1): ("W", self.drive_forward, True),
+            (1, 0): ("A", self.turn_left, True),
+            (1, 1): ("Space 空格", self.stop_robot, False),
+            (1, 2): ("D", self.turn_right, True),
+            (2, 1): ("S", self.drive_backward, True),
         }
-        for (row, col), (text, handler) in buttons.items():
+        for (row, col), (text, handler, hold_to_run) in buttons.items():
             button = QPushButton(text)
             button.setMinimumHeight(44)
-            button.clicked.connect(handler)
+            if hold_to_run:
+                button.pressed.connect(handler)
+                button.released.connect(self.stop_robot)
+            else:
+                button.clicked.connect(handler)
             pad.addWidget(button, row, col)
         layout.addLayout(pad)
 
         arc = QHBoxLayout()
         left = QPushButton("前进左转")
         right = QPushButton("前进右转")
-        left.clicked.connect(self.forward_left)
-        right.clicked.connect(self.forward_right)
+        left.pressed.connect(self.forward_left)
+        left.released.connect(self.stop_robot)
+        right.pressed.connect(self.forward_right)
+        right.released.connect(self.stop_robot)
         arc.addWidget(left)
         arc.addWidget(right)
         layout.addLayout(arc)
@@ -817,7 +975,7 @@ class MainWindow(QMainWindow):
         workspace = self.workspace_edit.text().strip() or DEFAULT_WORKSPACE_PATH
         ros_setup = self.ros_setup_edit.text().strip() or DEFAULT_ROS_SETUP_PATH
         remote_user = self.remote_user_edit.text().strip() or "yy"
-        remote_host = self.remote_host_edit.text().strip() or "192.168.43.21"
+        remote_host = self.remote_host_edit.text().strip() or "192.168.43.24"
         self.remote_user_edit.setText(remote_user)
         self.remote_host_edit.setText(remote_host)
         self.launch_manager.update_paths(
@@ -827,15 +985,41 @@ class MainWindow(QMainWindow):
         self.settings.setValue("ros_setup_path", ros_setup)
         self.settings.setValue("remote_user", remote_user)
         self.settings.setValue("remote_host", remote_host)
-        map_path = self._normalize_map_path(self._map_text())
-        self._set_map_text(map_path)
-        self.settings.setValue("map_path", map_path)
-        self.settings.setValue("use_rviz", "true" if self.use_rviz_check.isChecked() else "false")
-        self.settings.setValue("headless", "true" if self.headless_check.isChecked() else "false")
+        map_path = self._map_text()
+        if map_path:
+            self.settings.setValue("map_path", map_path)
+        self.settings.setValue("motor_pair", self.motor_pair_combo.currentText())
+        self.settings.setValue(
+            "left_inverted", "true" if self.left_inverted_check.isChecked() else "false"
+        )
+        self.settings.setValue(
+            "right_inverted", "true" if self.right_inverted_check.isChecked() else "false"
+        )
+
+    def _motor_launch_options(self):
+        return (
+            self.motor_pair_combo.currentText(),
+            self.left_inverted_check.isChecked(),
+            self.right_inverted_check.isChecked(),
+            self.actuation_enabled_check.isChecked(),
+        )
 
     def start_mapping(self):
         self._apply_launch_paths()
-        self.launch_manager.start_mapping()
+        if (
+            self.actuation_enabled_check.isChecked()
+            and self.motor_pair_combo.currentText() == "disabled"
+        ):
+            QMessageBox.warning(
+                self,
+                "电机端口未确认",
+                "启用电机前必须选择已现场确认的 AB 或 CD 端口。",
+            )
+            return
+        options = self._motor_launch_options()
+        if self.launch_manager.start_mapping(*options):
+            self._active_motor_pair = options[0]
+            self._active_actuation_enabled = bool(options[3])
 
     def start_thermal(self):
         self._apply_launch_paths()
@@ -874,23 +1058,109 @@ class MainWindow(QMainWindow):
 
     def start_navigation(self):
         self._apply_launch_paths()
-        map_path = self._normalize_map_path(self._map_text())
-        if not map_path:
-            QMessageBox.warning(self, "缺少地图路径", "启动导航前需要设置地图 YAML。")
+        try:
+            map_path = self._normalize_map_path(self._map_text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "地图路径无效", str(exc))
             return
         self._set_map_text(map_path)
-        self.launch_manager.start_navigation(map_path, self.use_rviz_check.isChecked())
+        if (
+            self.actuation_enabled_check.isChecked()
+            and self.motor_pair_combo.currentText() == "disabled"
+        ):
+            QMessageBox.warning(
+                self,
+                "电机端口未确认",
+                "启用电机前必须选择已现场确认的 AB 或 CD 端口。",
+            )
+            return
+        options = self._motor_launch_options()
+        regions_path = os.path.join(
+            self.launch_manager.workspace_path, "maps", "inspection_regions.yaml"
+        )
+        if self.launch_manager.start_navigation(
+            map_path,
+            *options,
+            regions_path=regions_path,
+            mission_home_x=self.init_x_spin.value(),
+            mission_home_y=self.init_y_spin.value(),
+            mission_home_yaw=math.radians(self.init_yaw_spin.value()),
+        ):
+            self._active_motor_pair = options[0]
+            self._active_actuation_enabled = bool(options[3])
 
     def save_map(self):
         self._apply_launch_paths()
-        map_path = self._normalize_map_path(self._map_text())
-        if not map_path:
-            QMessageBox.warning(self, "缺少地图路径", "请先设置输出地图 YAML 路径。")
+        snap = self.ros.snapshot()
+        last_map = float(snap.get("last_map", 0.0))
+        map_age = math.inf if last_map <= 0.0 else time.monotonic() - last_map
+        reason = map_save_block_reason(
+            self.launch_manager.is_running(),
+            self.launch_manager.active_name,
+            map_age,
+        )
+        if reason:
+            self.append_log(f"[MAP] 保存地图不可用: {reason}")
+            QMessageBox.warning(self, "保存地图不可用", reason)
+            return
+        try:
+            map_path = self._normalize_map_path(self._map_text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "地图路径无效", str(exc))
             return
         self._set_map_text(map_path)
-        self.launch_manager.save_map(map_path)
+        self.settings.setValue("map_path", map_path)
+        self._pending_map_save_path = map_path
+        self.save_map_button.setEnabled(False)
+        if not self.launch_manager.check_map_exists(map_path):
+            self._clear_pending_map_save()
+            QMessageBox.warning(self, "保存地图", "地图检查或保存操作已经在进行。")
+
+    def _map_preflight_finished(self, map_path, exists, error):
+        if map_path != self._pending_map_save_path:
+            return
+        if error:
+            self._clear_pending_map_save()
+            QMessageBox.warning(self, "保存地图", f"远端目标检查失败：\n{error}")
+            return
+        if exists:
+            reply = QMessageBox.question(
+                self,
+                "覆盖地图",
+                f"远端地图已存在：\n{map_path}\n\n是否覆盖 YAML 和 PGM？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self.append_log(f"[MAP] 已取消覆盖: {map_path}")
+                self._clear_pending_map_save()
+                return
+        if not self.launch_manager.save_map(map_path):
+            self._clear_pending_map_save()
+            QMessageBox.warning(self, "保存地图", "地图保存操作未能启动。")
+
+    def _map_save_finished(self, map_path, success, message):
+        if map_path != self._pending_map_save_path:
+            return
+        self._clear_pending_map_save()
+        if success:
+            self._set_map_text(map_path)
+            self.refresh_maps()
+            QMessageBox.information(self, "保存地图", f"地图已保存到：\n{map_path}")
+        else:
+            QMessageBox.warning(
+                self,
+                "保存地图失败",
+                f"旧地图已保留。\n{message or '远端保存命令执行失败。'}",
+            )
+
+    def _clear_pending_map_save(self):
+        self._pending_map_save_path = ""
+        self.save_map_button.setEnabled(True)
 
     def stop_launch(self):
+        self._clear_pending_map_save()
+        self._stop_manual_command()
         self.launch_manager.stop_thermal()
         self.launch_manager.stop()
 
@@ -905,8 +1175,16 @@ class MainWindow(QMainWindow):
     def start_mission(self):
         request = StartNavigation.Request()
         request.waypoint_pause_sec = float(self.waypoint_pause_spin.value())
+        request.return_to_start = self.return_to_start_check.isChecked()
         self.settings.setValue("waypoint_pause_sec", request.waypoint_pause_sec)
-        self.append_log(f"[MISSION] start mission pause={request.waypoint_pause_sec:.1f}s")
+        self.settings.setValue(
+            "return_to_start", "true" if request.return_to_start else "false"
+        )
+        return_mode = "完成后返回起点" if request.return_to_start else "终点停车"
+        self.append_log(
+            f"[MISSION] start mission pause={request.waypoint_pause_sec:.1f}s, "
+            f"{return_mode}"
+        )
         self.ros.call_service_async(
             self.ros.start_navigation_client,
             request,
@@ -916,7 +1194,7 @@ class MainWindow(QMainWindow):
 
     def stop_all_tasks(self):
         self.append_log("[MISSION] stop all tasks")
-        self.ros.publish_cmd_vel(0.0, 0.0)
+        self._stop_manual_command()
         self.ros.cancel_nav_goal()
         self.ros.call_service_async(
             self.ros.abort_mission_client,
@@ -927,7 +1205,7 @@ class MainWindow(QMainWindow):
 
     def emergency_stop(self):
         self.append_log("[SAFETY] software emergency stop requested")
-        self.ros.publish_cmd_vel(0.0, 0.0)
+        self._stop_manual_command()
         self.ros.cancel_nav_goal()
         request = SetBool.Request()
         request.data = True
@@ -1097,49 +1375,111 @@ class MainWindow(QMainWindow):
         self.init_yaw_spin.setValue(math.degrees(snap["yaw"]))
 
     def drive_forward(self):
-        self._begin_manual_takeover()
-        self.ros.publish_cmd_vel(self.linear_spin.value(), 0.0)
+        self._start_manual_command(self.linear_spin.value(), 0.0)
 
     def drive_backward(self):
-        self._begin_manual_takeover()
-        self.ros.publish_cmd_vel(-self.linear_spin.value(), 0.0)
+        self._start_manual_command(-self.linear_spin.value(), 0.0)
 
     def turn_left(self):
-        self._begin_manual_takeover()
-        self.ros.publish_cmd_vel(0.0, self.angular_spin.value())
+        self._start_manual_command(0.0, self.angular_spin.value())
 
     def turn_right(self):
-        self._begin_manual_takeover()
-        self.ros.publish_cmd_vel(0.0, -self.angular_spin.value())
+        self._start_manual_command(0.0, -self.angular_spin.value())
 
     def forward_left(self):
-        self._begin_manual_takeover()
-        self.ros.publish_cmd_vel(self.linear_spin.value(), self.angular_spin.value() * 0.5)
+        self._start_manual_command(
+            self.linear_spin.value(), self.angular_spin.value() * 0.5
+        )
 
     def forward_right(self):
-        self._begin_manual_takeover()
-        self.ros.publish_cmd_vel(self.linear_spin.value(), -self.angular_spin.value() * 0.5)
+        self._start_manual_command(
+            self.linear_spin.value(), -self.angular_spin.value() * 0.5
+        )
 
     def stop_robot(self):
-        self._begin_manual_takeover()
+        self._request_manual_preemption()
+        self._stop_manual_command()
+
+    def _start_manual_command(self, linear_x, angular_z):
+        if not self._begin_manual_takeover():
+            self._stop_manual_command()
+            return False
+        self._manual_command = (float(linear_x), float(angular_z))
+        self._publish_manual_command()
+        self.manual_command_timer.start()
+        return True
+
+    def _publish_manual_command(self):
+        self.ros.publish_cmd_vel(*self._manual_command)
+
+    def _stop_manual_command(self):
+        if hasattr(self, "manual_command_timer"):
+            self.manual_command_timer.stop()
+        self._manual_command = (0.0, 0.0)
         self.ros.publish_cmd_vel(0.0, 0.0)
 
     def _begin_manual_takeover(self):
         """Make a GUI command preempt autonomous motion before publishing it."""
-        self.ros.cancel_nav_goal()
+        snap = self.ros.snapshot()
         now = time.monotonic()
-        # Key-repeat and slider use must not create unbounded abort service calls.
+        reason = manual_control_block_reason(
+            self.launch_manager.is_running(),
+            self._active_actuation_enabled,
+            self._active_motor_pair,
+            self.ros.cmd_vel_pub.get_subscription_count(),
+            snap.get("safety_level", "WAITING"),
+            now - float(snap.get("last_safety", 0.0)),
+            now - float(snap.get("last_scan", 0.0)),
+        )
+        if reason:
+            self._report_manual_block(reason, now)
+            return False
+        self._last_manual_block_reason = ""
+        self._request_manual_preemption(now)
+        return True
+
+    def _report_manual_block(self, reason, now):
+        if (
+            reason == self._last_manual_block_reason
+            and now - self._last_manual_block_warning < 3.0
+        ):
+            return
+        self._last_manual_block_reason = reason
+        self._last_manual_block_warning = now
+        self.append_log(f"[MANUAL] 手动行进不可用: {reason}")
+        self.mission_label.setText(f"手动行进不可用: {reason}")
+        QMessageBox.warning(self, "手动行进不可用", reason)
+
+    def _request_manual_preemption(self, now=None):
+        self.ros.cancel_nav_goal(report_if_idle=False)
+        now = time.monotonic() if now is None else now
         if now - self._last_manual_takeover_request < 0.5:
             return
         self._last_manual_takeover_request = now
+        if not self.ros.abort_mission_client.service_is_ready():
+            self.append_log(
+                "[MANUAL] 无活动任务服务；继续使用安全门的手动优先通道"
+            )
+            return
         self.ros.call_service_async(
             self.ros.abort_mission_client,
             Trigger.Request(),
-            lambda result, error: self._emit_service_result("手动接管", result, error),
+            self._manual_takeover_result,
             timeout_sec=1.0,
         )
 
+    def _manual_takeover_result(self, result, error):
+        if error:
+            self.append_log(f"[WARN] 手动接管任务中止请求失败: {error}")
+        elif result is not None and not bool(getattr(result, "success", False)):
+            self.append_log(
+                f"[WARN] 手动接管任务中止未完成: {getattr(result, 'message', '')}"
+            )
+
     def keyPressEvent(self, event):
+        if event.isAutoRepeat():
+            event.accept()
+            return
         key = event.key()
         if key in (Qt.Key_W, Qt.Key_Up):
             self.drive_forward()
@@ -1154,6 +1494,25 @@ class MainWindow(QMainWindow):
         else:
             super().keyPressEvent(event)
 
+    def keyReleaseEvent(self, event):
+        if event.isAutoRepeat():
+            event.accept()
+            return
+        if event.key() in (
+            Qt.Key_W,
+            Qt.Key_A,
+            Qt.Key_S,
+            Qt.Key_D,
+            Qt.Key_Up,
+            Qt.Key_Down,
+            Qt.Key_Left,
+            Qt.Key_Right,
+        ):
+            self.stop_robot()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
     def append_log(self, line):
         if not line:
             return
@@ -1167,6 +1526,10 @@ class MainWindow(QMainWindow):
 
     def _launch_state_changed(self, state):
         self.launch_label.setText(f"启动状态: {state}")
+        if state == "idle":
+            self._stop_manual_command()
+            self._active_motor_pair = "disabled"
+            self._active_actuation_enabled = False
 
     def _refresh_status(self):
         snap = self.ros.snapshot()
@@ -1398,16 +1761,30 @@ class MainWindow(QMainWindow):
             self.ros_setup_edit.setText(path)
 
     def _browse_map(self):
-        start = os.path.dirname(self._map_text()) or os.path.join(self.workspace_edit.text(), "maps")
-        path, _ = QFileDialog.getOpenFileName(self, "地图 YAML", start, "YAML files (*.yaml *.yml)")
-        if path:
-            self._set_map_text(path)
+        current_name = os.path.basename(self._map_text()) or "inspection_map.yaml"
+        name, accepted = QInputDialog.getText(
+            self,
+            "远端地图文件名",
+            "保存在远端工作空间 maps/ 目录中的 YAML 文件名：",
+            text=current_name,
+        )
+        if not accepted:
+            return
+        try:
+            path = self._normalize_map_path(name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "地图路径无效", str(exc))
+            return
+        self._set_map_text(path)
 
     def refresh_maps(self):
         self._apply_launch_paths()
-        current = self._map_text()
+        try:
+            current = self._normalize_map_path(self._map_text())
+        except ValueError:
+            current = ""
         maps_dir = os.path.join(self.workspace_edit.text().strip() or DEFAULT_WORKSPACE_PATH, "maps")
-        maps = sorted(glob(os.path.join(maps_dir, "*.yaml")))
+        maps = self.launch_manager.list_maps()
         self.map_combo.clear()
         for path in maps or [current or self._normalize_map_path("")]:
             self.map_combo.addItem(path)
@@ -1428,15 +1805,15 @@ class MainWindow(QMainWindow):
         self.map_combo.setCurrentIndex(index)
 
     def _normalize_map_path(self, path):
-        maps_dir = os.path.join(self.workspace_edit.text().strip() or DEFAULT_WORKSPACE_PATH, "maps")
-        if not path:
-            return os.path.join(maps_dir, "inspection_map.yaml")
-        if os.path.basename(path) == path:
-            return os.path.join(maps_dir, path)
-        return path
+        return normalize_remote_map_path(
+            self.workspace_edit.text().strip() or DEFAULT_WORKSPACE_PATH,
+            path,
+        )
 
     def closeEvent(self, event):
         self.settings.sync()
+        self._clear_pending_map_save()
+        self._stop_manual_command()
         self.launch_manager.stop_thermal()
         if self.launch_manager.is_running():
             reply = QMessageBox.question(

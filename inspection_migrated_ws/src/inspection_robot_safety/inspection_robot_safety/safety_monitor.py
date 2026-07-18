@@ -17,6 +17,9 @@ from std_srvs.srv import SetBool, Trigger
 from robot_monitor_interfaces.msg import MissionStatus, RobotSafetyStatus
 
 
+DEFAULT_STATUS_PUBLISH_PERIOD_SEC = 0.10
+
+
 class SafetyMonitor(Node):
     def __init__(self):
         super().__init__("safety_monitor")
@@ -30,6 +33,9 @@ class SafetyMonitor(Node):
         self.declare_parameter("progress_fault_window_sec", 20.0)
         self.declare_parameter("progress_fault_count", 2)
         self.declare_parameter("poll_period_sec", 1.0)
+        self.declare_parameter(
+            "status_publish_period_sec", DEFAULT_STATUS_PUBLISH_PERIOD_SEC
+        )
 
         latched_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -74,8 +80,29 @@ class SafetyMonitor(Node):
 
         poll_period = float(self.get_parameter("poll_period_sec").value)
         self.timer = self.create_timer(poll_period, self._poll)
+        status_publish_period = self._bounded_period_parameter(
+            "status_publish_period_sec",
+            DEFAULT_STATUS_PUBLISH_PERIOD_SEC,
+            0.02,
+            0.50,
+        )
+        # Keep this heartbeat independent of the slower power and event poll.
+        # The velocity gate treats a missed heartbeat as a hard stop, including
+        # when this process is killed before destroy_node() can publish.
+        self.status_timer = self.create_timer(
+            status_publish_period, self._publish_status
+        )
         self._publish_status()
         self.get_logger().info("Safety monitor ready")
+
+    def _bounded_period_parameter(self, name, default, lower, upper):
+        try:
+            value = float(self.get_parameter(name).value)
+        except (TypeError, ValueError):
+            value = default
+        if not math.isfinite(value):
+            value = default
+        return max(lower, min(upper, value))
 
     def _status_cb(self, msg):
         active_states = {
@@ -250,7 +277,10 @@ class SafetyMonitor(Node):
 
     def _request_abort(self):
         request = Trigger.Request()
-        if not self.abort_client.wait_for_service(timeout_sec=1.0):
+        # A safety service callback must not block the 10 Hz status heartbeat.
+        # Mission bringup creates this service before motion can be commanded;
+        # mapping mode deliberately has no mission manager at all.
+        if not self.abort_client.service_is_ready():
             self.get_logger().warn("Abort mission service is unavailable during safety fault")
             return
         future = self.abort_client.call_async(request)

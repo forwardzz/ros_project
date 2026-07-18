@@ -63,7 +63,7 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
     initial_robot_pose.pose.pose.position.x = 0;
     initial_robot_pose.pose.pose.position.y = 0;
     initial_robot_pose.pose.pose.position.z = 0;
-    initial_robot_pose.pose.pose.orientation.w = 0;
+    initial_robot_pose.pose.pose.orientation.w = 1;
     initial_robot_pose.pose.pose.orientation.x = 0;
     initial_robot_pose.pose.pose.orientation.y = 0;
     initial_robot_pose.pose.pose.orientation.z = 0;
@@ -98,7 +98,10 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
     else
     {
       // Initialize module on first scan (from laser params)
-      setLaserPoseFromTf();
+      if (!setLaserPoseFromTf())
+      {
+        return;
+      }
       rf2o_ref.init(last_scan, initial_robot_pose.pose.pose);
       rf2o_ref.first_laser_scan = false;
     }
@@ -122,8 +125,15 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
   }
   catch (tf2::TransformException &ex)
   {
-    RCLCPP_ERROR(get_logger(), "%s",ex.what());
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Waiting for laser-to-base transform: %s", ex.what());
     retrieved = false;
+  }
+
+  if (!retrieved)
+  {
+    return false;
   }
 
   // Keep this transform as Eigen Matrix3d
@@ -173,10 +183,17 @@ void CLaserOdometry2DNode::process()
     // Do not run on the same data!
     new_scan_available = false;
   }
+  else if (!rf2o_ref.is_initialized())
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000, "Waiting for first laser scan...");
+  }
   else
   {
-    // This is a warning. We depend on laser scans, so no meaning running faster than scan freq.
-    RCLCPP_WARN(get_logger(), "Waiting for laser_scans....");
+    // The processing timer intentionally runs faster than the lidar, so an
+    // occasional tick without a new scan is expected and is debug-only.
+    RCLCPP_DEBUG_THROTTLE(
+      get_logger(), *get_clock(), 5000, "No new laser scan since the last RF2O update");
   }
 }
 

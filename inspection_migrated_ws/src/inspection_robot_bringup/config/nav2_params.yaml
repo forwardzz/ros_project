@@ -162,7 +162,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.20
+        inflation_radius: 0.25
         cost_scaling_factor: 5.0
       always_send_full_costmap: true
 
@@ -177,7 +177,9 @@ global_costmap:
       rolling_window: false
       resolution: 0.03
       transform_tolerance: 0.5
-      footprint: "[[0.135, 0.11], [0.135, -0.11], [-0.135, -0.11], [-0.135, 0.11]]"
+      # Conservative circle enclosing the 0.27 x 0.22 m tracked footprint.
+      # The local costmap retains the polygon for controller collision checks.
+      robot_radius: 0.18
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
@@ -200,7 +202,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.20
+        inflation_radius: 0.25
         cost_scaling_factor: 5.0
       always_send_full_costmap: true
 

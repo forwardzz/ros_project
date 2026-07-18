@@ -1,9 +1,13 @@
 # inspection_sim_ws → inspection_migrated_ws 迁移分析与执行计划
 
-更新时间：2026-07-13  
-工作目录：`/home/zjy/Desktop/project_transform`
+更新时间：2026-07-18
+工作目录：`/home/zjy/Desktop/ros_project_migration`
 
 本文件记录本次迁移的实际结果和后续上车步骤。源目录 `inspection_sim_ws/` 与 `ros_project/` 保持只读；所有新文件均位于 `inspection_migrated_ws/`。目标不是把实车工程改造成 Gazebo 仿真，而是把仿真的任务和控制算法放到一个新的实车工作空间，并把真实传感器和 GPIO 底层作为适配边界。
+
+2026-07-18 目标板电机禁用验收已覆盖真实 SLLIDAR、YB IMU、RF2O、EKF、MLX90640、速度安全门、GUI SSH 启停/存图/远端地图枚举及 Nav2/AMCL 生命周期。当前 GUI 建图复测频率为雷达/RF2O 9.32 Hz、IMU/EKF 9.91 Hz、地图 1.19 Hz、热帧 1.98 Hz，安全状态为 SAFE；软件急停使 `/cmd_vel` 在 0.021 s 内归零，复位前保持锁存，停止输入后 0.360 s 归零。GUI 零时间戳初始位姿可完成定位，八个 Nav2 managed node 全部 active；禁用电机的任务目标可进入 Nav2 action，取消后 `/cmd_vel_nav`、`/cmd_vel_auto`、`/cmd_vel` 在 0.002/0.087/0.100 s 内归零。上位机与目标板统一为 Fast DDS 后，实际 PC `RosAdapter` 已完成传感器/地图接收、初始位姿、定位服务、任务拒绝、中止服务和同位姿导航 action 的跨主机闭环。地图保存现采用远端临时目录暂存、YAML/PGM 校验和失败回滚；实机复测确认新建、取消覆盖、确认覆盖与自动刷新均正常。停止后无残留进程或串口占用，`vcgencmd get_throttled=0x0`。当前保存地图仅为静止诊断资产，地面定位、路径跟随、几何标定和制动距离仍须在隔离场地完成。
+
+2026-07-18 已以 `inspection_sim_ws` 的 `agent/dwa-navigation-reliability@0da6b2f` 为固定参考，补齐 RViz/区域 TSP、后台规划失效控制、区域障碍有限恢复、可选返航及显式 Nav2 进度检查。详细源码边界和当前硬件阻塞见 `SIM_PARITY_REVIEW.md`。
 
 ## 0. 已确认的迁移边界
 
@@ -11,13 +15,13 @@
 | --- | --- |
 | 新工作空间 | `inspection_migrated_ws` |
 | 控制逻辑 | 任务、区域扫描、Nav2 调用和自定义 DWA 以仿真版本为基线 |
-| 电机边界 | 仿真侧速度/状态控制逻辑 + 实车侧 GPIO/PWM 电机适配器 |
+| 电机边界 | 仿真侧速度/状态控制逻辑 + 原实机已验证的 BCM GPIO 电机接口；A/B PCA 仅保留为未选备用 |
 | 里程计 | `/laser_odom` + `/imu/data_raw` → EKF → `/odom`；不假设实车有 `/wheel_odom` |
-| 速度安全 | `velocity_safety_gate` 是唯一写入 `/cmd_vel` 的节点；安全状态缺失/超过 2 s、输入超时或故障时输出零，电机驱动只订阅最终输出 |
+| 速度安全 | `velocity_safety_gate` 是唯一写入 `/cmd_vel` 的节点；安全心跳、运动输入和扫描分别以 0.30/0.35/0.40 s 硬上限失效关闭，电机驱动只订阅最终输出 |
 | 区域任务 | 仿真区域规划和“旋转—低速直行—旋转”底盘原语；保留激光、TF、超时和障碍安全检查 |
 | GUI | PyQt5 仿真任务界面 + 实车 Tkinter UI 中的 SSH、气体、热成像和安全状态能力 |
 | 自定义 DWA | 迁移并设为 `FollowPath` 默认控制器 |
-| 服务接口 | `StartNavigation.srv` 增加 `waypoint_pause_sec`，客户端和服务端同时重编译 |
+| 服务接口 | `StartNavigation.srv` 包含 `waypoint_pause_sec` 和 `return_to_start`，客户端和服务端同时重编译 |
 | 实车几何初值 | `wheel_radius=0.025 m`、`track_width=0.155 m`、约 `0.27 × 0.22 m` footprint；必须现场标定 |
 
 ## 一、两个原项目的技术栈和目录结构对比
@@ -43,7 +47,7 @@
 - C++：`rclcpp`、`nav2_core`、`nav2_costmap_2d`、`pluginlib`、`tf2`、Eigen；对应自定义 DWA、RF2O 和 SLLIDAR SDK。
 - ROS Python：`rclpy`、`nav2_msgs`、`nav_msgs`、`sensor_msgs`、`geometry_msgs`、`tf2_ros`、`visualization_msgs`、`robot_localization`、`slam_toolbox`。
 - Python 第三方：`numpy`、`PyYAML`、`psutil`、PyQt5；气体节点使用 `pyserial`，热成像节点按需使用 `board/busio/adafruit_mlx90640`。
-- 实车专用：`RPi.GPIO`（可选导入，实际接电机时必须可用）、YB IMU 串口库、SLLIDAR by-path 串口和 udev 规则。
+- 实车专用：`RPi.GPIO`（C/D 底盘采用旧实机已验证的 BCM18/22/27、BCM23/25/24）、I²C/SMBus（传感器及备用 A/B PCA）、YB IMU 串口库、SLLIDAR by-path 串口和 udev 规则。
 
 ### 1.3 节点和功能结构
 
@@ -78,7 +82,7 @@
 
 ### 2.3 平台相关接口
 
-包括 `sllidar_ros2`/SDK/udev、`imu_ros2_device` + `YbImuLib`、GPIO/PWM 电机、气体传感器 Modbus 串口、MLX90640 I2C、实车安全电源监测、静态传感器 TF、SSH 远程 launch。该层拥有硬件权限和急停责任，不能被仿真控制器替换。
+包括 `sllidar_ros2`/SDK/udev、`imu_ros2_device` + `YbImuLib`、V4.0 PCA/GPIO 电机、可选气体传感器 Modbus 串口、MLX90640 I2C、实车安全电源监测、静态传感器 TF、SSH 远程 launch。该层拥有硬件权限和急停责任，不能被仿真控制器替换。
 
 ## 三、功能对比表
 
@@ -90,7 +94,7 @@
 | 激光雷达 | Gazebo GPU lidar，`/scan` | `sllidar_ros2`，by-path 串口 | 保留实车驱动；统一 `/scan` 和可配置 `laser` frame | 扫描频率、量程、反向安装、QoS |
 | IMU | Gazebo `/sim/imu/data_raw` + `sim_imu_adapter.py` | `imu_ros2_device`/`YbImuLib` `/imu/data_raw` | 删除仿真 adapter，直接使用 YB 节点 | 轴向、ENU/NED、单位、串口权限 |
 | 激光里程计 | `rf2o_laser_odometry` | 同名且源码一致 | 直接复用；新 launch 输出 `/laser_odom` | 真实地面反光、遮挡和低纹理 |
-| 轮速里程计 | SDF diff-drive `/wheel_odom` | GPIO 驱动没有编码器反馈 | 不迁移；EKF 不订阅该 topic | 若误加入会产生虚假约束/TF |
+| 轮速里程计 | SDF diff-drive `/wheel_odom` | V4.0 电机板驱动没有编码器反馈 | 不迁移；EKF 不订阅该 topic | 若误加入会产生虚假约束/TF |
 | EKF | 仿真 `laser_odom + wheel_odom + imu`，50 Hz | 实车原有配置；当前采用 `laser_odom + imu`，30 Hz | 新 `config/ekf.yaml` 明确去掉 `/wheel_odom` | IMU yaw rate 偏置和时间戳 |
 | SLAM | 仿真 bringup + `slam_toolbox` | 实车 `mapping_bringup` | 新 mapping launch 保留 SLAM，`use_sim_time=false` | 不得和 map_server/AMCL 同时运行 |
 | 定位/导航 | 仿真 Nav2、DWB/RotationShim | 实车 Nav2 原配置 | 新 navigation launch 使用仿真自定义 DWA + 实车几何参数 | DWA 参数、footprint、控制频率 |
@@ -146,7 +150,7 @@
 | `inspection_sim_ws/src/robot_monitor_interfaces/` + 实车同名包 | 新同名包 | 以实车接口为基线合并 | 保留 Gas/Safety/InspectionPoint/现有服务；新增 `MissionStatus.msg`，扩展 `StartNavigation.srv` | rosidl、std_msgs、geometry_msgs |
 | `ros_project/ros_ws/src/sllidar_ros2/` | 新同名包 | 直接复制 | 保留 SDK、launch、udev rules | 串口权限、SLLIDAR SDK |
 | `ros_project/ros_ws/src/imu_ros2_device/` + `YbImuLib/` | 新同名包/库 | 直接复制 | 保留 YB 串口驱动；launch 使用 `/dev/ttyAMA0` 默认值 | pyserial/设备权限/YbImuLib |
-| `ros_project/ros_ws/src/mapping_bringup/tracked_motor_driver.py` | `inspection_robot_hardware/tracked_motor_driver.py` | 复制到硬件适配包 | 保留 GPIO BCM pin、PWM、加速度限制、0.5 s watchdog；输入固定最终 `/cmd_vel` | RPi.GPIO、geometry_msgs |
+| `ros_project/ros_ws/src/mapping_bringup/tracked_motor_driver.py` | `inspection_robot_hardware/tracked_motor_driver.py` | 保留实机已验证接口并增加安全边界 | C/D 使用 GPIO18/22/27、GPIO23/25/24 与 100 Hz PWM；保留加速度限制、0.35 s watchdog；输入固定最终 `/cmd_vel`；A/B PCA 仅作备用 | RPi.GPIO、可选 smbus、geometry_msgs |
 | `ros_project/ros_ws/src/mapping_bringup/gas_sensor_node.py` | `inspection_robot_hardware/gas_sensor_node.py` | 复制 | 保留 Modbus 请求、13 字节解析、by-path fallback；不使用雷达端口 fallback | pyserial、GasData |
 | `ros_project/ros_ws/src/mapping_bringup/thermal_camera_node.py` | `inspection_robot_hardware/thermal_camera_node.py` | 复制 | 保留 MLX90640 实帧发布；缺少库时不造 mock 帧 | I2C/Adafruit 可选库 |
 | `ros_project/ros_ws/src/mapping_bringup/safety_monitor.py` | `inspection_robot_safety/safety_monitor.py` | 复制后接口适配 | 删除直接 `/cmd_vel` publisher；发布 `/safety_stop`，同时监听两种 Nav2 action 和 typed mission status | RobotSafetyStatus、Trigger |
@@ -171,7 +175,7 @@
 ### B. 修改接口后可以复用的代码
 
 - `mission_manager.py`：删除仿真 IMU 适配；速度改发 `/cmd_vel_nav`；状态增加 typed message；区域原语保持，但必须经过安全 gate。
-- `StartNavigation.srv`：增加 `waypoint_pause_sec` 并同步 GUI/服务端。
+- `StartNavigation.srv`：包含 `waypoint_pause_sec` 和 `return_to_start`，并同步 GUI/服务端。
 - Nav2 参数：自定义 DWA plugin、footprint、速度/加速度、真实 `/scan` 与 `/odom`，关闭仿真时间。
 - EKF：从仿真三源改为实车 RF2O+YB IMU；只让 EKF 发布 `odom→base_link`。
 - GUI RosAdapter/LaunchManager：`/cmd_vel_teleop`、远程 SSH、实车状态订阅、远程 workspace/setup 路径。
@@ -189,7 +193,7 @@
 
 ### D. `ros_project` 已存在、不应该重复迁移的代码
 
-- GPIO/PWM 电机驱动的真实 pin、方向、dead-zone、加速度斜坡和 watchdog。
+- V4.0 电机板的真实端口、方向、dead-zone、加速度斜坡和 watchdog。
 - SLLIDAR C++ SDK、驱动 launch、稳定 by-path 串口和 udev rules。
 - YB IMU 驱动、`YbImuLib`、`/dev/ttyAMA0` 默认接口。
 - 气体 Modbus 解析、热成像 MLX90640 采集、设备 fallback 和权限说明。
@@ -210,7 +214,7 @@
 
 当前新工程已经实现最小安全边界，建议后续继续按下列边界演进：
 
-1. **速度安全门（已实现）**：接收 `/cmd_vel_auto`、`/cmd_vel_teleop`，检查 safety level、`/safety_stop`、输入新鲜度、NaN/Inf 和物理速度上限，唯一发布 `/cmd_vel`。
+1. **速度安全门（已实现）**：接收 `/cmd_vel_auto`、`/cmd_vel_teleop`，检查 safety level、`/safety_stop`、输入与扫描新鲜度、NaN/Inf 和物理速度上限，唯一发布 `/cmd_vel`；失效超时和检查周期有不可被 launch 参数放宽的硬上限。
 2. **底盘适配器（已实现）**：`tracked_motor_driver` 只负责 Twist→差速轮 RPM→GPIO PWM，保留真实 pin、breakout PWM、加速度和 watchdog；不得在任务层直接写 GPIO。
 3. **传感器适配器（已实现）**：SLLIDAR/YB IMU/气体/热成像各自保持 ROS 标准消息；任务层通过 topic 和 typed 状态消费，不知道串口协议。
 4. **参数化外参层（建议确认）**：将雷达/IMU xyz/rpy、footprint、轮半径、履带宽度、速度/加速度集中到实车 YAML，并在上车前用测量值覆盖默认值。
@@ -227,9 +231,9 @@
 | 1 接口/通用库 | 构建 `robot_monitor_interfaces`、`robot_mission_utils`、RF2O；确认 MissionStatus/StartNavigation | `colcon build --packages-select robot_monitor_interfaces robot_mission_utils rf2o_laser_odometry`；`ros2 interface show` | 仅移除新接口/工具包 |
 | 2 DWA/Nav2 配置 | 构建 DWA；加载真实 footprint、速度、EKF/SLAM/Nav2 参数 | `colcon build --packages-select inspection_robot_dwa_controller inspection_robot_bringup`；launch `--show-args` | navigation launch 改回无 DWA 的验证配置 |
 | 3 任务层 | 启动 mission manager/actual recorder（不接电机），验证服务、Marker、typed status、区域文件 | `colcon build --packages-select inspection_robot_mission`；mock/只读 topic 服务测试 | 不启动 mission node，保留 Nav2 基础链路 |
-| 4 硬件/安全 | 单独启动雷达、IMU、GPIO 驱动和 safety/gate；先不使能电机，检查 watchdog 和 stop 初值 | `colcon build --packages-select inspection_robot_hardware inspection_robot_safety`；现场 `ros2 topic echo` | 只运行传感器，不运行 motor/gate；物理急停保持断开 |
+| 4 硬件/安全 | 单独启动雷达、IMU、电机板驱动和 safety/gate；先不使能电机，检查 watchdog 和 stop 初值 | `colcon build --packages-select inspection_robot_hardware inspection_robot_safety`；现场 `ros2 topic echo` | 只运行传感器，不运行 motor/gate；物理急停保持断开 |
 | 5 mapping | 真机低速、无导航任务运行 SLAM；确认 `/scan`、`/laser_odom`、`/odom`、TF 无重复 | `ros2 launch inspection_robot_bringup mapping.launch.py`；检查 `/map` 和 TF | 停止 mapping，恢复原 `mapping_bringup` launch |
-| 6 navigation | 已保存地图运行 AMCL/Nav2/DWA；先手动短距离，再单点，再多点 | `ros2 launch ... navigation.launch.py map:=... use_rviz:=false`；检查 lifecycle 和 `/cmd_vel` 唯一 publisher | 停止新 navigation，原实车导航仍可独立使用 |
+| 6 navigation | 已保存地图运行 AMCL/Nav2/DWA；先手动短距离，再单点，再多点 | `ros2 launch ... navigation.launch.py map:=...`；RViz 仅在上位机运行；检查 lifecycle 和 `/cmd_vel` 唯一 publisher | 停止新 navigation，原实车导航仍可独立使用 |
 | 7 区域/GUI | PyQt 远程启动、任务点、区域任务、气体/热成像状态和安全故障演练 | GUI 服务调用、障碍/TF/串口超时演练 | 停止 GUI/mission，保留基础导航和物理急停 |
 | 8 部署 | 将新 workspace 安装到目标板确认路径，安装 udev/用户组，固定 ROS_DOMAIN_ID/DDS | 目标板本地 build、冷启动、断电恢复测试 | 保留原 `/home/yy/ros2_ws`，切换启动脚本即可回退 |
 
@@ -245,7 +249,7 @@
 8. **底盘速度接口**：仿真 bridge 可直接接受 Twist，实车 PWM 存在死区和响应延迟；gate、velocity smoother、motor driver 三处限幅/加速度参数必须一致或明确分层，不能绕过 gate。
 9. **实机安全**：gate 初始 fault/stop 为真，未收到安全状态时输出零；safety monitor 故障会请求 `/abort_mission`。但软件 stop 不能替代物理急停，首次上电必须轮子离地、限流、低 PWM、有人值守。
 10. **串口和设备权限**：SLLIDAR、气体传感器、YB IMU 的 by-path 设备必须逐一确认；气体 fallback 不得包含雷达设备；udev 规则和用户组要在目标板安装。
-11. **网络/DDS/SSH**：GUI 默认 `yy@192.168.43.21`，新远程 workspace 默认 `/home/yy/inspection_migrated_ws`；ROS_DOMAIN_ID、`ROS_LOCALHOST_ONLY`、CycloneDDS URI、目标板实际安装路径必须一致。
+11. **网络/DDS/SSH**：GUI 默认 `yy@192.168.43.24`，新远程 workspace 默认 `/home/yy/inspection_migrated_ws`；ROS_DOMAIN_ID、`ROS_AUTOMATIC_DISCOVERY_RANGE`、`RMW_IMPLEMENTATION` 和目标板实际安装路径必须一致。启动链清除 Jazzy 已弃用的 `ROS_LOCALHOST_ONLY`，并默认使用 `SUBNET`。实测 Fast DDS 上位机与 Cyclone DDS 目标板之间 topic 可以互通，但 service/action 会超时或反序列化异常，因此两端均默认 `rmw_fastrtps_cpp`。若显式改用其他 RMW，必须在两端安装并保持一致；对应 DDS 配置也必须匹配。
 12. **地图和 AMCL 初始位姿**：navigation 的 `map:=` 不能为空；新工程默认地图仅是路径占位，必须由实车建图保存并在 RViz/GUI 设置真实初始位姿。
 13. **依赖可选性**：RPi.GPIO、MLX90640、pyserial、PyQt5 和 YbImuLib 在目标板/上位机的安装方式不同；节点应在缺少可选硬件时安全报错，但不能将缺失数据伪装为有效传感器。
 
@@ -255,11 +259,27 @@
 - `git -C ros_project status --short`：无输出。
 - 对新工程所有 Python、YAML、`package.xml` 做 AST/YAML/XML 静态检查：通过。
 - 新工程 `colcon build --symlink-install`：12 个条目全部完成；SLLIDAR SDK 只有既有的 zero-size array/unused parameter 编译警告，无失败。
+- 2026-07-18 本机以 Fast DDS 重新构建 12/12 个条目；`colcon test-result --verbose` 汇总 30 项、0 错误、0 失败、1 项版权检查跳过。
+- 软件急停非阻塞修复后的本机全量回归覆盖 12 个包、36 项测试，结果为 0 错误、0 失败、1 项既有版权检查跳过。
+- 针对雷达断流实测 0.5199 s 的失败项，扫描 watchdog 已下调并锁定为不大于 0.40 s，速度门周期锁定为不大于 0.05 s；目标板复测从最后扫描帧到零速度为 0.403337 s，已关闭该严格时序失败项。
+- 2026-07-18 17:09 起重新同步到 `yy@192.168.43.24`：目标板 11 个运行包构建通过，28 项测试、0 错误、0 失败、1 项跳过。远端确认 `/cmd_vel` 为速度门单 publisher/禁用驱动单 subscriber，实际参数为 scan/publish/input/safety=`0.40/0.02/0.35/0.30 s`，缺少扫描和心跳时输出零 Twist。
+- SLLIDAR 无帧问题定位为快速启停后的扫描状态卡住；停转再启动后恢复约 9.18 Hz。驱动已增加有限自动恢复、超时日志和显式 `Sensitivity` 参数传递，随后整套链路复测稳定约 9.21 Hz。
 - `ros2 launch inspection_robot_bringup mapping.launch.py --show-args`：通过。
 - `ros2 launch inspection_robot_bringup navigation.launch.py --show-args`：通过。
 - `ros2 launch inspection_robot_gui gui.launch.py --show-args`：通过。
 - `ros2 interface show` 已确认 `MissionStatus.msg` 和扩展后的 `StartNavigation.srv`。
-- 尚未接入真实 Raspberry Pi、GPIO、电机、电源和传感器，因此没有宣称完成现场运行验证。
+- 2026-07-18 已部署到 `yy@192.168.43.24:/home/yy/inspection_migrated_ws`，目标板按单任务构建通过；雷达、IMU、MLX90640、GPIO、安全门和 TF 拓扑完成实机检查。
+- C/D 采用旧实机已验证的直接 GPIO：C/左=`GPIO18 PWM + GPIO22/GPIO27`，D/右=`GPIO23 PWM + GPIO25/GPIO24`；架空履带确认 `left_inverted=false`、`right_inverted=false`，前进、后退、左转和右转均通过。
+- 软件急停锁存/复位、命令 watchdog、雷达断流、安全监控进程失联和节点退出停车均已验证。禁用电机复测中急停归零为 0.021 s、急停期间安全心跳最大间隔 0.103 s、输入中断归零为 0.360 s；低速地面定位、导航和完整巡检任务仍待隔离场地验收。
+- 最终只读复核频率：SLLIDAR 约 9.21 Hz、RF2O `/laser_odom` 约 9.23 Hz、IMU 10.0 Hz、MLX90640 约 1.968 Hz；扫描、IMU 四元数、32×24 热帧及 `map -> odom -> base_link -> {laser, imu_link}` 均有效。
+- GUI 的 SSH `bash -lc` 引用和远端清理已实机修复；按钮路径可启动建图与传感器节点，停止后 SLLIDAR、RF2O、IMU、EKF、TF、安全及热成像进程均无残留。
+- 当前 GUI SSH 导航链的禁用电机复测确认八个 managed node active、空任务被拒绝、安全目标任务进入 action、三层速度路由均工作；主动取消后 `/cmd_vel_nav`、`/cmd_vel_auto`、最终 `/cmd_vel` 分别在 0.002/0.087/0.100 s 归零。该结果不替代隔离场地的真实路径跟随验收。
+- 上位机 Fast DDS、目标板 Cyclone DDS 的混合配置实测出现 service/action 超时和 RTPS payload size 错误；`start.sh`、部署脚本和 GUI SSH 启动链已统一默认并传播 `rmw_fastrtps_cpp`。
+- 统一 RMW 后，实际 PC `RosAdapter` 收到 1080 点扫描、IMU、82×90 地图、32×24 热帧和 SAFE 状态；初始位姿更新延迟 0.126 s，定位服务成功，空任务正确拒绝，同位姿 Nav2 action 成功，空闲中止成功。Nav2 关键 lifecycle 为 active，图中 33 个节点，`/cmd_vel` 保持一个 publisher、一个禁用驱动 subscriber；目标板未运行 GUI/RViz。
+- 增加 GUI RMW/发现传播、终端信号清理、屏幕尺寸、手动控制和地图安全保存回归测试后，本机全量结果为 60 项、0 错误、0 失败、1 项既有版权检查跳过。
+- 用户实际入口 `./start.sh gui` 已在上位机启动并由 Ctrl+C 干净退出；GUI “刷新地图”从目标板找到一份 YAML，“启动传感器”收到 32×24、768 点热帧。“开始导航”按钮在 `SUBNET` 发现模式和禁用电机条件下再次完成雷达/IMU/地图/SAFE、AMCL、定位、空任务拒绝、同位姿 action 与中止闭环。
+- 以 `agent/dwa-navigation-reliability@0da6b2f` 重新对齐任务和路径规划后，参考工作空间相关测试 47 项通过；迁移工作空间 12 包构建通过、102 项测试 0 失败。目标板同步重编译后，规划/任务/导航配置测试及新服务调用通过。
+- 本次部署后的禁用电机启动已确认新 DWA、目标/进度检查器和任务管理器可配置加载；但 SLLIDAR 健康状态正常却未产生扫描帧（`80008002`），安全门正确保持禁止输出。现场恢复雷达后再继续地面路径与返航验收。
 
 ## 十一、需要用户确认的关键决策
 
@@ -267,7 +287,7 @@
 2. 雷达真实安装外参是否确认为 `laser`、z=0.15 m、yaw=π；IMU 是否确认为 `imu_link`、z=0.05 m、零 yaw？
 3. 实车 footprint、轮半径 0.025 m、履带宽 0.155 m、最大速度 0.18/0.55 是否需要根据实测修改？
 4. YB IMU 是否允许在 EKF 中只融合 yaw rate；是否需要先增加轴向/符号校准节点？
-5. `/cmd_vel_teleop` 与自主 `/cmd_vel_auto` 的优先级是否保持“自主新鲜时优先、否则手动”，还是改为人工始终优先？
+5. `/cmd_vel_teleop` 与自主 `/cmd_vel_auto` 的优先级是否保持当前“人工新鲜时优先、否则自主”的策略？GUI 开始手动控制时还会取消当前导航和巡检任务，避免自动命令恢复。
 6. 物理急停信号是否已有 GPIO/CAN 输入；若有，应接入 `velocity_safety_gate` 的 `/safety_stop` 或独立硬件使能，而不是只依赖 ROS topic。
 7. 气体传感器、热成像是否在 mapping/navigation 默认启动，还是只由 GUI 的“启动传感器”按需启动？当前方案为按需启动。
 8. 是否允许在目标板安装 PyQt5 并运行 GUI，还是 GUI 固定运行在上位机、目标板只运行 ROS 节点？当前方案支持上位机 PyQt5 + SSH，默认不在目标板强制启动 GUI。

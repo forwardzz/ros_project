@@ -198,6 +198,7 @@ class RosAdapter:
             "thermal_error": "",
             "gas": {"H2": 0.0, "CO": 0.0, "VOC": 0.0, "Smoke": 0.0},
             "last_gas": 0.0,
+            "last_safety": 0.0,
             "safety_level": "WAITING",
             "safety_code": "INIT",
             "safety_message": "No safety data",
@@ -249,10 +250,11 @@ class RosAdapter:
         self._emit_status(f"[NAV] goal -> x={x:.2f}, y={y:.2f}, yaw={math.degrees(yaw):.1f} deg")
         return True
 
-    def cancel_nav_goal(self):
+    def cancel_nav_goal(self, report_if_idle=True):
         goal_handle = self._goal_handle
         if goal_handle is None:
-            self._emit_status("[NAV] no active goal to cancel")
+            if report_if_idle:
+                self._emit_status("[NAV] no active goal to cancel")
             return
         cancel_future = goal_handle.cancel_goal_async()
         cancel_future.add_done_callback(lambda _future: self._emit_status("[NAV] cancel requested"))
@@ -432,6 +434,7 @@ class RosAdapter:
 
     def _safety_cb(self, msg):
         with self._lock:
+            self.data["last_safety"] = time.monotonic()
             self.data["safety_level"] = str(msg.level)
             self.data["safety_code"] = str(msg.code)
             self.data["safety_message"] = str(msg.message)

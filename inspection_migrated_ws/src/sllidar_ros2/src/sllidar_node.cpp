@@ -38,7 +38,10 @@
 #include "sl_lidar.h"
 #include "math.h"
 
+#include <algorithm>
+#include <chrono>
 #include <signal.h>
+#include <thread>
 
 #ifndef _countof
 #define _countof(_Array) (int)(sizeof(_Array) / sizeof(_Array[0]))
@@ -78,6 +81,10 @@ class SLlidarNode : public rclcpp::Node
         this->declare_parameter<bool>("angle_compensate", false);
         this->declare_parameter<std::string>("scan_mode",std::string());
         this->declare_parameter<float>("scan_frequency",10);
+        this->declare_parameter<bool>("auto_recovery_enabled", true);
+        this->declare_parameter<int>("scan_timeout_recovery_count", 3);
+        this->declare_parameter<int>("scan_recovery_stop_delay_ms", 3000);
+        this->declare_parameter<int>("max_scan_recovery_attempts", 2);
         
         this->get_parameter_or<std::string>("channel_type", channel_type, "serial");
         this->get_parameter_or<std::string>("tcp_ip", tcp_ip, "192.168.0.7"); 
@@ -94,6 +101,47 @@ class SLlidarNode : public rclcpp::Node
             this->get_parameter_or<float>("scan_frequency", scan_frequency, 20.0);
         else
             this->get_parameter_or<float>("scan_frequency", scan_frequency, 10.0);
+        this->get_parameter_or<bool>("auto_recovery_enabled", auto_recovery_enabled, true);
+        this->get_parameter_or<int>("scan_timeout_recovery_count", scan_timeout_recovery_count, 3);
+        this->get_parameter_or<int>("scan_recovery_stop_delay_ms", scan_recovery_stop_delay_ms, 3000);
+        this->get_parameter_or<int>("max_scan_recovery_attempts", max_scan_recovery_attempts, 2);
+        scan_timeout_recovery_count = std::min(std::max(scan_timeout_recovery_count, 1), 20);
+        scan_recovery_stop_delay_ms = std::min(std::max(scan_recovery_stop_delay_ms, 500), 10000);
+        max_scan_recovery_attempts = std::min(std::max(max_scan_recovery_attempts, 0), 5);
+    }
+
+    sl_result start_configured_scan(LidarScanMode & current_scan_mode)
+    {
+        if (scan_mode.empty()) {
+            return drv->startScan(false, true, 0, &current_scan_mode);
+        }
+
+        std::vector<LidarScanMode> all_supported_scan_modes;
+        sl_result result = drv->getAllSupportedScanModes(all_supported_scan_modes);
+        if (SL_IS_FAIL(result)) {
+            return result;
+        }
+
+        sl_u16 selected_scan_mode = sl_u16(-1);
+        for (const auto & supported_scan_mode : all_supported_scan_modes) {
+            if (supported_scan_mode.scan_mode == scan_mode) {
+                selected_scan_mode = supported_scan_mode.id;
+                break;
+            }
+        }
+
+        if (selected_scan_mode == sl_u16(-1)) {
+            RCLCPP_ERROR(this->get_logger(), "scan mode `%s' is not supported by lidar, supported modes:", scan_mode.c_str());
+            for (const auto & supported_scan_mode : all_supported_scan_modes) {
+                RCLCPP_ERROR(
+                    this->get_logger(), "\t%s: max_distance: %.1f m, Point number: %.1fK",
+                    supported_scan_mode.scan_mode, supported_scan_mode.max_distance,
+                    (1000 / supported_scan_mode.us_per_sample));
+            }
+            return SL_RESULT_OPERATION_FAIL;
+        }
+
+        return drv->startScanExpress(false, selected_scan_mode, 0, &current_scan_mode);
     }
 
     bool getSLLIDARDeviceInfo(ILidarDriver * drv)
@@ -160,6 +208,8 @@ class SLlidarNode : public rclcpp::Node
             return false;
 
         RCLCPP_DEBUG(this->get_logger(),"Stop motor");
+        scan_stopped_by_service = true;
+        drv->stop();
         drv->setMotorSpeed(0);
         return true;
     }
@@ -181,10 +231,13 @@ class SLlidarNode : public rclcpp::Node
                 return false;
             }
         
-            ans=drv->startScan(0,1);
+            LidarScanMode current_scan_mode;
+            ans = start_configured_scan(current_scan_mode);
             if (SL_IS_FAIL(ans)) {
                 RCLCPP_WARN(this->get_logger(), "Failed to start scan: %08x", ans);
+                return false;
             }
+            scan_stopped_by_service = false;
         } else {
             RCLCPP_INFO(this->get_logger(),"lost connection");
             return false;
@@ -308,33 +361,7 @@ public:
         drv->setMotorSpeed();
 
         LidarScanMode current_scan_mode;
-        if (scan_mode.empty()) {
-            op_result = drv->startScan(false /* not force scan */, true /* use typical scan mode */, 0, &current_scan_mode);
-        } else {
-            std::vector<LidarScanMode> allSupportedScanModes;
-            op_result = drv->getAllSupportedScanModes(allSupportedScanModes);
-
-            if (SL_IS_OK(op_result)) {
-                sl_u16 selectedScanMode = sl_u16(-1);
-                for (std::vector<LidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
-                    if (iter->scan_mode == scan_mode) {
-                        selectedScanMode = iter->id;
-                        break;
-                    }
-                }
-
-                if (selectedScanMode == sl_u16(-1)) {
-                    RCLCPP_ERROR(this->get_logger(),"scan mode `%s' is not supported by lidar, supported modes:", scan_mode.c_str());
-                    for (std::vector<LidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
-                        RCLCPP_ERROR(this->get_logger(),"\t%s: max_distance: %.1f m, Point number: %.1fK",  iter->scan_mode,
-                                iter->max_distance, (1000/iter->us_per_sample));
-                    }
-                    op_result = SL_RESULT_OPERATION_FAIL;
-                } else {
-                    op_result = drv->startScanExpress(false /* not force scan */, selectedScanMode, 0, &current_scan_mode);
-                }
-            }
-        }
+        op_result = start_configured_scan(current_scan_mode);
 
         if(SL_IS_OK(op_result))
         {
@@ -355,6 +382,8 @@ public:
         rclcpp::Time start_scan_time;
         rclcpp::Time end_scan_time;
         double scan_duration;
+        int consecutive_scan_failures = 0;
+        int scan_recovery_attempts = 0;
         while (rclcpp::ok() && !need_exit) {
             sl_lidar_response_measurement_node_hq_t nodes[8192];
             size_t   count = _countof(nodes);
@@ -365,6 +394,8 @@ public:
             scan_duration = (end_scan_time - start_scan_time).seconds();
 
             if (op_result == SL_RESULT_OK) {
+                consecutive_scan_failures = 0;
+                scan_recovery_attempts = 0;
                 op_result = drv->ascendScanData(nodes, count);
                 float angle_min = DEG2RAD(0.0f);
                 float angle_max = DEG2RAD(360.0f);
@@ -427,6 +458,47 @@ public:
                                 angle_min, angle_max, max_distance,
                                 frame_id);
                 }
+            } else if (!scan_stopped_by_service) {
+                consecutive_scan_failures++;
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 5000,
+                    "No scan frame received (result: %08x, consecutive failures: %d)",
+                    op_result, consecutive_scan_failures);
+
+                if (auto_recovery_enabled &&
+                    consecutive_scan_failures >= scan_timeout_recovery_count) {
+                    if (scan_recovery_attempts >= max_scan_recovery_attempts) {
+                        RCLCPP_ERROR_THROTTLE(
+                            this->get_logger(), *this->get_clock(), 10000,
+                            "SLLidar automatic recovery limit reached; /scan remains unavailable");
+                    } else {
+                        scan_recovery_attempts++;
+                        consecutive_scan_failures = 0;
+                        RCLCPP_WARN(
+                            this->get_logger(),
+                            "Restarting SLLidar scan after repeated timeouts (attempt %d/%d)",
+                            scan_recovery_attempts, max_scan_recovery_attempts);
+                        drv->stop();
+                        drv->setMotorSpeed(0);
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(scan_recovery_stop_delay_ms));
+
+                        sl_result recovery_result = drv->setMotorSpeed();
+                        LidarScanMode recovered_scan_mode;
+                        if (SL_IS_OK(recovery_result)) {
+                            recovery_result = start_configured_scan(recovered_scan_mode);
+                        }
+                        if (SL_IS_FAIL(recovery_result)) {
+                            RCLCPP_ERROR(
+                                this->get_logger(), "SLLidar scan recovery failed: %08x",
+                                recovery_result);
+                        } else {
+                            RCLCPP_INFO(
+                                this->get_logger(),
+                                "SLLidar scan recovery command completed; waiting for frames");
+                        }
+                    }
+                }
             }
 
             rclcpp::spin_some(shared_from_this());
@@ -460,6 +532,11 @@ public:
     size_t angle_compensate_multiple = 1;//it stand of angle compensate at per 1 degree
     std::string scan_mode;
     float scan_frequency;
+    bool auto_recovery_enabled = true;
+    int scan_timeout_recovery_count = 3;
+    int scan_recovery_stop_delay_ms = 3000;
+    int max_scan_recovery_attempts = 2;
+    bool scan_stopped_by_service = false;
 
     ILidarDriver * drv;    
 };
@@ -480,4 +557,3 @@ int main(int argc, char * argv[])
   rclcpp::shutdown();
   return ret;
 }
-
