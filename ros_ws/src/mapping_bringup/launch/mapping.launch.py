@@ -157,6 +157,21 @@ def generate_launch_description():
             output="screen",
         ),
 
+        Node(
+            package="mapping_bringup",
+            executable="safety_monitor",
+            name="safety_monitor",
+            output="screen",
+            parameters=[{"fault_on_undervoltage_seen": False}],
+        ),
+
+        Node(
+            package="mapping_bringup",
+            executable="velocity_safety_gate",
+            name="velocity_safety_gate",
+            output="screen",
+        ),
+
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(slam_launch_path),
             launch_arguments={

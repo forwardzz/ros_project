@@ -171,6 +171,7 @@ def generate_launch_description():
             executable="mission_manager",
             name="mission_manager",
             output="screen",
+            parameters=[{"use_tsp": True}],
         ),
 
         Node(
@@ -188,6 +189,13 @@ def generate_launch_description():
             parameters=[{
                 "fault_on_undervoltage_seen": False,
             }],
+        ),
+
+        Node(
+            package="mapping_bringup",
+            executable="velocity_safety_gate",
+            name="velocity_safety_gate",
+            output="screen",
         ),
 
         Node(
@@ -244,6 +252,7 @@ def generate_launch_description():
             name="behavior_server",
             output="screen",
             parameters=[nav2_param_path],
+            remappings=[("/cmd_vel", "/cmd_vel_nav")],
         ),
 
         Node(
@@ -262,7 +271,7 @@ def generate_launch_description():
             parameters=[nav2_param_path],
             remappings=[
                 ("/cmd_vel", "/cmd_vel_nav"),
-                ("/cmd_vel_smoothed", "/cmd_vel"),
+                ("/cmd_vel_smoothed", "/cmd_vel_auto"),
             ],
         ),
 

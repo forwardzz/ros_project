@@ -8,7 +8,7 @@ Use this file as the first project context for future coding agents.
 
 - Local repo: `/home/zjy/Desktop/ros_project_git_2026-05-20`
 - Local ROS workspace: `/home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws`
-- Robot host: `yy@192.168.43.21`
+- Robot host: `yy@192.168.43.24`
 - Robot source directory: `/home/yy/ros2_ws/src`
 - ROS distro: `jazzy`
 - Main branch remote: `git@github.com:forwardzz/ros_project.git`
@@ -77,45 +77,16 @@ colcon build --packages-select robot_monitor_interfaces mapping_bringup robot_co
 
 If building on the robot, run from `/home/yy/ros2_ws`, not `/home`; otherwise `colcon` may fail creating `log/`.
 
-## Launch Commands
+## Launch Command
 
-Mapping on robot:
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source /home/yy/ros2_ws/install/setup.bash
-ros2 launch mapping_bringup mapping.launch.py
-```
-
-Navigation on robot:
+The supported project entry point is only:
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /home/yy/ros2_ws/install/setup.bash
-ros2 launch mapping_bringup navigation.launch.py map:=/home/yy/ros2_ws/map_name.yaml
+cd /home/zjy/Desktop/ros_project_git_2026-05-20
+./start.sh
 ```
 
-Host UI:
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/install/setup.bash
-export ROS_DOMAIN_ID=0
-export ROS_LOCALHOST_ONLY=0
-ros2 launch robot_control_ui ui.launch.py \
-  remote_user:=yy \
-  remote_host:=192.168.43.21 \
-  workspace_path:=/home/yy/ros2_ws \
-  map_path:=/home/yy/ros2_ws/map_name.yaml
-```
-
-RViz recommended config:
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/install/setup.bash
-rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rviz/sllidar_ros2.rviz
-```
+`start.sh` builds the affected local packages, enforces a single local console, and starts the host Tk UI plus RViz. It does not automatically start mapping or navigation on the robot. Start and stop the selected robot mode through the UI. Do not launch a second UI/RViz manually.
 
 ## RViz Mission Workflow
 
@@ -126,7 +97,7 @@ Use RViz for mission points. The UI should only confirm and start the mission.
 - `2D Goal Pose (Mission Heading)` publishes `/mission_goal_pose` and only updates the nearest mission point heading.
 - `Clear RViz Points` clears mission-manager cached RViz points and preview markers.
 
-Mission execution must respect the operator-provided point order. Do not silently reorder RViz mission points during execution.
+Mission ordering is explicit in the Tk UI. `TSP` defaults on and optimizes ordinary points and regions; when it is off, execution must preserve the operator-provided point/region order. Never reorder without reflecting the selected mode in the UI and mission status.
 
 ## UI Notes
 
@@ -134,14 +105,7 @@ The UI is a Tkinter application intended to run on the host PC. It subscribes to
 
 Current UI layout is intentionally preserved by user request. Be careful when changing `robot_control_ui.py`; layout regressions are easy because status cards, runtime log, thermal panel, map, and manual drive all compete for vertical space.
 
-If the UI appears unchanged after a code edit, kill stale UI processes before retesting:
-
-```bash
-pkill -f robot_control_ui
-pkill -f "ros2 launch robot_control_ui"
-```
-
-Then re-source the intended local workspace and launch again.
+If the UI appears unchanged after a code edit, close the current `start.sh` console and run `./start.sh` again. Its exact local cleanup avoids duplicate UI/RViz processes.
 
 ## Networking And QoS
 
@@ -171,6 +135,9 @@ Important files:
 
 Known sensitive parameters:
 
+- `planner_server.GridBased` SmacPlanner2D parameters and `allow_unknown`
+- `global_costmap` live laser obstacle layer, resolution, and inflation settings
+- `navigate_to_pose_no_spin.xml` / `navigate_through_poses_no_spin.xml` path-validity replanning flow
 - `FollowPath.use_rotate_to_heading`
 - `FollowPath.rotate_to_heading_min_angle`
 - `FollowPath.allow_reversing`
@@ -189,7 +156,7 @@ source /opt/ros/jazzy/setup.bash
 colcon build --packages-select <changed_package>
 ```
 
-For robot-side changes, sync to `yy@192.168.43.21:/home/yy/ros2_ws/src/...` and build on the robot when the user expects immediate testing.
+For robot-side changes, sync to `yy@192.168.43.24:/home/yy/ros2_ws/src/...` and build on the robot when the user expects immediate testing.
 
 Useful runtime checks:
 

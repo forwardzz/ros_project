@@ -8,14 +8,14 @@ from collections import deque
 
 import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
-from geometry_msgs.msg import Twist
 from rcl_interfaces.msg import Log
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool, Empty
 from std_srvs.srv import Trigger
 
-from robot_monitor_interfaces.msg import RobotSafetyStatus
+from robot_monitor_interfaces.msg import MissionStatus, RobotSafetyStatus
 
 
 class SafetyMonitor(Node):
@@ -40,8 +40,8 @@ class SafetyMonitor(Node):
         )
 
         self.status_pub = self.create_publisher(RobotSafetyStatus, "/robot_safety_status", latched_qos)
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        self.cmd_vel_nav_pub = self.create_publisher(Twist, "/cmd_vel_nav", 10)
+        self.safety_stop_pub = self.create_publisher(Bool, "/safety_stop", latched_qos)
+        self.heartbeat_pub = self.create_publisher(Empty, "/safety_heartbeat", 10)
         self.abort_client = self.create_client(Trigger, "/abort_mission")
         self.create_service(Trigger, "/reset_safety_monitor", self._handle_reset)
 
@@ -49,8 +49,17 @@ class SafetyMonitor(Node):
         self.create_subscription(
             GoalStatusArray,
             "/navigate_through_poses/_action/status",
-            self._status_cb,
+            lambda msg: self._status_cb(msg, "through_poses"),
             10,
+        )
+        self.create_subscription(
+            GoalStatusArray,
+            "/navigate_to_pose/_action/status",
+            lambda msg: self._status_cb(msg, "to_pose"),
+            10,
+        )
+        self.create_subscription(
+            MissionStatus, "/mission_status_typed", self._mission_status_cb, latched_qos
         )
 
         self.collision_events = deque()
@@ -60,6 +69,8 @@ class SafetyMonitor(Node):
         self.code = "READY"
         self.message = "Safety monitor online"
         self.mission_active = False
+        self.typed_mission_active = False
+        self.action_active = {"through_poses": False, "to_pose": False}
         self.abort_requested = False
         self.last_fault_time = 0.0
         self.voltage_available = False
@@ -72,16 +83,27 @@ class SafetyMonitor(Node):
 
         poll_period = float(self.get_parameter("poll_period_sec").value)
         self.timer = self.create_timer(poll_period, self._poll)
+        self.heartbeat_timer = self.create_timer(0.1, self._publish_heartbeat)
         self._publish_status()
         self.get_logger().info("Safety monitor ready")
 
-    def _status_cb(self, msg):
+    def _status_cb(self, msg, source):
         active_states = {
             GoalStatus.STATUS_ACCEPTED,
             GoalStatus.STATUS_EXECUTING,
             GoalStatus.STATUS_CANCELING,
         }
-        self.mission_active = any(status.status in active_states for status in msg.status_list)
+        self.action_active[source] = any(
+            status.status in active_states for status in msg.status_list
+        )
+        self._update_mission_active()
+
+    def _mission_status_cb(self, msg):
+        self.typed_mission_active = bool(msg.active)
+        self._update_mission_active()
+
+    def _update_mission_active(self):
+        self.mission_active = self.typed_mission_active or any(self.action_active.values())
         if not self.mission_active:
             self.abort_requested = False
 
@@ -122,9 +144,7 @@ class SafetyMonitor(Node):
                 "Raspberry Pi undervoltage detected. Mission aborted to protect the board and power supply.",
             )
 
-        if self.fault_active:
-            self._publish_zero_cmd()
-        elif self.level != "SAFE":
+        if not self.fault_active and self.level != "SAFE":
             self.level = "SAFE"
             self.code = "READY"
             self.message = "Safety monitor online"
@@ -238,7 +258,6 @@ class SafetyMonitor(Node):
         self.message = message
         self.last_fault_time = time.time()
         self.get_logger().error(message)
-        self._publish_zero_cmd()
         self._publish_status()
         if not self.abort_requested:
             self.abort_requested = True
@@ -286,10 +305,11 @@ class SafetyMonitor(Node):
         self.get_logger().info(response.message)
         return response
 
-    def _publish_zero_cmd(self):
-        stop = Twist()
-        self.cmd_vel_nav_pub.publish(stop)
-        self.cmd_vel_pub.publish(stop)
+    def _publish_heartbeat(self):
+        self.heartbeat_pub.publish(Empty())
+        stop = Bool()
+        stop.data = bool(self.fault_active)
+        self.safety_stop_pub.publish(stop)
 
     def _publish_status(self):
         msg = RobotSafetyStatus()
@@ -303,6 +323,9 @@ class SafetyMonitor(Node):
         msg.undervoltage_seen = self.undervoltage_seen
         msg.throttled_flags = self.throttled_flags
         self.status_pub.publish(msg)
+        stop = Bool()
+        stop.data = bool(self.fault_active)
+        self.safety_stop_pub.publish(stop)
 
     @staticmethod
     def _trim_events(events, window_sec, now):

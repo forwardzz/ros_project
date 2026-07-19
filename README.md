@@ -37,6 +37,7 @@ ROS 2 Jazzy 履带机器人项目。源码工作区在 `ros_ws/src`，树莓派�
   - `mapping_bringup/mission_manager.py`：RViz 任务点、区域巡检、直接导航桥接
   - `mapping_bringup/actual_path_recorder.py`：发布 `/actual_path`
   - `mapping_bringup/safety_monitor.py`：导航安全监控
+  - `mapping_bringup/velocity_safety_gate.py`：唯一 `/cmd_vel` 发布者，统一仲裁手动与自主速度
 - `robot_control_ui`
   - 电脑端 UI，通过 ROS 2 DDS 读状态，通过 SSH 控制树莓派启动/停止任务
 - `robot_monitor_interfaces`
@@ -101,53 +102,18 @@ colcon build --packages-select mapping_bringup robot_control_ui robot_mission_ut
 
 ## 启动
 
-树莓派建图：
+以后只从项目根目录运行：
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /home/yy/ros2_ws/install/setup.bash
-ros2 launch mapping_bringup mapping.launch.py
+cd /home/zjy/Desktop/ros_project_git_2026-05-20
+./start.sh
 ```
 
-保存地图：
-
-```bash
-ros2 run nav2_map_server map_saver_cli -f /home/yy/ros2_ws/map_name
-```
-
-树莓派导航：
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source /home/yy/ros2_ws/install/setup.bash
-ros2 launch mapping_bringup navigation.launch.py map:=/home/yy/ros2_ws/map_name.yaml
-```
-
-电脑端 UI：
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/install/setup.bash
-export ROS_DOMAIN_ID=0
-export ROS_LOCALHOST_ONLY=0
-ros2 launch robot_control_ui ui.launch.py \
-  remote_user:=yy \
-  remote_host:=192.168.43.21 \
-  workspace_path:=/home/yy/ros2_ws \
-  map_path:=/home/yy/ros2_ws/map_name.yaml
-```
-
-推荐 RViz：
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/install/setup.bash
-rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rviz/sllidar_ros2.rviz
-```
+`start.sh` 会在正确的 `ros_ws` 目录编译受影响包，清理本机旧 UI/RViz，然后启动唯一的 Tk 控制台和 RViz。它不会自动让树莓派进入建图或导航；使用 UI 中的 `Start Mapping` / `Start Navigation` 选择模式。重复执行会被单实例锁拒绝。
 
 ## RViz 操作
 
-导航前先用 `2D Pose Estimate` 给 AMCL 初始位姿。
+导航启动后，可在 Tk 界面的 `Localization and Initial Pose` 输入 X/Y/Yaw 并点击 `Set Initial Pose`；也保留 RViz `2D Pose Estimate` 方式。
 
 RViz 工具用途：
 
@@ -157,9 +123,11 @@ RViz 工具用途：
 
 任务执行规则：
 
-- 普通任务点按 RViz 点击顺序执行，不自动重排
-- UI 点 `Start Mission` 后，如果已定义区域，则执行区域巡检路径；否则执行普通 RViz 任务点
-- 区域巡检使用轴对齐矩形，默认 `sweep_spacing=0.30m`、`region_margin=0.15m`
+- Tk 中 `TSP` 默认开启：普通多点任务按地图可通行路径代价优化顺序；关闭后严格保留 RViz 点击/请求顺序
+- 10 个及以下目标使用精确开放式 TSP，更多目标使用最近邻加 2-opt；区域 TSP 同时选择区域顺序和正/反扫方向
+- `Return to Start` 默认关闭；开启后仅在全部巡检成功时返回任务启动瞬间记录的 AMCL 位姿
+- 只有 UI 启用 `Region Mode` 时才执行区域巡检，已保存区域不会抢占普通多点任务
+- 区域巡检使用轴对齐矩形，默认 `sweep_spacing=0.10m`、`region_margin=0.23m`
 - 区域方案默认保存到 `/home/yy/ros2_ws/config/inspection_regions.yaml`
 
 RViz 主要显示：
@@ -169,22 +137,20 @@ RViz 主要显示：
 - `/plan`：Nav2 当前全局规划路径
 - `/actual_path`：机器人实际行驶轨迹
 
+全局路径由 `SmacPlanner2D` 在静态地图与实时激光障碍组成的全局代价地图上生成。行为树以 1Hz 检查当前路径，仅在目标变化或路径失效时重新规划；实车继续使用 RPP 跟踪路径，并禁用 Spin 恢复。
+
 ## UI 功能
 
 - 启动/停止建图和导航
+- 设置 AMCL 初始位姿并显示确认结果
 - 保存地图
-- 手动控制底盘
+- 按住按钮或键盘持续手动控制底盘，松开立即停车
 - 查看 `/scan`、`/odom`、`/map`、安全状态、热成像和气体数据
-- RViz 任务启动、定位检查、任务点清空
+- RViz 任务启动、TSP/返航选择、定位检查、任务点清空
 - 区域巡检模式开关、保存、加载、清空
 - 安全故障复位
 
-如果 UI 修改后看起来没变化，先清理旧进程：
-
-```bash
-pkill -f robot_control_ui
-pkill -f "ros2 launch robot_control_ui"
-```
+本机 UI/RViz 旧进程由 `start.sh` 自动清理，不要另外手工启动第二份 UI 或 RViz。
 
 ## 网络与 QoS
 

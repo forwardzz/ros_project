@@ -11,7 +11,7 @@ from tkinter import messagebox, ttk
 
 import matplotlib
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.executors import MultiThreadedExecutor
@@ -26,8 +26,10 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import SetBool, Trigger
 
-from robot_monitor_interfaces.msg import GasData, RobotSafetyStatus
+from robot_monitor_interfaces.msg import GasData, MissionStatus, RobotSafetyStatus
 from robot_monitor_interfaces.srv import Localize, StartNavigation
+
+from .initial_pose import InitialPoseRetryState, make_initial_pose_message
 
 try:
     from ament_index_python.packages import get_package_share_directory
@@ -54,13 +56,19 @@ class RosUiAdapter:
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self.cmd_vel_pub = self.node.create_publisher(Twist, "/cmd_vel", 10)
+        self.cmd_vel_pub = self.node.create_publisher(Twist, "/cmd_vel_teleop", 10)
+        self.initial_pose_pub = self.node.create_publisher(
+            PoseWithCovarianceStamped, "/initialpose", 10
+        )
         self.odom_sub = self.node.create_subscription(Odometry, "/odom", self._odom_cb, 10)
         self.scan_sub = self.node.create_subscription(
             LaserScan, "/scan", self._scan_cb, qos_profile_sensor_data
         )
         self.map_sub = self.node.create_subscription(
             OccupancyGrid, "/map", self._map_cb, map_qos
+        )
+        self.amcl_sub = self.node.create_subscription(
+            PoseWithCovarianceStamped, "/amcl_pose", self._amcl_pose_cb, 10
         )
         self.thermal_sub = self.node.create_subscription(
             Float32MultiArray, "/thermal_frame", self._thermal_cb, 10
@@ -70,6 +78,9 @@ class RosUiAdapter:
         )
         self.safety_sub = self.node.create_subscription(
             RobotSafetyStatus, "/robot_safety_status", self._safety_cb, map_qos
+        )
+        self.mission_status_sub = self.node.create_subscription(
+            MissionStatus, "/mission_status_typed", self._mission_status_cb, map_qos
         )
         self.localize_client = self.node.create_client(Localize, "/localize_robot")
         self.start_navigation_client = self.node.create_client(
@@ -81,6 +92,7 @@ class RosUiAdapter:
         self.set_region_mode_client = self.node.create_client(
             SetBool, "/set_region_mode"
         )
+        self.set_tsp_mode_client = self.node.create_client(SetBool, "/set_tsp_mode")
         self.clear_inspection_regions_client = self.node.create_client(
             Trigger, "/clear_inspection_regions"
         )
@@ -93,6 +105,16 @@ class RosUiAdapter:
         self.reset_safety_client = self.node.create_client(
             Trigger, "/reset_safety_monitor"
         )
+        self.abort_mission_client = self.node.create_client(Trigger, "/abort_mission")
+        self.undo_rviz_point_client = self.node.create_client(
+            Trigger, "/undo_last_rviz_point"
+        )
+        self.undo_region_client = self.node.create_client(
+            Trigger, "/undo_last_inspection_region"
+        )
+        self.software_estop_client = self.node.create_client(
+            SetBool, "/set_software_estop"
+        )
 
         self.robot_x = 0.0
         self.robot_y = 0.0
@@ -103,6 +125,10 @@ class RosUiAdapter:
         self.last_scan_stamp = 0.0
         self.last_odom_stamp = 0.0
         self.last_map_stamp = 0.0
+        self.amcl_x = 0.0
+        self.amcl_y = 0.0
+        self.amcl_yaw = 0.0
+        self.last_amcl_stamp = 0.0
         self.last_thermal_stamp = 0.0
         self.last_gas_stamp = 0.0
         self.thermal_width = 32
@@ -133,6 +159,12 @@ class RosUiAdapter:
         self.last_safety_stamp = 0.0
         self.pending_safety_alert = None
         self.last_safety_alert_signature = None
+        self.mission_state = "IDLE"
+        self.mission_mode = "waypoints"
+        self.mission_message = "No mission"
+        self.mission_active = False
+        self.mission_current_index = 0
+        self.mission_total_count = 0
 
     def _odom_cb(self, msg):
         self.robot_x = msg.pose.pose.position.x
@@ -151,6 +183,15 @@ class RosUiAdapter:
     def _map_cb(self, msg):
         self.map_data = msg
         self.last_map_stamp = time.time()
+
+    def _amcl_pose_cb(self, msg):
+        self.amcl_x = float(msg.pose.pose.position.x)
+        self.amcl_y = float(msg.pose.pose.position.y)
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.amcl_yaw = math.atan2(siny_cosp, cosy_cosp)
+        self.last_amcl_stamp = time.time()
 
     def _gas_cb(self, msg):
         self.gas_data["H2"] = float(msg.hydrogen_concentration)
@@ -199,11 +240,32 @@ class RosUiAdapter:
             self.pending_safety_alert = signature
             self.last_safety_alert_signature = signature
 
+    def _mission_status_cb(self, msg):
+        self.mission_state = msg.state or "IDLE"
+        self.mission_mode = msg.mode or "waypoints"
+        self.mission_message = msg.message or ""
+        self.mission_active = bool(msg.active)
+        self.mission_current_index = int(msg.current_index)
+        self.mission_total_count = int(msg.total_count)
+
     def publish_cmd_vel(self, linear_x=0.0, angular_z=0.0):
         msg = Twist()
         msg.linear.x = linear_x
         msg.angular.z = angular_z
         self.cmd_vel_pub.publish(msg)
+
+    def initial_pose_subscription_count(self):
+        return self.initial_pose_pub.get_subscription_count()
+
+    def publish_initial_pose(self, x, y, yaw):
+        msg = make_initial_pose_message(
+            x,
+            y,
+            yaw,
+            self.node.get_clock().now().to_msg(),
+        )
+        self.initial_pose_pub.publish(msg)
+        return msg
 
     def call_service_async(self, client, request, done_callback, timeout_sec=6.0):
         def worker():
@@ -232,7 +294,8 @@ class RosUiAdapter:
     def shutdown(self):
         self.executor.shutdown()
         self.node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 class LaunchManager:
@@ -260,12 +323,21 @@ class LaunchManager:
     def _run_remote_cleanup(self, patterns):
         if not patterns:
             return
-        cleanup_steps = [f"pkill -TERM -f {pattern} || true" for pattern in patterns]
+        safe_patterns = [self._self_safe_pkill_pattern(pattern) for pattern in patterns]
+        cleanup_steps = [
+            f"pkill -TERM -f -- {shlex.quote(pattern)} || true"
+            for pattern in safe_patterns
+        ]
         cleanup_steps.append("sleep 1")
+        cleanup_steps.extend(
+            f"pkill -KILL -f -- {shlex.quote(pattern)} || true"
+            for pattern in safe_patterns
+        )
         cleanup = " ; ".join(cleanup_steps)
         proc = subprocess.Popen(
             [
                 "ssh",
+                "-x",
                 f"{self.remote_user}@{self.remote_host}",
                 f"bash -lc {shlex.quote(cleanup)}",
             ],
@@ -282,49 +354,30 @@ class LaunchManager:
         if stdout:
             self.log_callback(stdout.rstrip())
 
+    @staticmethod
+    def _self_safe_pkill_pattern(pattern):
+        if not pattern:
+            return pattern
+        return f"[{pattern[0]}]{pattern[1:]}"
+
     def _stop_patterns_for(self, name):
         common = [
-            "ros2",
-            "mapping.launch.py",
-            "navigation.launch.py",
+            "ros2 launch mapping_bringup mapping.launch.py",
+            "ros2 launch mapping_bringup navigation.launch.py",
             "sllidar_node",
-            "rf2o_laser_odometry",
-            "static_transform_publisher",
+            "rf2o_laser_odometry_node",
+            "__node:=base_to_laser",
+            "__node:=base_to_imu",
+            "ybimu_driver",
+            "ekf_node",
             "tracked_motor_driver",
             "safety_monitor",
-            "gas_sensor_node",
+            "velocity_safety_gate",
         ]
-        if name == "mapping":
-            return [
-                "ros2",
-                "mapping.launch.py",
-                "slam_toolbox",
-                "thermal_camera_node",
-                "gas_sensor_node",
-                *common,
-            ]
-        if name == "navigation":
-            return [
-                "ros2",
-                "navigation.launch.py",
-                "nav2_amcl",
-                "planner_server",
-                "controller_server",
-                "bt_navigator",
-                "behavior_server",
-                "smoother_server",
-                "velocity_smoother",
-                "map_server",
-                "lifecycle_manager_navigation",
-                "thermal_camera_node",
-                "gas_sensor_node",
-                *common,
-            ]
-        return [
-            "ros2",
-            "mapping.launch.py",
-            "navigation.launch.py",
-            "slam_toolbox",
+        mapping = ["slam_toolbox"]
+        navigation = [
+            "mission_manager",
+            "actual_path_recorder",
             "nav2_amcl",
             "planner_server",
             "controller_server",
@@ -334,17 +387,17 @@ class LaunchManager:
             "velocity_smoother",
             "map_server",
             "lifecycle_manager_navigation",
-            "sllidar_node",
-            "rf2o_laser_odometry",
-            "tracked_motor_driver",
-            "static_transform_publisher",
-            "thermal_camera_node",
-            "gas_sensor_node",
         ]
+        if name == "mapping":
+            return common + mapping
+        if name == "navigation":
+            return common + navigation
+        return list(dict.fromkeys(common + mapping + navigation))
 
     def _build_remote_command(self, command):
         setup_path = os.path.join(self.workspace_path, "install", "setup.bash")
         return (
+            "unset DISPLAY WAYLAND_DISPLAY && "
             f"export CYCLONEDDS_URI={shlex.quote(self.cyclone_uri)} && "
             f"source {self.ros_setup_path} && "
             f"source {setup_path} && "
@@ -356,6 +409,7 @@ class LaunchManager:
         remote_command = self._build_remote_command(command)
         return [
             "ssh",
+            "-x",
             f"{self.remote_user}@{self.remote_host}",
             f"bash -lc {shlex.quote(remote_command)}",
         ]
@@ -364,6 +418,9 @@ class LaunchManager:
         if self.active_process and self.active_process.poll() is None:
             self.log_callback(f"[WARN] Stop current task before starting {name}.")
             return False
+
+        self.log_callback(f"[PREP] cleaning stale robot runtime before {name}")
+        self._run_remote_cleanup(self._stop_patterns_for("runtime"))
 
         self.active_process = subprocess.Popen(
             self._build_ssh_invocation(command),
@@ -477,7 +534,7 @@ class RobotControlApp:
             "remote_user", "yy"
         ).value
         self.remote_host = self.node.declare_parameter(
-            "remote_host", "192.168.43.21"
+            "remote_host", "192.168.43.24"
         ).value
         self.ros_setup_path = self.node.declare_parameter(
             "ros_setup_path", "/opt/ros/jazzy/setup.bash"
@@ -495,7 +552,12 @@ class RobotControlApp:
             self.log_queue.put,
         )
         self.manual_linear = 0.12
-        self.manual_angular = 0.8
+        self.manual_angular = 0.55
+        self.initial_pose_retry = InitialPoseRetryState(max_attempts=8)
+        self.initial_pose_after_id = None
+        self.manual_after_id = None
+        self.manual_command = None
+        self.manual_request_id = 0
         self.pose_history = []
         self.last_map_render_key = None
         self.thermal_window = None
@@ -504,9 +566,14 @@ class RobotControlApp:
         self.thermal_popup_canvas = None
         self.thermal_popup_cbar = None
         self.logo_image = None
+        self.closing = False
+        self.pending_initial_pose = None
 
         self.root.title("Tracked Robot Control UI")
-        self.root.geometry("1280x760")
+        window_width = max(1180, min(1600, self.root.winfo_screenwidth() - 80))
+        window_height = max(800, min(1450, self.root.winfo_screenheight() - 80))
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(1180, 800)
         self.root.configure(bg="#ebe6dc")
 
         self.map_var = tk.StringVar(value=self.default_map_path)
@@ -520,6 +587,16 @@ class RobotControlApp:
         self.map_var_status = tk.StringVar(value="map: no data")
         self.mission_var = tk.StringVar(value="mission: RViz mode")
         self.region_mode_var = tk.BooleanVar(value=False)
+        self.tsp_mode_var = tk.BooleanVar(value=True)
+        self.return_to_start_var = tk.BooleanVar(value=False)
+        self.waypoint_pause_var = tk.DoubleVar(value=2.0)
+        self.software_estop_var = tk.BooleanVar(value=False)
+        self.initial_x_var = tk.DoubleVar(value=0.0)
+        self.initial_y_var = tk.DoubleVar(value=0.0)
+        self.initial_yaw_deg_var = tk.DoubleVar(value=0.0)
+        self.initial_pose_status_var = tk.StringVar(
+            value="AMCL: start navigation before setting the initial pose"
+        )
         self.safety_var = tk.StringVar(value="safety: waiting")
         self.power_var = tk.StringVar(value="power: waiting")
         self.thermal_var = tk.StringVar(value="thermal: no data")
@@ -564,7 +641,7 @@ class RobotControlApp:
         ).pack(side=tk.RIGHT, padx=24)
 
         body = tk.Frame(self.root, bg="#ebe6dc")
-        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
+        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=10)
 
         left = tk.Frame(body, bg="#ebe6dc", width=800)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -574,15 +651,16 @@ class RobotControlApp:
         right.pack_propagate(False)
 
         self._build_launch_panel(left)
+        self._build_pose_panel(left)
         self._build_mission_panel(left)
 
         lower = tk.Frame(left, bg="#ebe6dc")
         lower.pack(fill=tk.BOTH, expand=True)
         log_col = tk.Frame(lower, bg="#ebe6dc")
-        log_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        status_col = tk.Frame(lower, bg="#ebe6dc", width=380)
+        status_col = tk.Frame(lower, bg="#ebe6dc", width=500)
         status_col.pack(side=tk.RIGHT, fill=tk.Y, padx=(18, 0))
         status_col.pack_propagate(False)
+        log_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self._build_log_panel(log_col)
         self._build_status_panel(status_col)
@@ -629,17 +707,17 @@ class RobotControlApp:
 
     def _build_launch_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Mission Control", style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(0, 18))
+        frame.pack(fill=tk.X, pady=(0, 10))
 
         row1 = tk.Frame(frame, bg="#ebe6dc")
-        row1.pack(fill=tk.X, padx=14, pady=(14, 8))
+        row1.pack(fill=tk.X, padx=14, pady=(8, 4))
         tk.Label(row1, text="Workspace", bg="#ebe6dc", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
         tk.Entry(row1, textvariable=self.workspace_var, font=("Helvetica", 10)).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0)
         )
 
         row2 = tk.Frame(frame, bg="#ebe6dc")
-        row2.pack(fill=tk.X, padx=14, pady=8)
+        row2.pack(fill=tk.X, padx=14, pady=4)
         tk.Label(row2, text="SSH", bg="#ebe6dc", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
         tk.Entry(row2, textvariable=self.remote_user_var, width=10, font=("Helvetica", 10)).pack(
             side=tk.LEFT, padx=(35, 8)
@@ -650,14 +728,14 @@ class RobotControlApp:
         )
 
         row3 = tk.Frame(frame, bg="#ebe6dc")
-        row3.pack(fill=tk.X, padx=14, pady=8)
+        row3.pack(fill=tk.X, padx=14, pady=4)
         tk.Label(row3, text="Map YAML", bg="#ebe6dc", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
         tk.Entry(row3, textvariable=self.map_var, font=("Helvetica", 10)).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(18, 0)
         )
 
         buttons = tk.Frame(frame, bg="#ebe6dc")
-        buttons.pack(fill=tk.X, padx=14, pady=(10, 16))
+        buttons.pack(fill=tk.X, padx=14, pady=(6, 8))
         ttk.Button(buttons, text="Start Mapping", style="Primary.TButton", command=self.start_mapping).pack(
             side=tk.LEFT, padx=(0, 10)
         )
@@ -673,6 +751,44 @@ class RobotControlApp:
         ttk.Button(buttons, text="Stop Launch", style="Danger.TButton", command=self.stop_launch).pack(
             side=tk.RIGHT
         )
+
+    def _build_pose_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Localization and Initial Pose", style="Card.TLabelframe")
+        frame.pack(fill=tk.X, pady=(0, 10))
+
+        controls = tk.Frame(frame, bg="#ebe6dc")
+        controls.pack(fill=tk.X, padx=12, pady=(10, 5))
+        for label, variable, lower, upper, increment in [
+            ("X (m)", self.initial_x_var, -20.0, 20.0, 0.05),
+            ("Y (m)", self.initial_y_var, -20.0, 20.0, 0.05),
+            ("Yaw (deg)", self.initial_yaw_deg_var, -180.0, 180.0, 1.0),
+        ]:
+            tk.Label(controls, text=label, bg="#ebe6dc", font=("Helvetica", 9, "bold")).pack(
+                side=tk.LEFT, padx=(0, 5)
+            )
+            tk.Spinbox(
+                controls,
+                from_=lower,
+                to=upper,
+                increment=increment,
+                width=7,
+                textvariable=variable,
+                format="%.2f" if increment < 1.0 else "%.0f",
+            ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(
+            controls,
+            text="Set Initial Pose",
+            style="Primary.TButton",
+            command=self.set_initial_pose,
+        ).pack(side=tk.RIGHT)
+
+        tk.Label(
+            frame,
+            textvariable=self.initial_pose_status_var,
+            bg="#ebe6dc",
+            font=("Helvetica", 9),
+            anchor="w",
+        ).pack(fill=tk.X, padx=12, pady=(0, 8))
 
     def _build_log_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Runtime Log", style="Card.TLabelframe")
@@ -690,56 +806,97 @@ class RobotControlApp:
 
     def _build_mission_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="RViz Mission", style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(0, 18))
+        frame.pack(fill=tk.X, pady=(0, 10))
 
         tk.Label(
             frame,
-            text=(
-                "Use RViz only for mission points.\n"
-                "1. Publish Point: add points\n"
-                "2. 2D Goal Pose (Mission Heading): set point heading\n"
-                "3. Start Mission: execute the RViz points"
-            ),
+            text="RViz: Publish Point adds points/region corners; Mission Heading sets point yaw.",
             justify="left",
             bg="#ebe6dc",
-            font=("Helvetica", 10),
-        ).pack(anchor="w", padx=12, pady=(12, 8))
+            font=("Helvetica", 9),
+        ).pack(anchor="w", padx=12, pady=(10, 5))
 
         buttons = tk.Frame(frame, bg="#ebe6dc")
-        buttons.pack(fill=tk.X, padx=12, pady=(0, 8))
+        buttons.pack(fill=tk.X, padx=12, pady=(0, 5))
         ttk.Button(buttons, text="Check Localization", command=self.check_localization).grid(
-            row=0, column=0, padx=(0, 8), pady=4, sticky="ew"
+            row=0, column=0, padx=(0, 5), pady=3, sticky="ew"
         )
         ttk.Button(buttons, text="Start Mission", command=self.start_mission).grid(
-            row=0, column=1, padx=8, pady=4, sticky="ew"
+            row=0, column=1, padx=5, pady=3, sticky="ew"
+        )
+        ttk.Button(buttons, text="Stop All Tasks", style="Danger.TButton", command=self.stop_mission).grid(
+            row=0, column=2, padx=5, pady=3, sticky="ew"
         )
         ttk.Button(buttons, text="Clear RViz Points", command=self.clear_rviz_points).grid(
-            row=0, column=2, padx=(8, 0), pady=4, sticky="ew"
+            row=0, column=3, padx=(5, 0), pady=3, sticky="ew"
         )
+
+        settings = tk.Frame(frame, bg="#ebe6dc")
+        settings.pack(fill=tk.X, padx=12, pady=(0, 5))
+        tk.Label(settings, text="Point pause (s)", bg="#ebe6dc").pack(side=tk.LEFT)
+        tk.Spinbox(
+            settings,
+            from_=0.0,
+            to=60.0,
+            increment=0.5,
+            width=6,
+            textvariable=self.waypoint_pause_var,
+            format="%.1f",
+        ).pack(side=tk.LEFT, padx=(8, 16))
         ttk.Checkbutton(
-            buttons,
+            settings,
+            text="TSP",
+            variable=self.tsp_mode_var,
+            command=self.set_tsp_mode,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            settings,
+            text="Return to Start",
+            variable=self.return_to_start_var,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            settings,
+            text="Software E-Stop",
+            variable=self.software_estop_var,
+            command=self.set_software_estop,
+        ).pack(side=tk.RIGHT)
+
+        regions = tk.Frame(frame, bg="#ebe6dc")
+        regions.pack(fill=tk.X, padx=12, pady=(0, 5))
+        ttk.Checkbutton(
+            regions,
             text="Region Mode",
             variable=self.region_mode_var,
             command=self.set_region_mode,
-        ).grid(row=1, column=0, padx=(0, 8), pady=4, sticky="ew")
-        ttk.Button(buttons, text="Save Regions", command=self.save_regions).grid(
-            row=1, column=1, padx=8, pady=4, sticky="ew"
+        ).grid(row=0, column=0, padx=(0, 5), pady=3, sticky="ew")
+        ttk.Button(regions, text="Save Regions", command=self.save_regions).grid(
+            row=0, column=1, padx=5, pady=3, sticky="ew"
         )
-        ttk.Button(buttons, text="Load Regions", command=self.load_regions).grid(
-            row=1, column=2, padx=(8, 0), pady=4, sticky="ew"
+        ttk.Button(regions, text="Load Regions", command=self.load_regions).grid(
+            row=0, column=2, padx=5, pady=3, sticky="ew"
         )
-        ttk.Button(buttons, text="Clear Regions", command=self.clear_regions).grid(
-            row=2, column=0, columnspan=3, padx=0, pady=4, sticky="ew"
+        ttk.Button(regions, text="Clear Regions", command=self.clear_regions).grid(
+            row=0, column=3, padx=(5, 0), pady=3, sticky="ew"
         )
-        for col in range(3):
+
+        undo = tk.Frame(frame, bg="#ebe6dc")
+        undo.pack(fill=tk.X, padx=12, pady=(0, 5))
+        ttk.Button(undo, text="Undo Region", command=self.undo_region).pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
+        ttk.Button(undo, text="Undo Point", command=self.undo_rviz_point).pack(
+            side=tk.LEFT
+        )
+        for col in range(4):
             buttons.grid_columnconfigure(col, weight=1)
+            regions.grid_columnconfigure(col, weight=1)
 
         tk.Label(
             frame,
             textvariable=self.mission_var,
             bg="#ebe6dc",
             font=("Helvetica", 10, "bold"),
-        ).pack(anchor="w", padx=12, pady=(0, 12))
+        ).pack(anchor="w", padx=12, pady=(0, 8))
 
     def _build_map_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Live Map", style="Card.TLabelframe")
@@ -747,7 +904,7 @@ class RobotControlApp:
         self.map_canvas = tk.Canvas(
             frame,
             width=460,
-            height=180,
+            height=150,
             bg="#f7f3eb",
             highlightthickness=0,
         )
@@ -762,17 +919,28 @@ class RobotControlApp:
     def _build_thermal_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Thermal Camera", style="Card.TLabelframe")
         frame.pack(fill=tk.X, pady=(18, 0))
-        self.thermal_fig, self.thermal_ax = plt.subplots(figsize=(5.3, 2.5), dpi=90)
+        self.thermal_fig, self.thermal_ax = plt.subplots(figsize=(5.3, 1.7), dpi=90)
         self.thermal_cbar = None
         self.thermal_canvas = FigureCanvasTkAgg(self.thermal_fig, frame)
         self.thermal_canvas.draw()
         self.thermal_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 8))
         buttons = tk.Frame(frame, bg="#ebe6dc")
         buttons.pack(fill=tk.X, padx=12, pady=(0, 8))
-        ttk.Button(buttons, text="Start Thermal", command=self.start_thermal).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Stop Thermal", command=self.stop_thermal).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Button(buttons, text="Open Thermal Window", command=self.open_thermal_window).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Button(buttons, text="Save Snapshot", command=self.save_thermal_snapshot).pack(side=tk.LEFT, padx=(10, 0))
+        for index, (label, command) in enumerate([
+            ("Start Thermal", self.start_thermal),
+            ("Stop Thermal", self.stop_thermal),
+            ("Open Thermal Window", self.open_thermal_window),
+            ("Save Snapshot", self.save_thermal_snapshot),
+        ]):
+            ttk.Button(buttons, text=label, command=command).grid(
+                row=index // 2,
+                column=index % 2,
+                padx=(0, 5) if index % 2 == 0 else (5, 0),
+                pady=3,
+                sticky="ew",
+            )
+        buttons.grid_columnconfigure(0, weight=1)
+        buttons.grid_columnconfigure(1, weight=1)
         tk.Label(
             frame,
             textvariable=self.thermal_var,
@@ -799,19 +967,19 @@ class RobotControlApp:
         frame.pack(fill=tk.BOTH, expand=True)
 
         lights = tk.Frame(frame, bg="#ebe6dc")
-        lights.pack(fill=tk.X, padx=12, pady=(12, 8))
+        lights.pack(fill=tk.X, padx=6, pady=(6, 3))
         for idx, name in enumerate(["SSH", "Laser", "Odom", "Map", "Safety", "Thermal", "Gas"]):
             lamp = tk.Frame(lights, bg="#ebe6dc")
-            row = idx // 2
-            col = idx % 2
-            lamp.grid(row=row, column=col, sticky="w", padx=(0, 10), pady=3)
-            canvas = tk.Canvas(lamp, width=18, height=18, bg="#ebe6dc", highlightthickness=0)
+            row = idx // 4
+            col = idx % 4
+            lamp.grid(row=row, column=col, sticky="w", padx=(0, 5), pady=1)
+            canvas = tk.Canvas(lamp, width=12, height=12, bg="#ebe6dc", highlightthickness=0)
             canvas.pack(side=tk.LEFT)
-            canvas.create_oval(2, 2, 16, 16, fill="#8f8f8f", outline="")
-            label = tk.Label(lamp, text=f"{name}: waiting", bg="#ebe6dc", font=("Helvetica", 9))
-            label.pack(side=tk.LEFT, padx=6)
+            canvas.create_oval(1, 1, 11, 11, fill="#8f8f8f", outline="")
+            label = tk.Label(lamp, text=f"{name}: waiting", bg="#ebe6dc", font=("Helvetica", 8))
+            label.pack(side=tk.LEFT, padx=3)
             self.indicators[name.lower()] = (canvas, label)
-        for col in range(2):
+        for col in range(4):
             lights.grid_columnconfigure(col, weight=1)
 
         cards = [
@@ -825,28 +993,29 @@ class RobotControlApp:
             ("Gas", self.gas_var, "#7c6a0a"),
         ]
         cards_frame = tk.Frame(frame, bg="#ebe6dc")
-        cards_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        cards_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
         for idx, (title, variable, color) in enumerate(cards):
             row = idx // 2
             col = idx % 2
-            card = tk.Frame(cards_frame, bg=color, width=0, height=64)
-            card.grid(row=idx, column=0, sticky="ew", padx=4, pady=4)
+            card = tk.Frame(cards_frame, bg=color, width=0, height=32)
+            card.grid(row=row, column=col, sticky="ew", padx=2, pady=2)
             card.pack_propagate(False)
-            tk.Label(card, text=title, bg=color, fg="white", font=("Helvetica", 12, "bold")).pack(
-                anchor="w", padx=8, pady=(6, 1)
+            tk.Label(card, text=title, bg=color, fg="white", font=("Helvetica", 8, "bold")).pack(
+                side=tk.LEFT, padx=(5, 3)
             )
             tk.Label(
                 card,
                 textvariable=variable,
                 bg=color,
                 fg="#f7f7f7",
-                font=("Helvetica", 10),
+                font=("Helvetica", 8),
                 justify="left",
-                wraplength=300,
+                wraplength=165,
             ).pack(
-                anchor="w", padx=8
+                side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
             )
         cards_frame.grid_columnconfigure(0, weight=1)
+        cards_frame.grid_columnconfigure(1, weight=1)
 
     def _build_drive_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Manual Drive", style="Card.TLabelframe")
@@ -860,35 +1029,96 @@ class RobotControlApp:
         ).pack(anchor="w", padx=12, pady=(12, 4))
 
         pad = tk.Frame(frame, bg="#ebe6dc")
-        pad.pack(padx=14, pady=14)
+        pad.pack(fill=tk.X, padx=14, pady=(4, 2))
 
-        ttk.Button(pad, text="↑", width=4, style="Drive.TButton", command=self.drive_forward).grid(row=0, column=1, padx=5, pady=8)
-        ttk.Button(pad, text="←", width=4, style="Drive.TButton", command=self.turn_left).grid(row=1, column=0, padx=5, pady=8)
-        ttk.Button(pad, text="STOP", width=6, style="Danger.TButton", command=self.stop_robot).grid(row=1, column=1, padx=5, pady=8)
-        ttk.Button(pad, text="→", width=4, style="Drive.TButton", command=self.turn_right).grid(row=1, column=2, padx=5, pady=8)
-        ttk.Button(pad, text="↓", width=4, style="Drive.TButton", command=self.drive_backward).grid(row=2, column=1, padx=5, pady=8)
+        self._make_hold_drive_button(pad, "←", 0, 0, 0.0, self.manual_angular, sticky="ew")
+        self._make_hold_drive_button(pad, "↑", 0, 1, self.manual_linear, 0.0, sticky="ew")
+        ttk.Button(
+            pad,
+            text="STOP",
+            width=6,
+            style="Danger.TButton",
+            command=self.stop_robot,
+        ).grid(row=0, column=2, padx=5, pady=4, sticky="ew")
+        self._make_hold_drive_button(pad, "↓", 0, 3, -self.manual_linear, 0.0, sticky="ew")
+        self._make_hold_drive_button(pad, "→", 0, 4, 0.0, -self.manual_angular, sticky="ew")
+        for column in range(5):
+            pad.grid_columnconfigure(column, weight=1)
 
         extra = tk.Frame(frame, bg="#ebe6dc")
         extra.pack(fill=tk.X, padx=12, pady=(0, 12))
-        ttk.Button(extra, text="Forward Left", command=self.forward_left).grid(row=0, column=0, padx=(0, 8), pady=4, sticky="ew")
-        ttk.Button(extra, text="Forward Right", command=self.forward_right).grid(row=0, column=1, padx=(8, 0), pady=4, sticky="ew")
+        self._make_hold_drive_button(
+            extra,
+            "Forward Left",
+            0,
+            0,
+            self.manual_linear,
+            self.manual_angular * 0.5,
+            sticky="ew",
+            padx=(0, 8),
+            width=None,
+        )
+        self._make_hold_drive_button(
+            extra,
+            "Forward Right",
+            0,
+            1,
+            self.manual_linear,
+            -self.manual_angular * 0.5,
+            sticky="ew",
+            padx=(8, 0),
+            width=None,
+        )
         extra.grid_columnconfigure(0, weight=1)
         extra.grid_columnconfigure(1, weight=1)
 
+    def _make_hold_drive_button(
+        self,
+        parent,
+        text,
+        row,
+        column,
+        linear_x,
+        angular_z,
+        *,
+        sticky="",
+        padx=5,
+        width=4,
+    ):
+        options = {"text": text, "style": "Drive.TButton"}
+        if width is not None:
+            options["width"] = width
+        button = ttk.Button(parent, **options)
+        button.grid(row=row, column=column, padx=padx, pady=4, sticky=sticky)
+        button.bind(
+            "<ButtonPress-1>",
+            lambda _event: self._begin_manual_cmd(linear_x, angular_z),
+        )
+        button.bind("<ButtonRelease-1>", lambda _event: self.stop_robot())
+        button.bind("<Leave>", lambda _event: self.stop_robot())
+        return button
+
     def _bind_keys(self):
         bindings = {
-            "<Up>": self.drive_forward,
-            "<Down>": self.drive_backward,
-            "<Left>": self.turn_left,
-            "<Right>": self.turn_right,
-            "<space>": self.stop_robot,
-            "w": self.drive_forward,
-            "s": self.drive_backward,
-            "a": self.turn_left,
-            "d": self.turn_right,
+            "Up": (self.manual_linear, 0.0),
+            "Down": (-self.manual_linear, 0.0),
+            "Left": (0.0, self.manual_angular),
+            "Right": (0.0, -self.manual_angular),
+            "w": (self.manual_linear, 0.0),
+            "s": (-self.manual_linear, 0.0),
+            "a": (0.0, self.manual_angular),
+            "d": (0.0, -self.manual_angular),
         }
-        for key, handler in bindings.items():
-            self.root.bind(key, lambda _event, fn=handler: fn())
+        for key, command in bindings.items():
+            linear_x, angular_z = command
+            self.root.bind(
+                f"<KeyPress-{key}>",
+                lambda _event, linear=linear_x, angular=angular_z: self._begin_manual_cmd(
+                    linear, angular
+                ),
+            )
+            self.root.bind(f"<KeyRelease-{key}>", lambda _event: self.stop_robot())
+        self.root.bind("<KeyPress-space>", lambda _event: self.stop_robot())
 
     def start_mapping(self):
         self._apply_workspace()
@@ -919,25 +1149,66 @@ class RobotControlApp:
         self.launch_manager.stop()
 
     def drive_forward(self):
-        self.ros.publish_cmd_vel(self.manual_linear, 0.0)
+        self._begin_manual_cmd(self.manual_linear, 0.0)
 
     def drive_backward(self):
-        self.ros.publish_cmd_vel(-self.manual_linear, 0.0)
+        self._begin_manual_cmd(-self.manual_linear, 0.0)
 
     def turn_left(self):
-        self.ros.publish_cmd_vel(0.0, self.manual_angular)
+        self._begin_manual_cmd(0.0, self.manual_angular)
 
     def turn_right(self):
-        self.ros.publish_cmd_vel(0.0, -self.manual_angular)
+        self._begin_manual_cmd(0.0, -self.manual_angular)
 
     def forward_left(self):
-        self.ros.publish_cmd_vel(self.manual_linear, self.manual_angular * 0.5)
+        self._begin_manual_cmd(self.manual_linear, self.manual_angular * 0.5)
 
     def forward_right(self):
-        self.ros.publish_cmd_vel(self.manual_linear, -self.manual_angular * 0.5)
+        self._begin_manual_cmd(self.manual_linear, -self.manual_angular * 0.5)
 
     def stop_robot(self):
+        self.manual_request_id += 1
+        self.manual_command = None
+        if self.manual_after_id is not None:
+            try:
+                self.root.after_cancel(self.manual_after_id)
+            except tk.TclError:
+                pass
+            self.manual_after_id = None
         self.ros.publish_cmd_vel(0.0, 0.0)
+
+    def _begin_manual_cmd(self, linear_x, angular_z):
+        requested = (float(linear_x), float(angular_z))
+        if self.manual_command == requested:
+            return
+        self.stop_robot()
+        self.manual_command = requested
+        self.manual_request_id += 1
+        request_id = self.manual_request_id
+        request = Trigger.Request()
+
+        def done(result, error):
+            def finish():
+                if request_id != self.manual_request_id or self.manual_command != requested:
+                    return
+                if error is not None or result is None or not result.success:
+                    detail = error or (result.message if result is not None else "unknown error")
+                    self.log_queue.put(f"[MANUAL] autonomous abort failed; command blocked: {detail}")
+                    self.manual_command = None
+                    return
+                self._publish_manual_cmd()
+            self.root.after(0, finish)
+
+        self.ros.call_service_async(
+            self.ros.abort_mission_client, request, done, timeout_sec=2.0
+        )
+
+    def _publish_manual_cmd(self):
+        self.manual_after_id = None
+        if self.manual_command is None or self.closing:
+            return
+        self.ros.publish_cmd_vel(*self.manual_command)
+        self.manual_after_id = self.root.after(100, self._publish_manual_cmd)
 
     def start_thermal(self):
         self._apply_workspace()
@@ -1010,6 +1281,19 @@ class RobotControlApp:
         self.log_queue.put(f"[MISSION] region mode {mode}")
         self.ros.call_service_async(self.ros.set_region_mode_client, request, done)
 
+    def set_tsp_mode(self):
+        request = SetBool.Request()
+        request.data = bool(self.tsp_mode_var.get())
+
+        def done(result, error):
+            self.root.after(0, lambda: self._handle_tsp_mode_result(result, error))
+
+        mode = "enabled" if request.data else "disabled"
+        self.log_queue.put(f"[MISSION] TSP mode {mode}")
+        self.ros.call_service_async(
+            self.ros.set_tsp_mode_client, request, done, timeout_sec=2.0
+        )
+
     def save_regions(self):
         self._call_region_trigger(
             self.ros.save_inspection_regions_client,
@@ -1030,6 +1314,46 @@ class RobotControlApp:
             "Clear Regions",
             "[MISSION] clearing inspection regions on robot",
         )
+
+    def undo_rviz_point(self):
+        self._call_region_trigger(
+            self.ros.undo_rviz_point_client,
+            "Undo Point",
+            "[MISSION] undoing last RViz point",
+        )
+
+    def undo_region(self):
+        self._call_region_trigger(
+            self.ros.undo_region_client,
+            "Undo Region",
+            "[MISSION] undoing last inspection region",
+        )
+
+    def stop_mission(self):
+        self._call_region_trigger(
+            self.ros.abort_mission_client,
+            "Stop Mission",
+            "[MISSION] abort requested",
+        )
+
+    def set_software_estop(self):
+        request = SetBool.Request()
+        request.data = bool(self.software_estop_var.get())
+
+        def done(result, error):
+            self.root.after(
+                0,
+                lambda: self._handle_software_estop_result(result, error, request.data),
+            )
+
+        if request.data:
+            self.ros.publish_cmd_vel(0.0, 0.0)
+        self.log_queue.put(
+            "[SAFETY] software emergency stop latch requested"
+            if request.data
+            else "[SAFETY] software emergency stop release requested"
+        )
+        self.ros.call_service_async(self.ros.software_estop_client, request, done)
 
     def _call_region_trigger(self, client, title, log_message):
         request = Trigger.Request()
@@ -1052,6 +1376,78 @@ class RobotControlApp:
         self.log_queue.put("[MISSION] querying localization status")
         self.ros.call_service_async(self.ros.localize_client, request, done)
 
+    def set_initial_pose(self):
+        if self.ros.initial_pose_subscription_count() < 1:
+            message = "AMCL is not subscribed to /initialpose. Start navigation first."
+            self.initial_pose_status_var.set(f"AMCL: {message}")
+            self.log_queue.put(f"[LOCALIZATION] {message}")
+            messagebox.showwarning("Set Initial Pose", message)
+            return
+
+        self._cancel_initial_pose_retry()
+        try:
+            x = max(-20.0, min(20.0, float(self.initial_x_var.get())))
+            y = max(-20.0, min(20.0, float(self.initial_y_var.get())))
+            yaw_deg = max(-180.0, min(180.0, float(self.initial_yaw_deg_var.get())))
+        except (tk.TclError, TypeError, ValueError):
+            messagebox.showerror("Set Initial Pose", "Initial pose values are invalid.")
+            return
+
+        self.initial_x_var.set(x)
+        self.initial_y_var.set(y)
+        self.initial_yaw_deg_var.set(yaw_deg)
+        self.pending_initial_pose = (x, y, math.radians(yaw_deg))
+        self.initial_pose_retry.begin(time.time())
+        self._publish_initial_pose_attempt()
+        self._schedule_initial_pose_retry()
+
+    def _publish_initial_pose_attempt(self):
+        if not self.initial_pose_retry.record_publish():
+            return
+        x, y, yaw = self.pending_initial_pose
+        self.ros.publish_initial_pose(x, y, yaw)
+        attempt = self.initial_pose_retry.attempts
+        total = self.initial_pose_retry.max_attempts
+        message = (
+            f"Initial pose sent ({attempt}/{total}): "
+            f"x={x:.2f}, y={y:.2f}, yaw={math.degrees(yaw):.1f}deg"
+        )
+        self.initial_pose_status_var.set(f"AMCL: waiting for confirmation, attempt {attempt}/{total}")
+        self.log_queue.put(f"[LOCALIZATION] {message}")
+
+    def _schedule_initial_pose_retry(self):
+        self.initial_pose_after_id = self.root.after(1000, self._initial_pose_retry_tick)
+
+    def _initial_pose_retry_tick(self):
+        self.initial_pose_after_id = None
+        result = self.initial_pose_retry.evaluate(self.ros.last_amcl_stamp)
+        if result == InitialPoseRetryState.CONFIRMED:
+            message = (
+                f"AMCL confirmed: x={self.ros.amcl_x:.2f}, y={self.ros.amcl_y:.2f}, "
+                f"yaw={math.degrees(self.ros.amcl_yaw):.1f}deg"
+            )
+            self.initial_pose_status_var.set(message)
+            self.log_queue.put(f"[LOCALIZATION] {message}")
+            return
+        if result == InitialPoseRetryState.TIMED_OUT:
+            message = "AMCL did not confirm the initial pose after 8 attempts."
+            self.initial_pose_status_var.set(f"AMCL: {message}")
+            self.log_queue.put(f"[LOCALIZATION] {message}")
+            messagebox.showwarning("Set Initial Pose", message)
+            return
+        if result == InitialPoseRetryState.RETRY:
+            self._publish_initial_pose_attempt()
+            self._schedule_initial_pose_retry()
+
+    def _cancel_initial_pose_retry(self):
+        self.initial_pose_retry.cancel()
+        if self.initial_pose_after_id is not None:
+            try:
+                self.root.after_cancel(self.initial_pose_after_id)
+            except tk.TclError:
+                pass
+            self.initial_pose_after_id = None
+
     def start_mission(self):
         if self.ros.safety_level == "FAULT":
             messagebox.showerror(
@@ -1061,6 +1457,15 @@ class RobotControlApp:
             return
 
         request = StartNavigation.Request()
+        try:
+            request.waypoint_pause_sec = max(
+                0.0, min(60.0, float(self.waypoint_pause_var.get()))
+            )
+        except (tk.TclError, TypeError, ValueError):
+            request.waypoint_pause_sec = 2.0
+            self.waypoint_pause_var.set(2.0)
+        request.use_tsp = bool(self.tsp_mode_var.get())
+        request.return_to_start = bool(self.return_to_start_var.get())
         if self.region_mode_var.get():
             self.log_queue.put("[MISSION] sending region inspection mission")
         else:
@@ -1121,6 +1526,18 @@ class RobotControlApp:
             self.region_mode_var.set(not self.region_mode_var.get())
             messagebox.showwarning("Region Mode", result.message)
 
+    def _handle_tsp_mode_result(self, result, error):
+        if error is not None:
+            self.log_queue.put(
+                f"[WARN] TSP preview sync unavailable: {error}; start request will apply the selected mode"
+            )
+            return
+        self.log_queue.put(f"[MISSION] {result.message}")
+        if not result.success:
+            self.log_queue.put(
+                "[WARN] TSP preview was not changed now; the next start request remains authoritative"
+            )
+
     def _handle_region_trigger_result(self, title, result, error):
         if error is not None:
             self.log_queue.put(f"[ERROR] {title.lower()} failed: {error}")
@@ -1142,6 +1559,15 @@ class RobotControlApp:
             messagebox.showinfo("Reset Safety", result.message)
         else:
             messagebox.showwarning("Reset Safety", result.message)
+
+    def _handle_software_estop_result(self, result, error, requested_state):
+        if error is not None or result is None or not result.success:
+            self.software_estop_var.set(not requested_state)
+            detail = error or (result.message if result is not None else "unknown error")
+            self.log_queue.put(f"[ERROR] software emergency stop update failed: {detail}")
+            messagebox.showerror("Software E-Stop", detail)
+            return
+        self.log_queue.put(f"[SAFETY] {result.message}")
 
     def _handle_start_mission_result(self, result, error):
         if error is not None:
@@ -1183,6 +1609,11 @@ class RobotControlApp:
             f"x={self.ros.robot_x:.2f}  y={self.ros.robot_y:.2f}  yaw={math.degrees(self.ros.robot_yaw):.1f}deg"
         )
         self._record_pose()
+        if not self.initial_pose_retry.active and now - self.ros.last_amcl_stamp < 2.0:
+            self.initial_pose_status_var.set(
+                f"AMCL: x={self.ros.amcl_x:.2f}, y={self.ros.amcl_y:.2f}, "
+                f"yaw={math.degrees(self.ros.amcl_yaw):.1f}deg"
+            )
         if now - self.ros.last_scan_stamp < 1.0:
             self.scan_var.set(f"scan alive, ranges={self.ros.scan_count}")
             self._set_indicator("laser", True, f"Laser: {self.ros.scan_count} ranges")
@@ -1274,7 +1705,7 @@ class RobotControlApp:
     def _set_indicator_state(self, key, color, text):
         canvas, label = self.indicators[key]
         canvas.delete('all')
-        canvas.create_oval(2, 2, 16, 16, fill=color, outline='')
+        canvas.create_oval(1, 1, 11, 11, fill=color, outline='')
         label.config(text=text)
 
     def _record_pose(self):
@@ -1285,10 +1716,16 @@ class RobotControlApp:
                 self.pose_history.pop(0)
 
     def _refresh_mission_status(self):
-        if self.ros.safety_mission_active:
-            self.mission_var.set("mission: running from RViz")
+        if self.ros.mission_active:
+            current = min(self.ros.mission_current_index + 1, self.ros.mission_total_count)
+            self.mission_var.set(
+                f"mission: {self.ros.mission_state} {self.ros.mission_mode} "
+                f"{current}/{self.ros.mission_total_count} - {self.ros.mission_message}"
+            )
         else:
-            self.mission_var.set("mission: RViz mode")
+            self.mission_var.set(
+                f"mission: {self.ros.mission_state} - {self.ros.mission_message}"
+            )
 
     def _draw_map_view(self):
         map_msg = self.ros.map_data
@@ -1489,7 +1926,11 @@ class RobotControlApp:
         return current_cbar
 
     def on_close(self):
+        if self.closing:
+            return
+        self.closing = True
         try:
+            self._cancel_initial_pose_retry()
             self.stop_robot()
             self.stop_thermal()
             self.launch_manager.stop()
@@ -1504,8 +1945,20 @@ def main(args=None):
     root = tk.Tk()
     ros_adapter = RosUiAdapter(args=args)
     app = RobotControlApp(root, ros_adapter)
+
+    def request_close(_signum, _frame):
+        try:
+            root.after(0, app.on_close)
+        except tk.TclError:
+            pass
+
+    signal.signal(signal.SIGINT, request_close)
+    signal.signal(signal.SIGTERM, request_close)
     try:
         root.mainloop()
     finally:
-        if root.winfo_exists():
-            app.on_close()
+        try:
+            if root.winfo_exists():
+                app.on_close()
+        except tk.TclError:
+            pass

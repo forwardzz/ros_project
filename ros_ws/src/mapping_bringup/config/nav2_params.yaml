@@ -272,39 +272,31 @@ local_costmap:
 global_costmap:
   global_costmap:
     ros__parameters:
-      # 全局代价地图更新频率（Hz）。2Hz 足够，因为地图变化慢
-      update_frequency: 2.0
+      # 与仿真规划流程一致，让实时激光障碍能及时使旧路径失效。
+      update_frequency: 5.0
       # 发布频率（Hz），仅供 RViz 显示
       publish_frequency: 1.0
       # 参考坐标系：map（全局固定坐标系）
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: false
+      transform_tolerance: 0.5
       # false = 不使用滚动窗口，整张地图都参与规划
       rolling_window: false
 
       # ----------------------------------------------------------
       # 全局代价地图分辨率（米/格）
-      # 比局部代价地图的 0.05 更粗（0.03 会更精细但更慢）。
+      # 与实车保存地图的 0.03m 分辨率一致，避免二次栅格重采样。
       # 调小 → 路径规划更精确但更慢；调大 → 更快但路径可能粗糙。
       # ----------------------------------------------------------
-      resolution: 0.05
+      resolution: 0.03
 
       # 机器人外接矩形 footprint（米）—— 和局部代价地图保持一致
       footprint: "[[0.135, 0.11], [0.135, -0.11], [-0.135, -0.11], [-0.135, 0.11]]"
 
       # ----------------------------------------------------------
-      # 全局膨胀半径（米）
-      # 这个值影响 NavFn 规划器的路径选择。
-      # 当前 0.15 略大于局部膨胀半径，让全局路径远离墙壁。
-      # ----------------------------------------------------------
-      inflation_radius: 0.15
-
-      # 代价衰减速率，含义同局部代价地图
-      cost_scaling_factor: 3.0
-
-      # 全局代价地图插件：先加载静态地图层，再膨胀
-      plugins: ["static_layer", "inflation_layer"]
+      # 全局代价地图同时使用静态地图和实时激光障碍。
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
 
       # ----------------------------------------------------------
       # 静态地图层：从 /map topic 读取已保存的 pgm/yaml 地图
@@ -317,9 +309,30 @@ global_costmap:
         # 如果 UI 重置后看不到地图，检查这个值是否为 true
         map_subscribe_transient_local: true
 
+      # 实时障碍会参与全局路径有效性检查；路径被挡住后 BT 才触发重规划。
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: laser
+        laser:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          obstacle_max_range: 3.0
+          raytrace_min_range: 0.15
+          obstacle_min_range: 0.15
+
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
+        # 采用已确认的折中值，兼顾实车窄通道和离障安全距离。
+        # 该值接近实车 footprint 外接半径，Smac 会提示无法启用其优化的
+        # 非圆形碰撞检查；规划仍可用，但若 CPU 占用过高应提高到至少 0.21m。
+        inflation_radius: 0.18
+        cost_scaling_factor: 4.0
 
       always_send_full_costmap: true
 
@@ -334,23 +347,26 @@ map_server:
 planner_server:
   ros__parameters:
     use_sim_time: false
+    expected_planner_frequency: 5.0
     planner_plugins: ["GridBased"]
     GridBased:
-      # NavFn 规划器：基于 Dijkstra/A* 的网格规划器
-      plugin: "nav2_navfn_planner::NavfnPlanner"
-      # ----------------------------------------------------------
-      # 到达容差（米）：目标点周围多少范围内算"到达"
-      # 0.5 表示距离目标 0.5m 以内就认为到了。如果机器人总到不了目标，调大这个值。
-      # ----------------------------------------------------------
+      plugin: "nav2_smac_planner::SmacPlanner2D"
       tolerance: 0.15
-      # true = 用 A*（更快），false = 用 Dijkstra（更完整但更慢）
-      use_astar: true
-      # ----------------------------------------------------------
-      # 是否允许路径经过未知区域（地图灰色区域）
-      # true = 允许（适合探索），false = 只走已知区域（更安全）
-      # 如果机器人经常走到未建图区域卡住，改成 false
-      # ----------------------------------------------------------
-      allow_unknown: true
+      downsample_costmap: false
+      downsampling_factor: 1
+      allow_unknown: false
+      max_iterations: 100000
+      max_on_approach_iterations: 1000
+      terminal_checking_interval: 5000
+      max_planning_time: 2.0
+      cost_travel_multiplier: 1.5
+      use_final_approach_orientation: false
+      GridBased.smoother.tolerance: 1.0e-10
+      GridBased.smoother.max_iterations: 1000
+      GridBased.smoother.refinement_num: 2
+      GridBased.smoother.w_data: 0.2
+      GridBased.smoother.w_smooth: 0.8
+      GridBased.smoother.do_refinement: true
 
 # ============================================================
 # 恢复行为服务器
@@ -402,7 +418,7 @@ smoother_server:
 
 # ============================================================
 # 速度平滑器
-# 在控制器输出 (/cmd_vel_nav) 和底盘输入 (/cmd_vel) 之间做平滑
+# 将控制器输出 (/cmd_vel_nav) 平滑为 (/cmd_vel_auto)，再交给速度安全门
 # 防止速度突变导致底盘打滑或硬件损坏
 # ============================================================
 velocity_smoother:

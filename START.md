@@ -1,62 +1,32 @@
 # 快速启动
 
-## 树莓派环境
+项目统一入口是根目录的 `start.sh`：
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /home/yy/ros2_ws/install/setup.bash
-export ROS_DOMAIN_ID=0
-export ROS_LOCALHOST_ONLY=0
+cd /home/zjy/Desktop/ros_project_git_2026-05-20
+./start.sh
 ```
 
-## 电脑环境
+`start.sh` 会：
+
+- 在 `ros_ws` 中编译界面、任务和安全链相关包
+- 设置 `ROS_DOMAIN_ID=0` 和 `ROS_LOCALHOST_ONLY=0`
+- 清理本机残留的 Tk UI/RViz
+- 启动唯一的 Tk 控制台和项目 RViz 配置
+- 在 UI 或 RViz 退出时收尾另一个本机进程
+
+`start.sh` 不会自动启动树莓派底盘。界面打开后：
+
+1. 使用 `Start Mapping` 或 `Start Navigation` 启动树莓派对应后端，两者不要同时运行。
+2. 导航模式下，在 `Localization and Initial Pose` 输入 X/Y/Yaw，点击 `Set Initial Pose`。
+3. RViz 中用 `Publish Point` 添加任务点，用 `Mission Heading` 修改点位朝向。
+4. 在 Tk 界面确认点位停留时间、`TSP` 和 `Return to Start`；TSP 默认开启，返航默认关闭，再点击 `Start Mission`。
+5. 区域任务需先启用 `Region Mode`，每两个 `Publish Point` 定义一个矩形。
+
+如需更换机器人地址，可仅对当次启动覆盖环境变量：
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/install/setup.bash
-export ROS_DOMAIN_ID=0
-export ROS_LOCALHOST_ONLY=0
+REMOTE_HOST=192.168.43.24 ./start.sh
 ```
 
-## 树莓派建图
-
-```bash
-ros2 launch mapping_bringup mapping.launch.py
-```
-
-## 树莓派导航
-
-```bash
-ros2 launch mapping_bringup navigation.launch.py map:=/home/yy/ros2_ws/map_name.yaml
-```
-
-## 电脑端 UI
-
-```bash
-ros2 launch robot_control_ui ui.launch.py \
-  remote_user:=yy \
-  remote_host:=192.168.43.21 \
-  workspace_path:=/home/yy/ros2_ws \
-  map_path:=/home/yy/ros2_ws/map_name.yaml
-```
-
-## 电脑端 RViz
-
-```bash
-rviz2 -d /home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws/src/sllidar_ros2/rviz/sllidar_ros2.rviz
-```
-
-## RViz 工具
-
-- `Publish Point`：添加任务点；区域模式下两点成框
-- `2D Goal Pose (Mission Heading)`：设置最近任务点朝向
-- `2D Goal Pose (Direct Nav)`：直接导航到目标
-
-## 常用清理
-
-```bash
-pkill -f robot_control_ui
-pkill -f "ros2 launch robot_control_ui"
-ros2 daemon stop
-ros2 daemon start
-```
+不要再直接运行 `ros2 launch robot_control_ui ...` 或另起 `rviz2`；重复执行 `start.sh` 会显示“control console is already running”并退出。
