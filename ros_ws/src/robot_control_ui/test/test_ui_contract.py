@@ -63,3 +63,90 @@ def test_remote_cleanup_has_no_process_wide_ros2_pattern():
     assert '"ros2",' not in cleanup
     assert "mapping.launch.py" in cleanup
     assert "navigation.launch.py" in cleanup
+
+
+# ---------------------------------------------------------------------------
+# Network / status-monitoring contract (network & status rework)
+# ---------------------------------------------------------------------------
+
+def test_default_robot_address_is_192_168_43_30():
+    assert '"remote_host", "192.168.43.30"' in UI_SOURCE
+    launch = (PACKAGE_ROOT / "launch" / "ui.launch.py").read_text(encoding="utf-8")
+    assert 'default_value="192.168.43.30"' in launch
+    start_script = (PACKAGE_ROOT.parents[2] / "start.sh").read_text(encoding="utf-8")
+    assert 'REMOTE_HOST="${REMOTE_HOST:-__AUTO__}"' in start_script
+
+
+def test_status_panel_has_scan_and_apply_controls():
+    panel = _method_source("_build_launch_panel", "_build_pose_panel")
+    for label in ("Scan LAN", "Refresh", "Apply IP"):
+        assert 'text="%s"' % label in panel
+
+
+def test_network_discovery_module_present():
+    module = (PACKAGE_ROOT / "robot_control_ui" / "network_discovery.py").read_text(
+        encoding="utf-8"
+    )
+    assert "def is_valid_ipv4" in module
+    assert "def scan_subnet" in module
+    assert "MAX_HOSTS" in module
+
+
+def test_remote_health_module_present():
+    module = (PACKAGE_ROOT / "robot_control_ui" / "remote_health.py").read_text(
+        encoding="utf-8"
+    )
+    assert "class RemoteHealthProbe" in module
+    assert "def parse_throttled" in module
+    assert "BatchMode=yes" in module
+
+
+def test_topic_health_module_present():
+    module = (PACKAGE_ROOT / "robot_control_ui" / "topic_health.py").read_text(
+        encoding="utf-8"
+    )
+    assert "class TopicHealthTracker" in module
+    assert "def classify" in module
+    assert "available" in module
+
+
+def test_ssh_indicator_does_not_trust_unprobed_state():
+    refresh = _method_source("_refresh_status", "_set_indicator")
+    # The old bug trusted last_exit_code None as healthy; that path is gone.
+    assert "last_exit_code in (None, 0)" not in refresh
+    assert "current_health" in refresh
+    assert "error_code" in refresh
+
+
+# ---------------------------------------------------------------------------
+# DDS environment & topic-tracker contract (WSL-PI communication fix)
+# ---------------------------------------------------------------------------
+
+def test_remote_command_sets_dds_environment():
+    method = _method_source("_build_remote_command", "_build_ssh_invocation")
+    assert "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" in method
+    assert "CYCLONEDDS_URI=" in method
+    assert "ROS_DOMAIN_ID=0" in method
+    assert "ROS_LOCALHOST_ONLY=0" in method
+    assert "shlex.quote(self.ros_setup_path)" in method
+    assert "shlex.quote(self.workspace_path)" in method
+
+
+def test_launch_files_do_not_override_dds_uri():
+    for name in ("mapping", "navigation", "sensor_monitor"):
+        path = (
+            PACKAGE_ROOT.parents[0]
+            / "mapping_bringup"
+            / "launch"
+            / (name + ".launch.py")
+        )
+        launch_text = path.read_text(encoding="utf-8")
+        assert "SetEnvironmentVariable" not in launch_text
+        assert "CYCLONEDDS_URI" not in launch_text
+
+
+def test_ui_reuses_adapter_topic_trackers():
+    assert "self.topic_trackers = self.ros.topic_trackers" in UI_SOURCE
+    # RosUiAdapter init (first class) creates trackers before any subscription
+    ros_init = UI_SOURCE[UI_SOURCE.index("class RosUiAdapter:"):UI_SOURCE.index("class LaunchManager:")]
+    assert "self.topic_trackers = {" in ros_init

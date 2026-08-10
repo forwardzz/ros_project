@@ -8,7 +8,7 @@ Use this file as the first project context for future coding agents.
 
 - Local repo: `/home/zjy/Desktop/ros_project_git_2026-05-20`
 - Local ROS workspace: `/home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws`
-- Robot host: `yy@192.168.43.24`
+- Robot host: `yy@192.168.43.30`
 - Robot source directory: `/home/yy/ros2_ws/src`
 - ROS distro: `jazzy`
 - Main branch remote: `git@github.com:forwardzz/ros_project.git`
@@ -156,7 +156,7 @@ source /opt/ros/jazzy/setup.bash
 colcon build --packages-select <changed_package>
 ```
 
-For robot-side changes, sync to `yy@192.168.43.24:/home/yy/ros2_ws/src/...` and build on the robot when the user expects immediate testing.
+For robot-side changes, sync to `yy@192.168.43.30:/home/yy/ros2_ws/src/...` and build on the robot when the user expects immediate testing.
 
 Useful runtime checks:
 
@@ -180,3 +180,12 @@ Do not commit build outputs:
 Avoid touching deleted legacy `robot_monitor_ws_src` files unless the user specifically asks to restore or inspect them.
 
 Keep commits focused. If there are unrelated dirty files, leave them alone and report that they were not included.
+
+## UI 网络与状态监控（2026-08 改造）
+
+- 默认机器人 SSH 地址为 `yy@192.168.43.30`，可用 `REMOTE_HOST=<addr> ./start.sh` 覆盖。
+- Mission Control 的 `Scan LAN` / `Refresh` / `Apply IP` 执行局域网尽力发现（邻居表 + TCP 22 探测，不要求管理员权限，不依赖 nmap）；任务运行中禁止切换地址。
+- `Robot Status` 的系统卡片通过 `RemoteHealthProbe`（后台 SSH，`BatchMode=yes` + `ConnectTimeout=2`）采集温度/CPU/内存/负载/运行时间/欠压，断线保留末值并标记过期。
+- 电压边界：`vcgencmd measure_volts` 是 CPU 核心电压；5V 输入电压在无 ADC/遥测路径时一律显示 `N/A (no ADC)`。
+- ROS 话题表结合运行模式（idle/mapping/navigation）分类；`/map` 按"是否收到 + 是否有发布者"判定，不再用两秒消息超时。
+- 所有扫描与 SSH 探测在后台线程执行，控件更新经 `root.after` 回到主线程。

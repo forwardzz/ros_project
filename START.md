@@ -26,7 +26,13 @@ cd /home/zjy/Desktop/ros_project_git_2026-05-20
 如需更换机器人地址，可仅对当次启动覆盖环境变量：
 
 ```bash
-REMOTE_HOST=192.168.43.24 ./start.sh
+REMOTE_HOST=192.168.43.30 ./start.sh
 ```
 
 不要再直接运行 `ros2 launch robot_control_ui ...` 或另起 `rviz2`；重复执行 `start.sh` 会显示“control console is already running”并退出。
+
+## 状态监控说明
+
+- `Scan LAN` 扫描当前子网并列出设备（IP/主机名/MAC/SSH 端口），`Apply IP` 应用所选地址。
+- 系统卡片显示树莓派温度、CPU、内存、运行时间与欠压状态；无 ADC 时 5V 输入电压显示 `N/A`。
+- `/map` 以"收到地图 + 存在发布者"判定可用，避免静态地图被误判掉线。

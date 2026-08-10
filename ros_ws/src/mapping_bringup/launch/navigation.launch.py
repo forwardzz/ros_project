@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
@@ -10,16 +10,6 @@ LIDAR_PORT = "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0"
 
 
 def generate_launch_description():
-    cyclone_uri = (
-        "<CycloneDDS xmlns='https://cdds.io/config'>"
-        "<Domain Id='any'>"
-        "<Discovery>"
-        "<ParticipantIndex>none</ParticipantIndex>"
-        "<MaxAutoParticipantIndex>200</MaxAutoParticipantIndex>"
-        "</Discovery>"
-        "</Domain>"
-        "</CycloneDDS>"
-    )
     sllidar_launch_path = PathJoinSubstitution(
         [FindPackageShare("sllidar_ros2"), "launch", "sllidar_a1_launch.py"]
     )
@@ -36,7 +26,6 @@ def generate_launch_description():
         [FindPackageShare("mapping_bringup"), "config", "navigate_through_poses_no_spin.xml"]
     )
     return LaunchDescription([
-        SetEnvironmentVariable("CYCLONEDDS_URI", cyclone_uri),
         DeclareLaunchArgument(
             name="map",
             default_value="",

@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -9,19 +9,8 @@ GAS_PORT = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:2:1.0-port0"
 
 
 def generate_launch_description():
-    cyclone_uri = (
-        "<CycloneDDS xmlns='https://cdds.io/config'>"
-        "<Domain Id='any'>"
-        "<Discovery>"
-        "<ParticipantIndex>none</ParticipantIndex>"
-        "<MaxAutoParticipantIndex>200</MaxAutoParticipantIndex>"
-        "</Discovery>"
-        "</Domain>"
-        "</CycloneDDS>"
-    )
 
     return LaunchDescription([
-        SetEnvironmentVariable("CYCLONEDDS_URI", cyclone_uri),
         DeclareLaunchArgument(
             name="gas_serial_port",
             default_value=GAS_PORT,

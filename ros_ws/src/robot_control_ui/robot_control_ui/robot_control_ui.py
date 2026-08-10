@@ -30,6 +30,13 @@ from robot_monitor_interfaces.msg import GasData, MissionStatus, RobotSafetyStat
 from robot_monitor_interfaces.srv import Localize, StartNavigation
 
 from .initial_pose import InitialPoseRetryState, make_initial_pose_message
+from .network_discovery import (
+    default_subnet,
+    is_valid_ipv4,
+    scan_subnet,
+)
+from .remote_health import RemoteHealthProbe, SystemHealth
+from .topic_health import TopicHealthTracker, classify as classify_topic
 
 try:
     from ament_index_python.packages import get_package_share_directory
@@ -40,6 +47,28 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 
 
+def _fmt_uptime(seconds):
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _fmt_rate(rate):
+    return "--" if rate is None else f"{rate:.1f}"
+
+
+def _fmt_age(age):
+    return "--" if age is None else f"{age:.1f}s"
+
+
 class RosUiAdapter:
     def __init__(self, args=None):
         rclpy.init(args=args)
@@ -48,6 +77,16 @@ class RosUiAdapter:
         self.executor.add_node(self.node)
         self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
         self.spin_thread.start()
+
+        # created before any subscription so callbacks always find them
+        self.topic_trackers = {
+            "/scan": TopicHealthTracker("/scan"),
+            "/odom": TopicHealthTracker("/odom"),
+            "/map": TopicHealthTracker("/map"),
+            "/amcl_pose": TopicHealthTracker("/amcl_pose"),
+            "/robot_safety_status": TopicHealthTracker("/robot_safety_status"),
+            "/mission_status_typed": TopicHealthTracker("/mission_status_typed"),
+        }
 
         map_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -174,15 +213,21 @@ class RosUiAdapter:
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.robot_yaw = math.atan2(siny_cosp, cosy_cosp)
         self.robot_yaw_rate = msg.twist.twist.angular.z
-        self.last_odom_stamp = time.time()
+        now = time.time()
+        self.last_odom_stamp = now
+        self.topic_trackers["/odom"].track(now, self.odom_sub.get_publisher_count())
 
     def _scan_cb(self, msg):
         self.scan_count = len(msg.ranges)
-        self.last_scan_stamp = time.time()
+        now = time.time()
+        self.last_scan_stamp = now
+        self.topic_trackers["/scan"].track(now, self.scan_sub.get_publisher_count())
 
     def _map_cb(self, msg):
         self.map_data = msg
-        self.last_map_stamp = time.time()
+        now = time.time()
+        self.last_map_stamp = now
+        self.topic_trackers["/map"].track(now, self.map_sub.get_publisher_count())
 
     def _amcl_pose_cb(self, msg):
         self.amcl_x = float(msg.pose.pose.position.x)
@@ -191,7 +236,9 @@ class RosUiAdapter:
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.amcl_yaw = math.atan2(siny_cosp, cosy_cosp)
-        self.last_amcl_stamp = time.time()
+        now = time.time()
+        self.last_amcl_stamp = now
+        self.topic_trackers["/amcl_pose"].track(now, self.amcl_sub.get_publisher_count())
 
     def _gas_cb(self, msg):
         self.gas_data["H2"] = float(msg.hydrogen_concentration)
@@ -234,7 +281,11 @@ class RosUiAdapter:
         self.safety_undervoltage_now = bool(msg.undervoltage_now)
         self.safety_undervoltage_seen = bool(msg.undervoltage_seen)
         self.safety_throttled_flags = int(msg.throttled_flags)
-        self.last_safety_stamp = time.time()
+        now = time.time()
+        self.last_safety_stamp = now
+        self.topic_trackers["/robot_safety_status"].track(
+            now, self.safety_sub.get_publisher_count()
+        )
         signature = (self.safety_level, self.safety_code, self.safety_message)
         if self.safety_level in ('WARN', 'FAULT') and signature != self.last_safety_alert_signature:
             self.pending_safety_alert = signature
@@ -247,6 +298,10 @@ class RosUiAdapter:
         self.mission_active = bool(msg.active)
         self.mission_current_index = int(msg.current_index)
         self.mission_total_count = int(msg.total_count)
+        now = time.time()
+        self.topic_trackers["/mission_status_typed"].track(
+            now, self.mission_status_sub.get_publisher_count()
+        )
 
     def publish_cmd_vel(self, linear_x=0.0, angular_z=0.0):
         msg = Twist()
@@ -309,16 +364,7 @@ class LaunchManager:
         self.thermal_process = None
         self.active_name = "idle"
         self.last_exit_code = None
-        self.cyclone_uri = (
-            "<CycloneDDS xmlns='https://cdds.io/config'>"
-            "<Domain Id='any'>"
-            "<Discovery>"
-            "<ParticipantIndex>none</ParticipantIndex>"
-            "<MaxAutoParticipantIndex>200</MaxAutoParticipantIndex>"
-            "</Discovery>"
-            "</Domain>"
-            "</CycloneDDS>"
-        )
+        self.cyclone_uri = "file:///home/yy/cyclonedds_unicast.xml"
 
     def _run_remote_cleanup(self, patterns):
         if not patterns:
@@ -398,10 +444,13 @@ class LaunchManager:
         setup_path = os.path.join(self.workspace_path, "install", "setup.bash")
         return (
             "unset DISPLAY WAYLAND_DISPLAY && "
+            "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && "
             f"export CYCLONEDDS_URI={shlex.quote(self.cyclone_uri)} && "
-            f"source {self.ros_setup_path} && "
-            f"source {setup_path} && "
-            f"cd {self.workspace_path} && "
+            "export ROS_DOMAIN_ID=0 && "
+            "export ROS_LOCALHOST_ONLY=0 && "
+            f"source {shlex.quote(self.ros_setup_path)} && "
+            f"source {shlex.quote(setup_path)} && "
+            f"cd {shlex.quote(self.workspace_path)} && "
             f"{command}"
         )
 
@@ -534,7 +583,7 @@ class RobotControlApp:
             "remote_user", "yy"
         ).value
         self.remote_host = self.node.declare_parameter(
-            "remote_host", "192.168.43.24"
+            "remote_host", "192.168.43.30"
         ).value
         self.ros_setup_path = self.node.declare_parameter(
             "ros_setup_path", "/opt/ros/jazzy/setup.bash"
@@ -568,6 +617,23 @@ class RobotControlApp:
         self.logo_image = None
         self.closing = False
         self.pending_initial_pose = None
+
+        # --- network & health monitoring (added in status rework) ---
+        self.health_queue = queue.Queue()
+        self.current_health = SystemHealth()
+        self.health_probe = RemoteHealthProbe(
+            self.remote_user,
+            self.remote_host,
+            interval=2.0,
+            callback=self.health_queue.put,
+        )
+        self.health_probe.start()
+        self.topic_trackers = self.ros.topic_trackers
+        self.scan_thread = None
+        self.scan_cancel = None
+        self.scan_window = None
+        self.scan_result_queue = queue.Queue()
+        self.scan_status_var = tk.StringVar(value="")
 
         self.root.title("Tracked Robot Control UI")
         window_width = max(1180, min(1600, self.root.winfo_screenwidth() - 80))
@@ -726,6 +792,25 @@ class RobotControlApp:
         tk.Entry(row2, textvariable=self.remote_host_var, font=("Helvetica", 10)).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0)
         )
+
+        row_scan = tk.Frame(frame, bg="#ebe6dc")
+        row_scan.pack(fill=tk.X, padx=14, pady=4)
+        ttk.Button(row_scan, text="Scan LAN", command=self.open_scan_window).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(row_scan, text="Refresh", command=self.refresh_scan).pack(
+            side=tk.LEFT, padx=8
+        )
+        ttk.Button(row_scan, text="Apply IP", command=self.apply_selected_ip).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        tk.Label(
+            row_scan,
+            textvariable=self.scan_status_var,
+            bg="#ebe6dc",
+            fg="#4a5759",
+            font=("Helvetica", 9),
+        ).pack(side=tk.LEFT, padx=10)
 
         row3 = tk.Frame(frame, bg="#ebe6dc")
         row3.pack(fill=tk.X, padx=14, pady=4)
@@ -982,40 +1067,281 @@ class RobotControlApp:
         for col in range(4):
             lights.grid_columnconfigure(col, weight=1)
 
-        cards = [
-            ("Pose", self.pose_var, "#0f4c5c"),
-            ("Laser", self.scan_var, "#437f97"),
-            ("Odometry", self.odom_var, "#bc4b51"),
-            ("Map", self.map_var_status, "#6d597a"),
-            ("Safety", self.safety_var, "#8b1e3f"),
-            ("Power", self.power_var, "#4a5759"),
-            ("Thermal", self.thermal_var, "#6b705c"),
-            ("Gas", self.gas_var, "#7c6a0a"),
+        # ---- system status cards (two rows of three) ----
+        self.sys_vars = {
+            "ssh": tk.StringVar(value="SSH: probing"),
+            "power": tk.StringVar(value="5V Input: N/A (no ADC)"),
+            "temp": tk.StringVar(value="CPU Temp: --"),
+            "cpu": tk.StringVar(value="CPU: --"),
+            "mem": tk.StringVar(value="Memory: --"),
+            "uptime": tk.StringVar(value="Uptime: --"),
+        }
+        sys_cards = [
+            ("SSH", self.sys_vars["ssh"], "#0f4c5c"),
+            ("Power", self.sys_vars["power"], "#4a5759"),
+            ("CPU Temp", self.sys_vars["temp"], "#bc4b51"),
+            ("CPU", self.sys_vars["cpu"], "#437f97"),
+            ("Memory", self.sys_vars["mem"], "#6d597a"),
+            ("Uptime", self.sys_vars["uptime"], "#8b1e3f"),
         ]
-        cards_frame = tk.Frame(frame, bg="#ebe6dc")
-        cards_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
-        for idx, (title, variable, color) in enumerate(cards):
-            row = idx // 2
-            col = idx % 2
-            card = tk.Frame(cards_frame, bg=color, width=0, height=32)
-            card.grid(row=row, column=col, sticky="ew", padx=2, pady=2)
+        sys_frame = tk.Frame(frame, bg="#ebe6dc")
+        sys_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        for idx, (title, variable, color) in enumerate(sys_cards):
+            r, c = divmod(idx, 3)
+            card = tk.Frame(sys_frame, bg=color, height=34)
+            card.grid(row=r, column=c, sticky="ew", padx=2, pady=2)
             card.pack_propagate(False)
-            tk.Label(card, text=title, bg=color, fg="white", font=("Helvetica", 8, "bold")).pack(
-                side=tk.LEFT, padx=(5, 3)
+            tk.Label(card, text=title, bg=color, fg="white",
+                     font=("Helvetica", 8, "bold")).pack(side=tk.LEFT, padx=(5, 3))
+            tk.Label(card, textvariable=variable, bg=color, fg="#f7f7f7",
+                     font=("Helvetica", 8), justify="left",
+                     wraplength=150).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        for c in range(3):
+            sys_frame.grid_columnconfigure(c, weight=1)
+
+        # ---- ROS topic health table ----
+        topic_frame = tk.Frame(frame, bg="#ebe6dc")
+        topic_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        columns = ("publisher", "rate", "age", "summary", "state")
+        self.topic_tree = ttk.Treeview(
+            topic_frame, columns=columns, show="tree headings", height=6
+        )
+        self.topic_tree.heading("#0", text="Topic")
+        for col, text in zip(columns, ("Pub", "Rate", "Age", "Summary", "State")):
+            self.topic_tree.heading(col, text=text)
+        self.topic_tree.column("#0", width=130, anchor="w")
+        for col, width in zip(columns, (40, 55, 55, 150, 80)):
+            self.topic_tree.column(col, width=width, anchor="center")
+        for state in ("online", "stale", "offline", "available", "unstarted", "na"):
+            self.topic_tree.tag_configure(state, foreground={
+                "online": "#2dc653", "stale": "#f77f00", "offline": "#d00000",
+                "available": "#2dc653", "unstarted": "#8f8f8f", "na": "#8f8f8f",
+            }[state])
+        vsb = ttk.Scrollbar(topic_frame, orient="vertical", command=self.topic_tree.yview)
+        self.topic_tree.configure(yscrollcommand=vsb.set)
+        self.topic_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._update_topic_table()
+
+    # ------------------------------------------------------------------
+    # LAN scan / IP apply
+    # ------------------------------------------------------------------
+    def open_scan_window(self):
+        if self.scan_window is not None and self.scan_window.winfo_exists():
+            self.scan_window.lift()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("LAN Device Scan")
+        win.geometry("780x440")
+        win.configure(bg="#ebe6dc")
+        self.scan_window = win
+        columns = ("ip", "hostname", "mac", "reachable", "ssh", "current")
+        tree = ttk.Treeview(win, columns=columns, show="headings")
+        for col, text, width in zip(
+            columns,
+            ("IP", "Hostname", "MAC", "Reachable", "SSH", "Current"),
+            (140, 150, 160, 80, 60, 70),
+        ):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="center")
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.scan_tree = tree
+
+        bar = tk.Frame(win, bg="#ebe6dc")
+        bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.scan_progress_var = tk.StringVar(value="Ready")
+        tk.Label(bar, textvariable=self.scan_progress_var, bg="#ebe6dc").pack(side=tk.LEFT)
+        ttk.Button(bar, text="Cancel", command=self.cancel_scan).pack(side=tk.RIGHT)
+        ttk.Button(
+            bar, text="Apply Selected", command=self.apply_scan_selection
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.scan_cancel = threading.Event()
+        self.scan_result_queue = queue.Queue()
+        self.scan_thread = threading.Thread(target=self._scan_worker, daemon=True)
+        self.scan_thread.start()
+
+    def refresh_scan(self):
+        if self.scan_thread and self.scan_thread.is_alive():
+            self.scan_status_var.set("scan already running")
+            return
+        if self.scan_window is None or not self.scan_window.winfo_exists():
+            self.open_scan_window()
+            return
+        self.scan_cancel = threading.Event()
+        self.scan_result_queue = queue.Queue()
+        self.scan_thread = threading.Thread(target=self._scan_worker, daemon=True)
+        self.scan_thread.start()
+        self.scan_status_var.set("rescan started")
+
+    def cancel_scan(self):
+        if self.scan_cancel is not None:
+            self.scan_cancel.set()
+
+    def _scan_worker(self):
+        subnet = default_subnet()
+        if not subnet:
+            self.scan_result_queue.put(("error", "could not determine active subnet"))
+            return
+        self.scan_result_queue.put(("status", "scanning " + subnet))
+        try:
+            devices = scan_subnet(
+                subnet,
+                timeout=0.8,
+                cancel_event=self.scan_cancel,
+                current_ip=self.remote_host_var.get().strip(),
             )
-            tk.Label(
-                card,
-                textvariable=variable,
-                bg=color,
-                fg="#f7f7f7",
-                font=("Helvetica", 8),
-                justify="left",
-                wraplength=165,
-            ).pack(
-                side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        except Exception as exc:
+            self.scan_result_queue.put(("error", str(exc)))
+            return
+        self.scan_result_queue.put(("devices", devices))
+
+    def _flush_scan_queue(self):
+        while not self.scan_result_queue.empty():
+            kind, payload = self.scan_result_queue.get_nowait()
+            if kind == "status":
+                self.scan_status_var.set(payload)
+                if hasattr(self, "scan_progress_var"):
+                    self.scan_progress_var.set(payload)
+            elif kind == "error":
+                self.scan_status_var.set("scan error: " + payload)
+                if hasattr(self, "scan_progress_var"):
+                    self.scan_progress_var.set("error")
+                messagebox.showerror("LAN Scan", payload)
+            elif kind == "devices":
+                self.scan_status_var.set("scan done: " + str(len(payload)) + " device(s)")
+                if hasattr(self, "scan_progress_var"):
+                    self.scan_progress_var.set("done")
+                self._populate_scan_table(payload)
+
+    def _populate_scan_table(self, devices):
+        if not hasattr(self, "scan_tree") or not self.scan_tree.winfo_exists():
+            return
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        for dev in devices:
+            self.scan_tree.insert(
+                "",
+                "end",
+                iid=dev.ip,
+                values=(
+                    dev.ip,
+                    dev.hostname,
+                    dev.mac,
+                    "yes" if dev.reachable else "no",
+                    "open" if dev.ssh_open else "closed",
+                    "*" if dev.current else "",
+                ),
             )
-        cards_frame.grid_columnconfigure(0, weight=1)
-        cards_frame.grid_columnconfigure(1, weight=1)
+
+    def apply_selected_ip(self):
+        self._apply_host_text(self.remote_host_var.get().strip())
+
+    def apply_scan_selection(self):
+        if not hasattr(self, "scan_tree") or not self.scan_tree.winfo_exists():
+            return
+        sel = self.scan_tree.selection()
+        if not sel:
+            messagebox.showinfo("Apply IP", "Select a device row first.")
+            return
+        self._apply_host_text(sel[0])
+
+    def _apply_host_text(self, text):
+        if not is_valid_ipv4(text):
+            messagebox.showerror("Apply IP", "Invalid IPv4 address: " + text)
+            return
+        if self.launch_manager.is_running():
+            messagebox.showwarning(
+                "Apply IP",
+                "A task is running. Stop it before switching the robot address.",
+            )
+            return
+        self.remote_host = text
+        self.launch_manager.remote_host = text
+        self.remote_host_var.set(text)
+        self.ssh_var.set(f"{self.remote_user}@{text}")
+        self.current_health = SystemHealth()
+        self.health_probe.stop()
+        self.health_probe = RemoteHealthProbe(
+            self.remote_user,
+            self.remote_host,
+            interval=2.0,
+            callback=self.health_queue.put,
+        )
+        self.health_probe.start()
+        self.scan_status_var.set("applied " + text)
+        if self.scan_window is not None and self.scan_window.winfo_exists():
+            self.scan_window.destroy()
+            self.scan_window = None
+
+    # ------------------------------------------------------------------
+    # Health cards + topic table
+    # ------------------------------------------------------------------
+    def _flush_health(self):
+        while not self.health_queue.empty():
+            health = self.health_queue.get_nowait()
+            self.current_health = health
+            self._update_health_cards(health)
+
+    def _update_health_cards(self, health):
+        if health.online:
+            self.sys_vars["ssh"].set(
+                f"{self.remote_user}@{self.remote_host} {health.latency_ms}ms"
+            )
+            self.sys_vars["temp"].set(
+                f"{health.temp_c} C" if health.temp_c is not None else "N/A"
+            )
+            cpu = "N/A" if health.cpu_percent is None else f"{health.cpu_percent}%"
+            load = "N/A" if health.load_1m is None else f"{health.load_1m:.2f}"
+            self.sys_vars["cpu"].set(f"{cpu}  load {load}")
+            mem = "N/A" if health.mem_percent is None else f"{health.mem_percent}%"
+            self.sys_vars["mem"].set(mem)
+            self.sys_vars["uptime"].set(
+                _fmt_uptime(health.uptime_s) if health.uptime_s is not None else "N/A"
+            )
+            power = "5V Input: N/A (no ADC)"
+            if health.throttled_flags is not None:
+                uv_now = "Active" if health.throttled_flags & 0x1 else "Normal"
+                uv_seen = "seen" if health.throttled_flags & 0x10000 else "no"
+                power += f"  UV: {uv_now}/{uv_seen}"
+            if health.core_voltage_v is not None:
+                power += f"  Core: {health.core_voltage_v}V"
+            self.sys_vars["power"].set(power)
+        else:
+            self.sys_vars["ssh"].set("SSH: " + health.error_code)
+            if health.temp_c is None:
+                self.sys_vars["temp"].set("N/A (expired)")
+            if health.cpu_percent is None:
+                self.sys_vars["cpu"].set("N/A (expired)")
+            if health.mem_percent is None:
+                self.sys_vars["mem"].set("N/A (expired)")
+            if health.uptime_s is None:
+                self.sys_vars["uptime"].set("N/A (expired)")
+
+    def _update_topic_table(self):
+        if not hasattr(self, "topic_tree") or not self.topic_tree.winfo_exists():
+            return
+        mode = self._current_mode()
+        now = time.time()
+        order = ["/scan", "/odom", "/map", "/amcl_pose",
+                 "/robot_safety_status", "/mission_status_typed"]
+        existing = set(self.topic_tree.get_children())
+        for name in order:
+            tracker = self.topic_trackers.get(name)
+            snap = classify_topic(name, mode, tracker, now=now)
+            values = (snap.publishers, _fmt_rate(snap.rate_hz),
+                      _fmt_age(snap.age_s), snap.summary, snap.state)
+            if name in existing:
+                self.topic_tree.item(name, values=values, tags=(snap.state,))
+            else:
+                self.topic_tree.insert(
+                    "", "end", iid=name, text=name, values=values, tags=(snap.state,)
+                )
+
+    def _current_mode(self):
+        active = self.launch_manager.active_name
+        if active in ("mapping", "navigation"):
+            return active
+        return "idle"
 
     def _build_drive_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Manual Drive", style="Card.TLabelframe")
@@ -1582,6 +1908,8 @@ class RobotControlApp:
 
     def _schedule_update(self):
         self._flush_logs()
+        self._flush_health()
+        self._flush_scan_queue()
         self._handle_safety_alert()
         self._refresh_status()
         self.root.after(200, self._schedule_update)
@@ -1684,8 +2012,19 @@ class RobotControlApp:
             self.gas_var.set("gas timeout")
             self._set_indicator("gas", False, "Gas: timeout")
 
-        ssh_ok = self.launch_manager.last_exit_code in (None, 0) or self.launch_manager.is_running()
-        self._set_indicator("ssh", ssh_ok, f"SSH: {self.ssh_var.get()}")
+        health = self.current_health
+        if health.online:
+            self._set_indicator(
+                "ssh", True,
+                f"SSH: {self.ssh_var.get()} {health.latency_ms}ms"
+            )
+        elif health.error_code == "unprobed":
+            self._set_indicator_state("ssh", "#8f8f8f", "SSH: probing...")
+        else:
+            self._set_indicator_state(
+                "ssh", "#d00000", f"SSH: {health.error_code}"
+            )
+        self._update_topic_table()
 
         if self.ros.safety_level == 'FAULT':
             self.status_var.set(f"FAULT: {self.ros.safety_code}")
@@ -1929,6 +2268,7 @@ class RobotControlApp:
         if self.closing:
             return
         self.closing = True
+        self.health_probe.stop()
         try:
             self._cancel_initial_pose_retry()
             self.stop_robot()
