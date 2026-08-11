@@ -1,6 +1,6 @@
 """LAN device discovery for the robot control UI.
 
-Pure-logic helpers (no tkinter / rclpy dependency) so the scanning
+Pure-logic helpers (no Qt / rclpy dependency) so the scanning
 strategy can be unit tested.  Best-effort discovery: devices that
 block ICMP and are absent from the neighbour table may not be found.
 """

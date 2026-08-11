@@ -1,6 +1,6 @@
 """SSH-based health probing for the robot.
 
-Runs ``ssh -o BatchMode=yes`` in a background thread so the TK main
+Runs ``ssh -o BatchMode=yes`` in a background thread so the Qt event
 loop never blocks.  Values keep their last good reading and are marked
 ``expired`` instead of being zeroed when the link drops.
 

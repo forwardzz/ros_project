@@ -3,11 +3,11 @@
 import sys
 from pathlib import Path
 
-PKG = Path(__file__).resolve().parents[1] / "robot_control_ui"
+PKG = Path(__file__).resolve().parents[1]
 if str(PKG) not in sys.path:
     sys.path.insert(0, str(PKG))
 
-from remote_health import (
+from robot_control_ui.logic.remote_health import (
     SystemHealth,
     classify_ssh_error,
     compute_cpu_percent,

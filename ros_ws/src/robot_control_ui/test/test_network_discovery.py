@@ -3,11 +3,11 @@
 import sys
 from pathlib import Path
 
-PKG = Path(__file__).resolve().parents[1] / "robot_control_ui"
+PKG = Path(__file__).resolve().parents[1]
 if str(PKG) not in sys.path:
     sys.path.insert(0, str(PKG))
 
-from network_discovery import (
+from robot_control_ui.logic.network_discovery import (
     MAX_HOSTS,
     DeviceInfo,
     is_valid_ipv4,

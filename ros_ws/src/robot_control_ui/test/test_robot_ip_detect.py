@@ -7,6 +7,8 @@ robot selection) without touching the live network.
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parents[4] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -106,3 +108,17 @@ def test_detect_no_robot_when_no_ssh_ok(monkeypatch):
     monkeypatch.setattr(rid, "passwordless_ssh_ok", lambda user, ip: False)
     result = rid.detect("yy")
     assert result["robot"] == ""
+
+
+def test_fast_check_exit_codes(monkeypatch):
+    monkeypatch.setattr(rid, "passwordless_ssh_ok", lambda user, ip, timeout=3.0: ip == "192.168.43.30")
+    with pytest.raises(SystemExit) as ok:
+        rid.main([
+            "fast-check", "--ip", "192.168.43.30", "--user", "yy",
+        ])
+    assert ok.value.code == 0
+    with pytest.raises(SystemExit) as bad:
+        rid.main([
+            "fast-check", "--ip", "192.168.43.99", "--user", "yy",
+        ])
+    assert bad.value.code == 1

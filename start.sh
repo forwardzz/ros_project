@@ -3,15 +3,28 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${SCRIPT_DIR}/ros_ws"
-RVIZ_CONFIG="${WORKSPACE}/src/sllidar_ros2/rviz/sllidar_ros2.rviz"
 ROS_SETUP="/opt/ros/jazzy/setup.bash"
 REMOTE_USER="${REMOTE_USER:-yy}"
-REMOTE_HOST="${REMOTE_HOST:-__AUTO__}"
+REMOTE_HOST="${REMOTE_HOST:-192.168.43.31}"
 REMOTE_WORKSPACE="${REMOTE_WORKSPACE:-/home/yy/ros2_ws}"
 REMOTE_MAP="${REMOTE_MAP:-/home/yy/ros2_ws/map_name.yaml}"
 LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/ros_project_control_${UID}.lock"
 DDS_CONFIG="${HOME}/cyclonedds_unicast.xml"
 DETECT_SCRIPT="${SCRIPT_DIR}/scripts/robot_ip_detect.py"
+LAST_IP_FILE="${HOME}/.ros_device_ip"
+
+# WSLg exposes both Wayland and X11.  RViz/Qt5 is more reliable through
+# XWayland, and Qt requires its runtime directory to be private to the user.
+if [[ -d "/mnt/wslg" && -n "${DISPLAY:-}" ]]; then
+    export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+    if [[ "${XDG_RUNTIME_DIR:-}" == "/mnt/wslg/runtime-dir" ]]; then
+        if [[ -O "${XDG_RUNTIME_DIR}" ]]; then
+            chmod 700 "${XDG_RUNTIME_DIR}"
+        else
+            echo "[GUI] 警告：无法修正 ${XDG_RUNTIME_DIR} 的所有者/权限" >&2
+        fi
+    fi
+fi
 
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
@@ -37,7 +50,7 @@ if [[ "${BUILD_CHOICE}" == "skip" && ! -f "${WORKSPACE}/install/setup.bash" ]]; 
     BUILD_CHOICE="build"
 fi
 if [[ "${BUILD_CHOICE}" == "build" ]]; then
-    echo "[BUILD] 将编译工作区（4 个包）"
+    echo "[BUILD] 将编译主机所需包及本地依赖"
 else
     echo "[BUILD] 跳过编译，直接启动（本次不重新构建）"
 fi
@@ -50,22 +63,33 @@ if [[ ! -d "${WORKSPACE}/src" ]]; then
     echo "ROS workspace not found: ${WORKSPACE}" >&2
     exit 1
 fi
-if [[ ! -f "${RVIZ_CONFIG}" ]]; then
-    echo "RViz config not found: ${RVIZ_CONFIG}" >&2
-    exit 1
-fi
 
 # ---------------------------------------------------------------------------
 # Resolve the robot IP so the UI always starts with the correct address.
 # ---------------------------------------------------------------------------
 if [[ "${REMOTE_HOST}" == "__AUTO__" ]]; then
-    echo "[NET] 正在自动检测设备 IP ..."
-    DETECT_OUT="$(python3 "${DETECT_SCRIPT}" detect --user "${REMOTE_USER}" 2>/dev/null || true)"
+    RESOLVED_IP=""
+    # fast path: try the last-known address first, then fall back to a scan
+    if [[ -f "${LAST_IP_FILE}" ]]; then
+        LAST_IP="$(cat "${LAST_IP_FILE}" | tr -d '[:space:]')"
+        if [[ -n "${LAST_IP}" ]] && \
+            python3 "${DETECT_SCRIPT}" validate --ip "${LAST_IP}" >/dev/null 2>&1 && \
+            python3 "${DETECT_SCRIPT}" fast-check --ip "${LAST_IP}" --user "${REMOTE_USER}" >/dev/null 2>&1; then
+            RESOLVED_IP="${LAST_IP}"
+            echo "[NET] 上次地址仍在线：${LAST_IP}"
+        else
+            echo "[NET] 上次地址 ${LAST_IP:-（无记录）} 不可达，开始扫描 ..."
+        fi
+    fi
+    if [[ -z "${RESOLVED_IP}" ]]; then
+        echo "[NET] 正在自动检测设备 IP ..."
+        DETECT_OUT="$(python3 "${DETECT_SCRIPT}" detect --user "${REMOTE_USER}" 2>/dev/null || true)"
     RESOLVED_IP="$(printf '%s' "${DETECT_OUT}" | python3 -c 'import sys,json
 try:
     print(json.load(sys.stdin).get("robot") or "")
 except Exception:
     print("")' 2>/dev/null || true)"
+    fi
     if [[ -z "${RESOLVED_IP}" ]]; then
         echo "[NET] 未自动发现设备。当前候选："
         printf '%s' "${DETECT_OUT}" | python3 -c 'import sys,json
@@ -88,10 +112,11 @@ except Exception:
     fi
     if [[ -n "${RESOLVED_IP}" ]]; then
         REMOTE_HOST="${RESOLVED_IP}"
-        echo "[NET] 使用设备 IP：${REMOTE_HOST}"
+        printf '%s' "${RESOLVED_IP}" > "${LAST_IP_FILE}"
+        echo "[NET] 使用设备 IP：${REMOTE_HOST}（已记住）"
     else
         echo "[NET] 未指定设备 IP；界面启动后请使用 Scan LAN 选择。" >&2
-        REMOTE_HOST="192.168.43.30"
+        REMOTE_HOST="192.168.43.31"
     fi
 fi
 
@@ -164,9 +189,7 @@ export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
 
 cd "${WORKSPACE}"
 if [[ "${BUILD_CHOICE}" == "build" ]]; then
-    colcon build --packages-select \
-        robot_monitor_interfaces \
-        robot_mission_utils \
+    colcon build --packages-up-to \
         mapping_bringup \
         robot_control_ui
 fi
@@ -190,7 +213,6 @@ cleanup_stale_local() {
     local patterns=(
         "${WORKSPACE}/install/robot_control_ui/lib/robot_control_ui/robot_control_ui"
         "ros2 launch robot_control_ui ui.launch.py"
-        "rviz2 -d ${RVIZ_CONFIG}"
     )
     local pattern
     local pid
@@ -208,20 +230,18 @@ cleanup_stale_local() {
 }
 
 UI_PID=""
-RVIZ_PID=""
 cleanup() {
     local status=$?
     trap - EXIT INT TERM HUP
     terminate_pid "${UI_PID}"
-    terminate_pid "${RVIZ_PID}"
     wait "${UI_PID}" 2>/dev/null || true
-    wait "${RVIZ_PID}" 2>/dev/null || true
     exit "${status}"
 }
 trap cleanup EXIT INT TERM HUP
 
 cleanup_stale_local
 
+echo "[UI] Qt interface"
 setsid ros2 launch robot_control_ui ui.launch.py \
     remote_user:="${REMOTE_USER}" \
     remote_host:="${REMOTE_HOST}" \
@@ -229,11 +249,8 @@ setsid ros2 launch robot_control_ui ui.launch.py \
     map_path:="${REMOTE_MAP}" 9>&- &
 UI_PID=$!
 
-setsid rviz2 -d "${RVIZ_CONFIG}" 9>&- &
-RVIZ_PID=$!
-
 set +e
-wait -n "${UI_PID}" "${RVIZ_PID}"
+wait "${UI_PID}"
 STATUS=$?
 set -e
 exit "${STATUS}"

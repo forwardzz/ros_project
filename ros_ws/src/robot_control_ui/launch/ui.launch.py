@@ -18,7 +18,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "remote_host",
-            default_value="192.168.43.30",
+            default_value="192.168.43.31",
             description="SSH host for the robot",
         ),
         DeclareLaunchArgument(

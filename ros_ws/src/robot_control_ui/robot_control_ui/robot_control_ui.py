@@ -1,2304 +1,1879 @@
+"""Qt control UI - single-file interface implementation.
+
+Merged from qt_bridge / qt_main_window / widgets / renderers so all Qt
+interface code lives in one module.  Non-interface logic stays in
+ros_adapter / launch_manager / ui_state / network_discovery / remote_health /
+topic_health.
+"""
+
 import math
 import os
 import queue
 import shlex
-import signal
-import subprocess
+import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import messagebox, ttk
 
 import matplotlib
-import rclpy
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from nav_msgs.msg import OccupancyGrid, Odometry
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import (
-    DurabilityPolicy,
-    HistoryPolicy,
-    QoSProfile,
-    ReliabilityPolicy,
-    qos_profile_sensor_data,
-)
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32MultiArray
-from std_srvs.srv import SetBool, Trigger
+matplotlib.use("Qt5Agg")
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
 
-from robot_monitor_interfaces.msg import GasData, MissionStatus, RobotSafetyStatus
-from robot_monitor_interfaces.srv import Localize, StartNavigation
+from ament_index_python.packages import get_package_share_directory
+from python_qt_binding import QtCore, QtGui, QtWidgets
 
-from .initial_pose import InitialPoseRetryState, make_initial_pose_message
-from .network_discovery import (
-    default_subnet,
-    is_valid_ipv4,
-    scan_subnet,
-)
-from .remote_health import RemoteHealthProbe, SystemHealth
-from .topic_health import TopicHealthTracker, classify as classify_topic
+MAPPING_CMD = "ros2 launch mapping_bringup mapping.launch.py"
+NAVIGATION_CMD = "ros2 launch mapping_bringup navigation.launch.py"
 
-try:
-    from ament_index_python.packages import get_package_share_directory
-except ImportError:
-    get_package_share_directory = None
+STYLE_QSS = """
+QWidget {
+    color: #243746;
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif;
+    font-size: 13px;
+}
+QMainWindow, QWidget#appRoot, QScrollArea, QScrollArea > QWidget > QWidget {
+    background-color: #eef3f6;
+}
+QFrame#appHeader {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #123b4a, stop:1 #176579);
+    border: 0;
+    border-radius: 10px;
+}
+QLabel#headerTitle {
+    color: white;
+    font-size: 22px;
+    font-weight: 700;
+}
+QLabel#headerSubtitle {
+    color: #cfe7ed;
+    font-size: 12px;
+}
+QWidget#panelCard {
+    background-color: #ffffff;
+    border: 1px solid #d7e1e7;
+    border-radius: 10px;
+}
+QLabel#panelTitle {
+    font-size: 15px;
+    font-weight: 700;
+    color: #153f50;
+    padding: 2px 0 5px 0;
+}
+QLabel#metricCard {
+    background-color: #f4f8fa;
+    border: 1px solid #dce7ec;
+    border-radius: 6px;
+    padding: 7px 9px;
+}
+QPushButton {
+    background-color: #e7eff3;
+    border: 1px solid #bdcdd5;
+    border-radius: 6px;
+    min-height: 28px;
+    padding: 3px 12px;
+}
+QPushButton:hover { background-color: #d7e6ec; border-color: #86a9b7; }
+QPushButton:pressed { background-color: #c8dce4; }
+QPushButton:disabled { color: #94a4ab; background-color: #edf1f3; border-color: #d9e0e4; }
+QPushButton#primary { background-color: #126477; border-color: #126477; color: white; font-weight: 600; }
+QPushButton#primary:hover { background-color: #16788d; }
+QPushButton#danger { background-color: #a3264c; border-color: #a3264c; color: white; font-weight: 600; }
+QPushButton#danger:hover { background-color: #bd315b; }
+QPushButton#headerTool {
+    color: white;
+    background-color: rgba(255, 255, 255, 35);
+    border: 1px solid rgba(255, 255, 255, 95);
+    min-height: 30px;
+    padding: 3px 16px;
+}
+QPushButton#headerTool:hover { background-color: rgba(255, 255, 255, 60); }
+QPushButton#compactTool { min-height: 24px; padding: 1px 10px; }
+QLineEdit, QComboBox {
+    background-color: white;
+    border: 1px solid #b9cad2;
+    border-radius: 5px;
+    min-height: 27px;
+    padding: 1px 7px;
+    selection-background-color: #176579;
+}
+QLineEdit:focus, QComboBox:focus { border: 1px solid #16758a; }
+QCheckBox { spacing: 7px; }
+QTableWidget {
+    background-color: white;
+    alternate-background-color: #f2f7f9;
+    border: 1px solid #d5e0e5;
+    border-radius: 6px;
+    gridline-color: #e1e8ec;
+}
+QHeaderView::section {
+    background-color: #194b5d;
+    color: white;
+    padding: 6px;
+    border: none;
+    font-weight: 600;
+}
+QSplitter::handle { background-color: #c5d6de; width: 4px; }
+QPlainTextEdit {
+    background-color: #10252e;
+    color: #d8eef4;
+    border: 1px solid #294b58;
+    border-radius: 6px;
+    padding: 6px;
+    font-family: "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
+    font-size: 12px;
+    selection-background-color: #267d92;
+}
+QDialog { background-color: #eef3f6; }
+QScrollBar:vertical { background: #edf2f4; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #b7cbd4; min-height: 28px; border-radius: 5px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+"""
 
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
+STATE_COLORS = {
+    "online": "#2dc653", "stale": "#f77f00", "offline": "#d00000",
+    "available": "#2dc653", "unstarted": "#8f8f8f", "na": "#8f8f8f",
+}
+
+from .launch_manager import LaunchManager
+from .logic.network_discovery import default_subnet, is_valid_ipv4, scan_subnet
+from .logic.topic_health import classify as classify_topic
+from .ros_adapter import RosUiAdapter
 
 
-def _fmt_uptime(seconds):
-    seconds = int(seconds)
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    mins, secs = divmod(rem, 60)
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {mins}m"
-    if mins:
-        return f"{mins}m {secs}s"
-    return f"{secs}s"
+def style_as_card(widget, minimum_height=None):
+    """Apply the shared dashboard-card identity to a panel widget."""
+    widget.setObjectName("panelCard")
+    widget.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+    if minimum_height is not None:
+        widget.setMinimumHeight(minimum_height)
 
 
-def _fmt_rate(rate):
-    return "--" if rate is None else f"{rate:.1f}"
+# ---------------------------------------------------------------------
+# Rendering helpers (pure)
+# ---------------------------------------------------------------------
+def grid_to_world(map_msg, x, y):
+    """Grid cell (x, y) -> world coordinates."""
+    info = map_msg.info
+    return (
+        info.origin.position.x + (x + 0.5) * info.resolution,
+        info.origin.position.y + (y + 0.5) * info.resolution,
+    )
 
 
-def _fmt_age(age):
-    return "--" if age is None else f"{age:.1f}s"
+
+def world_to_grid(map_msg, wx, wy):
+    """World coordinates -> grid cell (x, y), clamped to the map."""
+    info = map_msg.info
+    x = int((wx - info.origin.position.x) / info.resolution)
+    y = int((wy - info.origin.position.y) / info.resolution)
+    x = max(0, min(x, info.width - 1))
+    y = max(0, min(y, info.height - 1))
+    return x, y
 
 
-class RosUiAdapter:
-    def __init__(self, args=None):
-        rclpy.init(args=args)
-        self.node = rclpy.create_node("robot_control_ui")
-        self.executor = MultiThreadedExecutor()
-        self.executor.add_node(self.node)
-        self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
-        self.spin_thread.start()
 
-        # created before any subscription so callbacks always find them
-        self.topic_trackers = {
-            "/scan": TopicHealthTracker("/scan"),
-            "/odom": TopicHealthTracker("/odom"),
-            "/map": TopicHealthTracker("/map"),
-            "/amcl_pose": TopicHealthTracker("/amcl_pose"),
-            "/robot_safety_status": TopicHealthTracker("/robot_safety_status"),
-            "/mission_status_typed": TopicHealthTracker("/mission_status_typed"),
+def occupancy_to_rows(map_msg):
+    """Return the map data reshaped into rows: list of rows, each a list of ints."""
+    width = map_msg.info.width
+    data = list(map_msg.data)
+    return [data[i * width:(i + 1) * width] for i in range(map_msg.info.height)]
+
+def analyze_frame(data):
+    """Return (min, max, avg) of a flat thermal frame; zeros when empty."""
+    if not data:
+        return 0.0, 0.0, 0.0
+    return min(data), max(data), sum(data) / len(data)
+
+
+
+def update_baseline(baseline_avg, baseline_time, avg, now, window=60.0):
+    """Return (change_per_min, change_ready, new_baseline, new_time)."""
+    if baseline_avg is None:
+        return 0.0, False, avg, now
+    if now - baseline_time >= window:
+        change = avg - baseline_avg
+        return change, True, avg, now
+    return 0.0, False, baseline_avg, baseline_time
+
+# ---------------------------------------------------------------------
+# Qt event bridge
+# ---------------------------------------------------------------------
+class QtBridge(QtCore.QObject):
+    """Signal hub with per-channel queues drained from the GUI thread."""
+
+    log_received = QtCore.Signal(str)
+    health_received = QtCore.Signal(object)
+    scan_status_received = QtCore.Signal(str)
+    scan_devices_received = QtCore.Signal(list)
+    safety_alert_received = QtCore.Signal(str, str, str)  # level, code, message
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._queues = {
+            "log": queue.Queue(),
+            "health": queue.Queue(),
+            "scan_status": queue.Queue(),
+            "scan_devices": queue.Queue(),
+            "safety": queue.Queue(),
         }
 
-        map_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
+    # --- producers (callable from any thread) ---
+    def put(self, channel, payload):
+        q = self._queues.get(channel)
+        if q is not None:
+            q.put(payload)
 
-        self.cmd_vel_pub = self.node.create_publisher(Twist, "/cmd_vel_teleop", 10)
-        self.initial_pose_pub = self.node.create_publisher(
-            PoseWithCovarianceStamped, "/initialpose", 10
-        )
-        self.odom_sub = self.node.create_subscription(Odometry, "/odom", self._odom_cb, 10)
-        self.scan_sub = self.node.create_subscription(
-            LaserScan, "/scan", self._scan_cb, qos_profile_sensor_data
-        )
-        self.map_sub = self.node.create_subscription(
-            OccupancyGrid, "/map", self._map_cb, map_qos
-        )
-        self.amcl_sub = self.node.create_subscription(
-            PoseWithCovarianceStamped, "/amcl_pose", self._amcl_pose_cb, 10
-        )
-        self.thermal_sub = self.node.create_subscription(
-            Float32MultiArray, "/thermal_frame", self._thermal_cb, 10
-        )
-        self.gas_sub = self.node.create_subscription(
-            GasData, "/gas_data", self._gas_cb, 10
-        )
-        self.safety_sub = self.node.create_subscription(
-            RobotSafetyStatus, "/robot_safety_status", self._safety_cb, map_qos
-        )
-        self.mission_status_sub = self.node.create_subscription(
-            MissionStatus, "/mission_status_typed", self._mission_status_cb, map_qos
-        )
-        self.localize_client = self.node.create_client(Localize, "/localize_robot")
-        self.start_navigation_client = self.node.create_client(
-            StartNavigation, "/start_navigation"
-        )
-        self.clear_rviz_points_client = self.node.create_client(
-            Trigger, "/clear_rviz_points"
-        )
-        self.set_region_mode_client = self.node.create_client(
-            SetBool, "/set_region_mode"
-        )
-        self.set_tsp_mode_client = self.node.create_client(SetBool, "/set_tsp_mode")
-        self.clear_inspection_regions_client = self.node.create_client(
-            Trigger, "/clear_inspection_regions"
-        )
-        self.save_inspection_regions_client = self.node.create_client(
-            Trigger, "/save_inspection_regions"
-        )
-        self.load_inspection_regions_client = self.node.create_client(
-            Trigger, "/load_inspection_regions"
-        )
-        self.reset_safety_client = self.node.create_client(
-            Trigger, "/reset_safety_monitor"
-        )
-        self.abort_mission_client = self.node.create_client(Trigger, "/abort_mission")
-        self.undo_rviz_point_client = self.node.create_client(
-            Trigger, "/undo_last_rviz_point"
-        )
-        self.undo_region_client = self.node.create_client(
-            Trigger, "/undo_last_inspection_region"
-        )
-        self.software_estop_client = self.node.create_client(
-            SetBool, "/set_software_estop"
-        )
+    def put_log(self, line):
+        self.put("log", line)
 
-        self.robot_x = 0.0
-        self.robot_y = 0.0
-        self.robot_yaw = 0.0
-        self.robot_yaw_rate = 0.0
-        self.scan_count = 0
-        self.map_data = None
-        self.last_scan_stamp = 0.0
-        self.last_odom_stamp = 0.0
-        self.last_map_stamp = 0.0
-        self.amcl_x = 0.0
-        self.amcl_y = 0.0
-        self.amcl_yaw = 0.0
-        self.last_amcl_stamp = 0.0
-        self.last_thermal_stamp = 0.0
-        self.last_gas_stamp = 0.0
-        self.thermal_width = 32
-        self.thermal_height = 24
-        self.thermal_frame = []
-        self.thermal_min = 0.0
-        self.thermal_max = 0.0
-        self.thermal_avg = 0.0
-        self.thermal_change_per_min = 0.0
-        self.thermal_change_ready = False
-        self.thermal_baseline_avg = None
-        self.thermal_baseline_time = 0.0
-        self.gas_data = {
-            "H2": 0.0,
-            "CO": 0.0,
-            "VOC": 0.0,
-            "Smoke": 0.0,
-        }
-        self.safety_level = 'WAITING'
-        self.safety_code = 'INIT'
-        self.safety_message = 'No safety data'
-        self.safety_mission_active = False
-        self.safety_voltage_available = False
-        self.safety_measured_voltage_v = float('nan')
-        self.safety_undervoltage_now = False
-        self.safety_undervoltage_seen = False
-        self.safety_throttled_flags = 0
-        self.last_safety_stamp = 0.0
-        self.pending_safety_alert = None
-        self.last_safety_alert_signature = None
-        self.mission_state = "IDLE"
-        self.mission_mode = "waypoints"
-        self.mission_message = "No mission"
-        self.mission_active = False
-        self.mission_current_index = 0
-        self.mission_total_count = 0
+    def put_health(self, health):
+        self.put("health", health)
 
-    def _odom_cb(self, msg):
-        self.robot_x = msg.pose.pose.position.x
-        self.robot_y = msg.pose.pose.position.y
-        q = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.robot_yaw = math.atan2(siny_cosp, cosy_cosp)
-        self.robot_yaw_rate = msg.twist.twist.angular.z
-        now = time.time()
-        self.last_odom_stamp = now
-        self.topic_trackers["/odom"].track(now, self.odom_sub.get_publisher_count())
+    def put_scan_status(self, text):
+        self.put("scan_status", text)
 
-    def _scan_cb(self, msg):
-        self.scan_count = len(msg.ranges)
-        now = time.time()
-        self.last_scan_stamp = now
-        self.topic_trackers["/scan"].track(now, self.scan_sub.get_publisher_count())
+    def put_scan_devices(self, devices):
+        self.put("scan_devices", devices)
 
-    def _map_cb(self, msg):
-        self.map_data = msg
-        now = time.time()
-        self.last_map_stamp = now
-        self.topic_trackers["/map"].track(now, self.map_sub.get_publisher_count())
+    def put_safety(self, level, code, message):
+        self.put("safety", (level, code, message))
 
-    def _amcl_pose_cb(self, msg):
-        self.amcl_x = float(msg.pose.pose.position.x)
-        self.amcl_y = float(msg.pose.pose.position.y)
-        q = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.amcl_yaw = math.atan2(siny_cosp, cosy_cosp)
-        now = time.time()
-        self.last_amcl_stamp = now
-        self.topic_trackers["/amcl_pose"].track(now, self.amcl_sub.get_publisher_count())
+    # --- consumer (GUI thread, called by QTimer) ---
+    def drain(self):
+        self._drain("log", self.log_received)
+        self._drain("health", self.health_received)
+        self._drain("scan_status", self.scan_status_received)
+        self._drain("scan_devices", self.scan_devices_received)
+        self._drain("safety", self.safety_alert_received)
 
-    def _gas_cb(self, msg):
-        self.gas_data["H2"] = float(msg.hydrogen_concentration)
-        self.gas_data["CO"] = float(msg.co_concentration)
-        self.gas_data["VOC"] = float(msg.voc_concentration)
-        self.gas_data["Smoke"] = float(msg.smoke_concentration)
-        self.last_gas_stamp = time.time()
-
-    def _thermal_cb(self, msg):
-        dims = msg.layout.dim
-        if len(dims) >= 2 and dims[0].size > 0 and dims[1].size > 0:
-            self.thermal_height = int(dims[0].size)
-            self.thermal_width = int(dims[1].size)
-
-        if not msg.data:
-            return
-
-        self.thermal_frame = list(msg.data)
-        self.thermal_min = min(self.thermal_frame)
-        self.thermal_max = max(self.thermal_frame)
-        self.thermal_avg = sum(self.thermal_frame) / len(self.thermal_frame)
-        now = time.time()
-        if self.thermal_baseline_avg is None:
-            self.thermal_baseline_avg = self.thermal_avg
-            self.thermal_baseline_time = now
-        elif now - self.thermal_baseline_time >= 60.0:
-            self.thermal_change_per_min = self.thermal_avg - self.thermal_baseline_avg
-            self.thermal_change_ready = True
-            self.thermal_baseline_avg = self.thermal_avg
-            self.thermal_baseline_time = now
-        self.last_thermal_stamp = time.time()
-
-    def _safety_cb(self, msg):
-        self.safety_level = msg.level or 'WAITING'
-        self.safety_code = msg.code or 'UNKNOWN'
-        self.safety_message = msg.message or 'No details'
-        self.safety_mission_active = bool(msg.mission_active)
-        self.safety_voltage_available = bool(msg.voltage_available)
-        self.safety_measured_voltage_v = float(msg.measured_voltage_v)
-        self.safety_undervoltage_now = bool(msg.undervoltage_now)
-        self.safety_undervoltage_seen = bool(msg.undervoltage_seen)
-        self.safety_throttled_flags = int(msg.throttled_flags)
-        now = time.time()
-        self.last_safety_stamp = now
-        self.topic_trackers["/robot_safety_status"].track(
-            now, self.safety_sub.get_publisher_count()
-        )
-        signature = (self.safety_level, self.safety_code, self.safety_message)
-        if self.safety_level in ('WARN', 'FAULT') and signature != self.last_safety_alert_signature:
-            self.pending_safety_alert = signature
-            self.last_safety_alert_signature = signature
-
-    def _mission_status_cb(self, msg):
-        self.mission_state = msg.state or "IDLE"
-        self.mission_mode = msg.mode or "waypoints"
-        self.mission_message = msg.message or ""
-        self.mission_active = bool(msg.active)
-        self.mission_current_index = int(msg.current_index)
-        self.mission_total_count = int(msg.total_count)
-        now = time.time()
-        self.topic_trackers["/mission_status_typed"].track(
-            now, self.mission_status_sub.get_publisher_count()
-        )
-
-    def publish_cmd_vel(self, linear_x=0.0, angular_z=0.0):
-        msg = Twist()
-        msg.linear.x = linear_x
-        msg.angular.z = angular_z
-        self.cmd_vel_pub.publish(msg)
-
-    def initial_pose_subscription_count(self):
-        return self.initial_pose_pub.get_subscription_count()
-
-    def publish_initial_pose(self, x, y, yaw):
-        msg = make_initial_pose_message(
-            x,
-            y,
-            yaw,
-            self.node.get_clock().now().to_msg(),
-        )
-        self.initial_pose_pub.publish(msg)
-        return msg
-
-    def call_service_async(self, client, request, done_callback, timeout_sec=6.0):
-        def worker():
-            if not client.wait_for_service(timeout_sec=timeout_sec):
-                done_callback(None, f"Service {client.srv_name} is unavailable")
-                return
-
-            future = client.call_async(request)
-            deadline = time.time() + timeout_sec
-            while rclpy.ok() and not future.done() and time.time() < deadline:
-                time.sleep(0.05)
-
-            if not future.done():
-                done_callback(None, f"Service {client.srv_name} timed out")
-                return
-
+    def _drain(self, channel, signal):
+        q = self._queues[channel]
+        while not q.empty():
             try:
-                result = future.result()
-            except Exception as exc:
-                done_callback(None, str(exc))
-                return
-            done_callback(result, None)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def shutdown(self):
-        self.executor.shutdown()
-        self.node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-
-
-class LaunchManager:
-    def __init__(self, workspace_path, remote_user, remote_host, ros_setup_path, log_callback):
-        self.workspace_path = workspace_path
-        self.remote_user = remote_user
-        self.remote_host = remote_host
-        self.ros_setup_path = ros_setup_path
-        self.log_callback = log_callback
-        self.active_process = None
-        self.thermal_process = None
-        self.active_name = "idle"
-        self.last_exit_code = None
-        self.cyclone_uri = "file:///home/yy/cyclonedds_unicast.xml"
-
-    def _run_remote_cleanup(self, patterns):
-        if not patterns:
-            return
-        safe_patterns = [self._self_safe_pkill_pattern(pattern) for pattern in patterns]
-        cleanup_steps = [
-            f"pkill -TERM -f -- {shlex.quote(pattern)} || true"
-            for pattern in safe_patterns
-        ]
-        cleanup_steps.append("sleep 1")
-        cleanup_steps.extend(
-            f"pkill -KILL -f -- {shlex.quote(pattern)} || true"
-            for pattern in safe_patterns
-        )
-        cleanup = " ; ".join(cleanup_steps)
-        proc = subprocess.Popen(
-            [
-                "ssh",
-                "-x",
-                f"{self.remote_user}@{self.remote_host}",
-                f"bash -lc {shlex.quote(cleanup)}",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        try:
-            stdout, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, _ = proc.communicate()
-            self.log_callback("[WARN] remote cleanup timed out")
-        if stdout:
-            self.log_callback(stdout.rstrip())
-
-    @staticmethod
-    def _self_safe_pkill_pattern(pattern):
-        if not pattern:
-            return pattern
-        return f"[{pattern[0]}]{pattern[1:]}"
-
-    def _stop_patterns_for(self, name):
-        common = [
-            "ros2 launch mapping_bringup mapping.launch.py",
-            "ros2 launch mapping_bringup navigation.launch.py",
-            "sllidar_node",
-            "rf2o_laser_odometry_node",
-            "__node:=base_to_laser",
-            "__node:=base_to_imu",
-            "ybimu_driver",
-            "ekf_node",
-            "tracked_motor_driver",
-            "safety_monitor",
-            "velocity_safety_gate",
-        ]
-        mapping = ["slam_toolbox"]
-        navigation = [
-            "mission_manager",
-            "actual_path_recorder",
-            "nav2_amcl",
-            "planner_server",
-            "controller_server",
-            "bt_navigator",
-            "behavior_server",
-            "smoother_server",
-            "velocity_smoother",
-            "map_server",
-            "lifecycle_manager_navigation",
-        ]
-        if name == "mapping":
-            return common + mapping
-        if name == "navigation":
-            return common + navigation
-        return list(dict.fromkeys(common + mapping + navigation))
-
-    def _build_remote_command(self, command):
-        setup_path = os.path.join(self.workspace_path, "install", "setup.bash")
-        return (
-            "unset DISPLAY WAYLAND_DISPLAY && "
-            "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && "
-            f"export CYCLONEDDS_URI={shlex.quote(self.cyclone_uri)} && "
-            "export ROS_DOMAIN_ID=0 && "
-            "export ROS_LOCALHOST_ONLY=0 && "
-            f"source {shlex.quote(self.ros_setup_path)} && "
-            f"source {shlex.quote(setup_path)} && "
-            f"cd {shlex.quote(self.workspace_path)} && "
-            f"{command}"
-        )
-
-    def _build_ssh_invocation(self, command):
-        remote_command = self._build_remote_command(command)
-        return [
-            "ssh",
-            "-x",
-            f"{self.remote_user}@{self.remote_host}",
-            f"bash -lc {shlex.quote(remote_command)}",
-        ]
-
-    def start(self, name, command):
-        if self.active_process and self.active_process.poll() is None:
-            self.log_callback(f"[WARN] Stop current task before starting {name}.")
-            return False
-
-        self.log_callback(f"[PREP] cleaning stale robot runtime before {name}")
-        self._run_remote_cleanup(self._stop_patterns_for("runtime"))
-
-        self.active_process = subprocess.Popen(
-            self._build_ssh_invocation(command),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            preexec_fn=os.setsid,
-        )
-        self.active_name = name
-        self.log_callback(f"[RUN] {name}: {command}")
-        threading.Thread(target=self._stream_output, args=(self.active_process, name), daemon=True).start()
-        return True
-
-    def run_once(self, name, command):
-        def worker():
-            self.log_callback(f"[RUN] {name}: {command}")
-            proc = subprocess.Popen(
-                self._build_ssh_invocation(command),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                preexec_fn=os.setsid,
-            )
-            self._stream_output(proc, name, track_active=False)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def stop(self):
-        target_name = self.active_name
-        if not self.active_process or self.active_process.poll() is not None:
-            patterns = self._stop_patterns_for(target_name)
-            self._run_remote_cleanup(patterns)
-            self.log_callback(f"[STOP] remote cleanup for {target_name or 'all'}")
-            self.active_name = "idle"
-            return
-
-        try:
-            os.killpg(os.getpgid(self.active_process.pid), signal.SIGTERM)
-            self.log_callback(f"[STOP] {self.active_name}")
-        except ProcessLookupError:
-            pass
-        finally:
-            self._run_remote_cleanup(self._stop_patterns_for(target_name))
-            self.active_process = None
-            self.active_name = "idle"
-
-    def is_running(self):
-        return bool(self.active_process and self.active_process.poll() is None)
-
-    def start_thermal(self):
-        if self.thermal_process and self.thermal_process.poll() is None:
-            self.log_callback("[WARN] Thermal node is already running.")
-            return False
-
-        self._run_remote_cleanup(["thermal_camera_node", "gas_sensor_node", "sensor_monitor.launch.py"])
-        command = "ros2 launch mapping_bringup sensor_monitor.launch.py"
-        self.thermal_process = subprocess.Popen(
-            self._build_ssh_invocation(command),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            preexec_fn=os.setsid,
-        )
-        self.log_callback(f"[RUN] thermal: {command}")
-        threading.Thread(
-            target=self._stream_output,
-            args=(self.thermal_process, "thermal"),
-            kwargs={"track_active": False, "track_thermal": True},
-            daemon=True,
-        ).start()
-        return True
-
-    def stop_thermal(self):
-        try:
-            if self.thermal_process and self.thermal_process.poll() is None:
-                os.killpg(os.getpgid(self.thermal_process.pid), signal.SIGTERM)
-                self.log_callback("[STOP] thermal")
-        except ProcessLookupError:
-            pass
-        finally:
-            self._run_remote_cleanup(["thermal_camera_node", "gas_sensor_node", "sensor_monitor.launch.py"])
-            self.thermal_process = None
-
-    def is_thermal_running(self):
-        return bool(self.thermal_process and self.thermal_process.poll() is None)
-
-    def _stream_output(self, proc, name, track_active=True, track_thermal=False):
-        if proc.stdout is not None:
-            for line in proc.stdout:
-                self.log_callback(line.rstrip())
-        code = proc.wait()
-        self.last_exit_code = code
-        self.log_callback(f"[EXIT] {name} -> {code}")
-        if track_active and self.active_process is proc:
-            self.active_process = None
-            self.active_name = "idle"
-        if track_thermal and self.thermal_process is proc:
-            self.thermal_process = None
-
-
-class RobotControlApp:
-    def __init__(self, root, ros_adapter):
-        self.root = root
-        self.ros = ros_adapter
-        self.node = ros_adapter.node
-
-        self.workspace_path = self.node.declare_parameter(
-            "workspace_path", "/home/yy/ros2_ws"
-        ).value
-        self.remote_user = self.node.declare_parameter(
-            "remote_user", "yy"
-        ).value
-        self.remote_host = self.node.declare_parameter(
-            "remote_host", "192.168.43.30"
-        ).value
-        self.ros_setup_path = self.node.declare_parameter(
-            "ros_setup_path", "/opt/ros/jazzy/setup.bash"
-        ).value
-        self.default_map_path = self.node.declare_parameter(
-            "map_path", "/home/yy/ros2_ws/map_name.yaml"
-        ).value
-
-        self.log_queue = queue.Queue()
-        self.launch_manager = LaunchManager(
-            self.workspace_path,
-            self.remote_user,
-            self.remote_host,
-            self.ros_setup_path,
-            self.log_queue.put,
-        )
-        self.manual_linear = 0.12
-        self.manual_angular = 0.55
-        self.initial_pose_retry = InitialPoseRetryState(max_attempts=8)
-        self.initial_pose_after_id = None
-        self.manual_after_id = None
-        self.manual_command = None
-        self.manual_request_id = 0
-        self.pose_history = []
-        self.last_map_render_key = None
-        self.thermal_window = None
-        self.thermal_popup_fig = None
-        self.thermal_popup_ax = None
-        self.thermal_popup_canvas = None
-        self.thermal_popup_cbar = None
-        self.logo_image = None
-        self.closing = False
-        self.pending_initial_pose = None
-
-        # --- network & health monitoring (added in status rework) ---
-        self.health_queue = queue.Queue()
-        self.current_health = SystemHealth()
-        self.health_probe = RemoteHealthProbe(
-            self.remote_user,
-            self.remote_host,
-            interval=2.0,
-            callback=self.health_queue.put,
-        )
-        self.health_probe.start()
-        self.topic_trackers = self.ros.topic_trackers
-        self.scan_thread = None
-        self.scan_cancel = None
-        self.scan_window = None
-        self.scan_result_queue = queue.Queue()
-        self.scan_status_var = tk.StringVar(value="")
-
-        self.root.title("Tracked Robot Control UI")
-        window_width = max(1180, min(1600, self.root.winfo_screenwidth() - 80))
-        window_height = max(800, min(1450, self.root.winfo_screenheight() - 80))
-        self.root.geometry(f"{window_width}x{window_height}")
-        self.root.minsize(1180, 800)
-        self.root.configure(bg="#ebe6dc")
-
-        self.map_var = tk.StringVar(value=self.default_map_path)
-        self.workspace_var = tk.StringVar(value=self.workspace_path)
-        self.remote_user_var = tk.StringVar(value=self.remote_user)
-        self.remote_host_var = tk.StringVar(value=self.remote_host)
-        self.status_var = tk.StringVar(value="Idle")
-        self.pose_var = tk.StringVar(value="x=0.00  y=0.00  yaw=0.0")
-        self.scan_var = tk.StringVar(value="scan: no data")
-        self.odom_var = tk.StringVar(value="odom: no data")
-        self.map_var_status = tk.StringVar(value="map: no data")
-        self.mission_var = tk.StringVar(value="mission: RViz mode")
-        self.region_mode_var = tk.BooleanVar(value=False)
-        self.tsp_mode_var = tk.BooleanVar(value=True)
-        self.return_to_start_var = tk.BooleanVar(value=False)
-        self.waypoint_pause_var = tk.DoubleVar(value=2.0)
-        self.software_estop_var = tk.BooleanVar(value=False)
-        self.initial_x_var = tk.DoubleVar(value=0.0)
-        self.initial_y_var = tk.DoubleVar(value=0.0)
-        self.initial_yaw_deg_var = tk.DoubleVar(value=0.0)
-        self.initial_pose_status_var = tk.StringVar(
-            value="AMCL: start navigation before setting the initial pose"
-        )
-        self.safety_var = tk.StringVar(value="safety: waiting")
-        self.power_var = tk.StringVar(value="power: waiting")
-        self.thermal_var = tk.StringVar(value="thermal: no data")
-        self.gas_var = tk.StringVar(value="gas: no data")
-        self.gas_h2_var = tk.StringVar(value="H2: --")
-        self.gas_co_var = tk.StringVar(value="CO: --")
-        self.gas_voc_var = tk.StringVar(value="VOC: --")
-        self.gas_smoke_var = tk.StringVar(value="Smoke: --")
-        self.ssh_var = tk.StringVar(value=f"{self.remote_user}@{self.remote_host}")
-        self.indicators = {}
-
-        self._build_ui()
-        self._bind_keys()
-        self._schedule_update()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def _build_ui(self):
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Card.TLabelframe", background="#ebe6dc")
-        style.configure("Card.TLabelframe.Label", font=("Helvetica", 12, "bold"))
-        style.configure("Primary.TButton", font=("Helvetica", 11, "bold"), padding=10)
-        style.configure("Danger.TButton", font=("Helvetica", 11, "bold"), padding=10)
-        style.configure("Drive.TButton", font=("Helvetica", 12, "bold"), padding=(6, 10))
-
-        header = tk.Frame(self.root, bg="#153243", height=72)
-        header.pack(fill=tk.X)
-        self._add_header_logo(header)
-        tk.Label(
-            header,
-            text="Tracked Robot Control Center",
-            bg="#153243",
-            fg="#f4efe7",
-            font=("Helvetica", 22, "bold"),
-        ).pack(side=tk.LEFT, padx=(8, 24), pady=18)
-        tk.Label(
-            header,
-            textvariable=self.status_var,
-            bg="#153243",
-            fg="#ffc857",
-            font=("Helvetica", 14, "bold"),
-        ).pack(side=tk.RIGHT, padx=24)
-
-        body = tk.Frame(self.root, bg="#ebe6dc")
-        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=10)
-
-        left = tk.Frame(body, bg="#ebe6dc", width=800)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        left.pack_propagate(False)
-        right = tk.Frame(body, bg="#ebe6dc", width=440)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(18, 0))
-        right.pack_propagate(False)
-
-        self._build_launch_panel(left)
-        self._build_pose_panel(left)
-        self._build_mission_panel(left)
-
-        lower = tk.Frame(left, bg="#ebe6dc")
-        lower.pack(fill=tk.BOTH, expand=True)
-        log_col = tk.Frame(lower, bg="#ebe6dc")
-        status_col = tk.Frame(lower, bg="#ebe6dc", width=500)
-        status_col.pack(side=tk.RIGHT, fill=tk.Y, padx=(18, 0))
-        status_col.pack_propagate(False)
-        log_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self._build_log_panel(log_col)
-        self._build_status_panel(status_col)
-        self._build_map_panel(right)
-        self._build_thermal_panel(right)
-        self._build_drive_panel(right)
-
-    def _asset_path(self, filename):
-        candidates = []
-        if get_package_share_directory is not None:
-            try:
-                candidates.append(
-                    os.path.join(get_package_share_directory("robot_control_ui"), "assets", filename)
-                )
-            except Exception:
-                pass
-        candidates.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets", filename)))
-        for path in candidates:
-            if os.path.exists(path):
-                return path
-        return None
-
-    def _add_header_logo(self, parent):
-        logo_path = self._asset_path("wut_logo.png")
-        if logo_path:
-            try:
-                image = tk.PhotoImage(file=logo_path)
-                factor = max(1, math.ceil(max(image.width() / 48.0, image.height() / 48.0)))
-                self.logo_image = image.subsample(factor, factor)
-                tk.Label(parent, image=self.logo_image, bg="#153243").pack(
-                    side=tk.LEFT, padx=(18, 8), pady=10
-                )
-                return
-            except Exception:
-                self.logo_image = None
-
-        tk.Label(
-            parent,
-            text="武汉理工大学",
-            bg="#153243",
-            fg="#f4efe7",
-            font=("Helvetica", 13, "bold"),
-        ).pack(side=tk.LEFT, padx=(18, 8), pady=18)
-
-    def _build_launch_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Mission Control", style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(0, 10))
-
-        row1 = tk.Frame(frame, bg="#ebe6dc")
-        row1.pack(fill=tk.X, padx=14, pady=(8, 4))
-        tk.Label(row1, text="Workspace", bg="#ebe6dc", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
-        tk.Entry(row1, textvariable=self.workspace_var, font=("Helvetica", 10)).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0)
-        )
-
-        row2 = tk.Frame(frame, bg="#ebe6dc")
-        row2.pack(fill=tk.X, padx=14, pady=4)
-        tk.Label(row2, text="SSH", bg="#ebe6dc", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
-        tk.Entry(row2, textvariable=self.remote_user_var, width=10, font=("Helvetica", 10)).pack(
-            side=tk.LEFT, padx=(35, 8)
-        )
-        tk.Label(row2, text="@", bg="#ebe6dc", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
-        tk.Entry(row2, textvariable=self.remote_host_var, font=("Helvetica", 10)).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0)
-        )
-
-        row_scan = tk.Frame(frame, bg="#ebe6dc")
-        row_scan.pack(fill=tk.X, padx=14, pady=4)
-        ttk.Button(row_scan, text="Scan LAN", command=self.open_scan_window).pack(
-            side=tk.LEFT, padx=(0, 8)
-        )
-        ttk.Button(row_scan, text="Refresh", command=self.refresh_scan).pack(
-            side=tk.LEFT, padx=8
-        )
-        ttk.Button(row_scan, text="Apply IP", command=self.apply_selected_ip).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-        tk.Label(
-            row_scan,
-            textvariable=self.scan_status_var,
-            bg="#ebe6dc",
-            fg="#4a5759",
-            font=("Helvetica", 9),
-        ).pack(side=tk.LEFT, padx=10)
-
-        row3 = tk.Frame(frame, bg="#ebe6dc")
-        row3.pack(fill=tk.X, padx=14, pady=4)
-        tk.Label(row3, text="Map YAML", bg="#ebe6dc", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
-        tk.Entry(row3, textvariable=self.map_var, font=("Helvetica", 10)).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(18, 0)
-        )
-
-        buttons = tk.Frame(frame, bg="#ebe6dc")
-        buttons.pack(fill=tk.X, padx=14, pady=(6, 8))
-        ttk.Button(buttons, text="Start Mapping", style="Primary.TButton", command=self.start_mapping).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
-        ttk.Button(buttons, text="Start Navigation", style="Primary.TButton", command=self.start_navigation).pack(
-            side=tk.LEFT, padx=10
-        )
-        ttk.Button(buttons, text="Save Map", style="Primary.TButton", command=self.save_map).pack(
-            side=tk.LEFT, padx=10
-        )
-        ttk.Button(buttons, text="Reset Safety", command=self.reset_safety).pack(
-            side=tk.RIGHT, padx=(10, 0)
-        )
-        ttk.Button(buttons, text="Stop Launch", style="Danger.TButton", command=self.stop_launch).pack(
-            side=tk.RIGHT
-        )
-
-    def _build_pose_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Localization and Initial Pose", style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(0, 10))
-
-        controls = tk.Frame(frame, bg="#ebe6dc")
-        controls.pack(fill=tk.X, padx=12, pady=(10, 5))
-        for label, variable, lower, upper, increment in [
-            ("X (m)", self.initial_x_var, -20.0, 20.0, 0.05),
-            ("Y (m)", self.initial_y_var, -20.0, 20.0, 0.05),
-            ("Yaw (deg)", self.initial_yaw_deg_var, -180.0, 180.0, 1.0),
-        ]:
-            tk.Label(controls, text=label, bg="#ebe6dc", font=("Helvetica", 9, "bold")).pack(
-                side=tk.LEFT, padx=(0, 5)
-            )
-            tk.Spinbox(
-                controls,
-                from_=lower,
-                to=upper,
-                increment=increment,
-                width=7,
-                textvariable=variable,
-                format="%.2f" if increment < 1.0 else "%.0f",
-            ).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(
-            controls,
-            text="Set Initial Pose",
-            style="Primary.TButton",
-            command=self.set_initial_pose,
-        ).pack(side=tk.RIGHT)
-
-        tk.Label(
-            frame,
-            textvariable=self.initial_pose_status_var,
-            bg="#ebe6dc",
-            font=("Helvetica", 9),
-            anchor="w",
-        ).pack(fill=tk.X, padx=12, pady=(0, 8))
-
-    def _build_log_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Runtime Log", style="Card.TLabelframe")
-        frame.pack(fill=tk.BOTH, expand=True)
-        self.log_text = tk.Text(
-            frame,
-            height=16,
-            bg="#101820",
-            fg="#d8f3dc",
-            insertbackground="#d8f3dc",
-            font=("Courier New", 10),
-            wrap="word",
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-
-    def _build_mission_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="RViz Mission", style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(0, 10))
-
-        tk.Label(
-            frame,
-            text="RViz: Publish Point adds points/region corners; Mission Heading sets point yaw.",
-            justify="left",
-            bg="#ebe6dc",
-            font=("Helvetica", 9),
-        ).pack(anchor="w", padx=12, pady=(10, 5))
-
-        buttons = tk.Frame(frame, bg="#ebe6dc")
-        buttons.pack(fill=tk.X, padx=12, pady=(0, 5))
-        ttk.Button(buttons, text="Check Localization", command=self.check_localization).grid(
-            row=0, column=0, padx=(0, 5), pady=3, sticky="ew"
-        )
-        ttk.Button(buttons, text="Start Mission", command=self.start_mission).grid(
-            row=0, column=1, padx=5, pady=3, sticky="ew"
-        )
-        ttk.Button(buttons, text="Stop All Tasks", style="Danger.TButton", command=self.stop_mission).grid(
-            row=0, column=2, padx=5, pady=3, sticky="ew"
-        )
-        ttk.Button(buttons, text="Clear RViz Points", command=self.clear_rviz_points).grid(
-            row=0, column=3, padx=(5, 0), pady=3, sticky="ew"
-        )
-
-        settings = tk.Frame(frame, bg="#ebe6dc")
-        settings.pack(fill=tk.X, padx=12, pady=(0, 5))
-        tk.Label(settings, text="Point pause (s)", bg="#ebe6dc").pack(side=tk.LEFT)
-        tk.Spinbox(
-            settings,
-            from_=0.0,
-            to=60.0,
-            increment=0.5,
-            width=6,
-            textvariable=self.waypoint_pause_var,
-            format="%.1f",
-        ).pack(side=tk.LEFT, padx=(8, 16))
-        ttk.Checkbutton(
-            settings,
-            text="TSP",
-            variable=self.tsp_mode_var,
-            command=self.set_tsp_mode,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(
-            settings,
-            text="Return to Start",
-            variable=self.return_to_start_var,
-        ).pack(side=tk.LEFT)
-        ttk.Checkbutton(
-            settings,
-            text="Software E-Stop",
-            variable=self.software_estop_var,
-            command=self.set_software_estop,
-        ).pack(side=tk.RIGHT)
-
-        regions = tk.Frame(frame, bg="#ebe6dc")
-        regions.pack(fill=tk.X, padx=12, pady=(0, 5))
-        ttk.Checkbutton(
-            regions,
-            text="Region Mode",
-            variable=self.region_mode_var,
-            command=self.set_region_mode,
-        ).grid(row=0, column=0, padx=(0, 5), pady=3, sticky="ew")
-        ttk.Button(regions, text="Save Regions", command=self.save_regions).grid(
-            row=0, column=1, padx=5, pady=3, sticky="ew"
-        )
-        ttk.Button(regions, text="Load Regions", command=self.load_regions).grid(
-            row=0, column=2, padx=5, pady=3, sticky="ew"
-        )
-        ttk.Button(regions, text="Clear Regions", command=self.clear_regions).grid(
-            row=0, column=3, padx=(5, 0), pady=3, sticky="ew"
-        )
-
-        undo = tk.Frame(frame, bg="#ebe6dc")
-        undo.pack(fill=tk.X, padx=12, pady=(0, 5))
-        ttk.Button(undo, text="Undo Region", command=self.undo_region).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
-        ttk.Button(undo, text="Undo Point", command=self.undo_rviz_point).pack(
-            side=tk.LEFT
-        )
-        for col in range(4):
-            buttons.grid_columnconfigure(col, weight=1)
-            regions.grid_columnconfigure(col, weight=1)
-
-        tk.Label(
-            frame,
-            textvariable=self.mission_var,
-            bg="#ebe6dc",
-            font=("Helvetica", 10, "bold"),
-        ).pack(anchor="w", padx=12, pady=(0, 8))
-
-    def _build_map_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Live Map", style="Card.TLabelframe")
-        frame.pack(fill=tk.X)
-        self.map_canvas = tk.Canvas(
-            frame,
-            width=460,
-            height=150,
-            bg="#f7f3eb",
-            highlightthickness=0,
-        )
-        self.map_canvas.pack(padx=12, pady=(12, 8))
-        tk.Label(
-            frame,
-            text="OccupancyGrid, robot pose and recent trail",
-            bg="#ebe6dc",
-            font=("Helvetica", 10),
-        ).pack(anchor="w", padx=12, pady=(0, 12))
-
-    def _build_thermal_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Thermal Camera", style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(18, 0))
-        self.thermal_fig, self.thermal_ax = plt.subplots(figsize=(5.3, 1.7), dpi=90)
-        self.thermal_cbar = None
-        self.thermal_canvas = FigureCanvasTkAgg(self.thermal_fig, frame)
-        self.thermal_canvas.draw()
-        self.thermal_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 8))
-        buttons = tk.Frame(frame, bg="#ebe6dc")
-        buttons.pack(fill=tk.X, padx=12, pady=(0, 8))
-        for index, (label, command) in enumerate([
-            ("Start Thermal", self.start_thermal),
-            ("Stop Thermal", self.stop_thermal),
-            ("Open Thermal Window", self.open_thermal_window),
-            ("Save Snapshot", self.save_thermal_snapshot),
-        ]):
-            ttk.Button(buttons, text=label, command=command).grid(
-                row=index // 2,
-                column=index % 2,
-                padx=(0, 5) if index % 2 == 0 else (5, 0),
-                pady=3,
-                sticky="ew",
-            )
-        buttons.grid_columnconfigure(0, weight=1)
-        buttons.grid_columnconfigure(1, weight=1)
-        tk.Label(
-            frame,
-            textvariable=self.thermal_var,
-            bg="#ebe6dc",
-            font=("Helvetica", 10),
-        ).pack(anchor="w", padx=12, pady=(0, 8))
-
-        gas_frame = tk.Frame(frame, bg="#ebe6dc")
-        gas_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
-        for idx, variable in enumerate([self.gas_h2_var, self.gas_co_var, self.gas_voc_var, self.gas_smoke_var]):
-            row = idx // 2
-            col = idx % 2
-            tk.Label(
-                gas_frame,
-                textvariable=variable,
-                bg="#ebe6dc",
-                font=("Helvetica", 10, "bold"),
-                anchor="w",
-                width=18,
-            ).grid(row=row, column=col, sticky="w", padx=(0, 16), pady=2)
-
-    def _build_status_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Robot Status", style="Card.TLabelframe")
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        lights = tk.Frame(frame, bg="#ebe6dc")
-        lights.pack(fill=tk.X, padx=6, pady=(6, 3))
-        for idx, name in enumerate(["SSH", "Laser", "Odom", "Map", "Safety", "Thermal", "Gas"]):
-            lamp = tk.Frame(lights, bg="#ebe6dc")
-            row = idx // 4
-            col = idx % 4
-            lamp.grid(row=row, column=col, sticky="w", padx=(0, 5), pady=1)
-            canvas = tk.Canvas(lamp, width=12, height=12, bg="#ebe6dc", highlightthickness=0)
-            canvas.pack(side=tk.LEFT)
-            canvas.create_oval(1, 1, 11, 11, fill="#8f8f8f", outline="")
-            label = tk.Label(lamp, text=f"{name}: waiting", bg="#ebe6dc", font=("Helvetica", 8))
-            label.pack(side=tk.LEFT, padx=3)
-            self.indicators[name.lower()] = (canvas, label)
-        for col in range(4):
-            lights.grid_columnconfigure(col, weight=1)
-
-        # ---- system status cards (two rows of three) ----
-        self.sys_vars = {
-            "ssh": tk.StringVar(value="SSH: probing"),
-            "power": tk.StringVar(value="5V Input: N/A (no ADC)"),
-            "temp": tk.StringVar(value="CPU Temp: --"),
-            "cpu": tk.StringVar(value="CPU: --"),
-            "mem": tk.StringVar(value="Memory: --"),
-            "uptime": tk.StringVar(value="Uptime: --"),
-        }
-        sys_cards = [
-            ("SSH", self.sys_vars["ssh"], "#0f4c5c"),
-            ("Power", self.sys_vars["power"], "#4a5759"),
-            ("CPU Temp", self.sys_vars["temp"], "#bc4b51"),
-            ("CPU", self.sys_vars["cpu"], "#437f97"),
-            ("Memory", self.sys_vars["mem"], "#6d597a"),
-            ("Uptime", self.sys_vars["uptime"], "#8b1e3f"),
-        ]
-        sys_frame = tk.Frame(frame, bg="#ebe6dc")
-        sys_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
-        for idx, (title, variable, color) in enumerate(sys_cards):
-            r, c = divmod(idx, 3)
-            card = tk.Frame(sys_frame, bg=color, height=34)
-            card.grid(row=r, column=c, sticky="ew", padx=2, pady=2)
-            card.pack_propagate(False)
-            tk.Label(card, text=title, bg=color, fg="white",
-                     font=("Helvetica", 8, "bold")).pack(side=tk.LEFT, padx=(5, 3))
-            tk.Label(card, textvariable=variable, bg=color, fg="#f7f7f7",
-                     font=("Helvetica", 8), justify="left",
-                     wraplength=150).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        for c in range(3):
-            sys_frame.grid_columnconfigure(c, weight=1)
-
-        # ---- ROS topic health table ----
-        topic_frame = tk.Frame(frame, bg="#ebe6dc")
-        topic_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
-        columns = ("publisher", "rate", "age", "summary", "state")
-        self.topic_tree = ttk.Treeview(
-            topic_frame, columns=columns, show="tree headings", height=6
-        )
-        self.topic_tree.heading("#0", text="Topic")
-        for col, text in zip(columns, ("Pub", "Rate", "Age", "Summary", "State")):
-            self.topic_tree.heading(col, text=text)
-        self.topic_tree.column("#0", width=130, anchor="w")
-        for col, width in zip(columns, (40, 55, 55, 150, 80)):
-            self.topic_tree.column(col, width=width, anchor="center")
-        for state in ("online", "stale", "offline", "available", "unstarted", "na"):
-            self.topic_tree.tag_configure(state, foreground={
-                "online": "#2dc653", "stale": "#f77f00", "offline": "#d00000",
-                "available": "#2dc653", "unstarted": "#8f8f8f", "na": "#8f8f8f",
-            }[state])
-        vsb = ttk.Scrollbar(topic_frame, orient="vertical", command=self.topic_tree.yview)
-        self.topic_tree.configure(yscrollcommand=vsb.set)
-        self.topic_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._update_topic_table()
-
-    # ------------------------------------------------------------------
-    # LAN scan / IP apply
-    # ------------------------------------------------------------------
-    def open_scan_window(self):
-        if self.scan_window is not None and self.scan_window.winfo_exists():
-            self.scan_window.lift()
-            return
-        win = tk.Toplevel(self.root)
-        win.title("LAN Device Scan")
-        win.geometry("780x440")
-        win.configure(bg="#ebe6dc")
-        self.scan_window = win
-        columns = ("ip", "hostname", "mac", "reachable", "ssh", "current")
-        tree = ttk.Treeview(win, columns=columns, show="headings")
-        for col, text, width in zip(
-            columns,
-            ("IP", "Hostname", "MAC", "Reachable", "SSH", "Current"),
-            (140, 150, 160, 80, 60, 70),
-        ):
-            tree.heading(col, text=text)
-            tree.column(col, width=width, anchor="center")
-        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.scan_tree = tree
-
-        bar = tk.Frame(win, bg="#ebe6dc")
-        bar.pack(fill=tk.X, padx=10, pady=(0, 10))
-        self.scan_progress_var = tk.StringVar(value="Ready")
-        tk.Label(bar, textvariable=self.scan_progress_var, bg="#ebe6dc").pack(side=tk.LEFT)
-        ttk.Button(bar, text="Cancel", command=self.cancel_scan).pack(side=tk.RIGHT)
-        ttk.Button(
-            bar, text="Apply Selected", command=self.apply_scan_selection
-        ).pack(side=tk.RIGHT, padx=(0, 8))
-
-        self.scan_cancel = threading.Event()
-        self.scan_result_queue = queue.Queue()
-        self.scan_thread = threading.Thread(target=self._scan_worker, daemon=True)
-        self.scan_thread.start()
-
-    def refresh_scan(self):
-        if self.scan_thread and self.scan_thread.is_alive():
-            self.scan_status_var.set("scan already running")
-            return
-        if self.scan_window is None or not self.scan_window.winfo_exists():
-            self.open_scan_window()
-            return
-        self.scan_cancel = threading.Event()
-        self.scan_result_queue = queue.Queue()
-        self.scan_thread = threading.Thread(target=self._scan_worker, daemon=True)
-        self.scan_thread.start()
-        self.scan_status_var.set("rescan started")
-
-    def cancel_scan(self):
-        if self.scan_cancel is not None:
-            self.scan_cancel.set()
-
-    def _scan_worker(self):
-        subnet = default_subnet()
-        if not subnet:
-            self.scan_result_queue.put(("error", "could not determine active subnet"))
-            return
-        self.scan_result_queue.put(("status", "scanning " + subnet))
-        try:
-            devices = scan_subnet(
-                subnet,
-                timeout=0.8,
-                cancel_event=self.scan_cancel,
-                current_ip=self.remote_host_var.get().strip(),
-            )
-        except Exception as exc:
-            self.scan_result_queue.put(("error", str(exc)))
-            return
-        self.scan_result_queue.put(("devices", devices))
-
-    def _flush_scan_queue(self):
-        while not self.scan_result_queue.empty():
-            kind, payload = self.scan_result_queue.get_nowait()
-            if kind == "status":
-                self.scan_status_var.set(payload)
-                if hasattr(self, "scan_progress_var"):
-                    self.scan_progress_var.set(payload)
-            elif kind == "error":
-                self.scan_status_var.set("scan error: " + payload)
-                if hasattr(self, "scan_progress_var"):
-                    self.scan_progress_var.set("error")
-                messagebox.showerror("LAN Scan", payload)
-            elif kind == "devices":
-                self.scan_status_var.set("scan done: " + str(len(payload)) + " device(s)")
-                if hasattr(self, "scan_progress_var"):
-                    self.scan_progress_var.set("done")
-                self._populate_scan_table(payload)
-
-    def _populate_scan_table(self, devices):
-        if not hasattr(self, "scan_tree") or not self.scan_tree.winfo_exists():
-            return
-        self.scan_tree.delete(*self.scan_tree.get_children())
-        for dev in devices:
-            self.scan_tree.insert(
-                "",
-                "end",
-                iid=dev.ip,
-                values=(
-                    dev.ip,
-                    dev.hostname,
-                    dev.mac,
-                    "yes" if dev.reachable else "no",
-                    "open" if dev.ssh_open else "closed",
-                    "*" if dev.current else "",
-                ),
-            )
-
-    def apply_selected_ip(self):
-        self._apply_host_text(self.remote_host_var.get().strip())
-
-    def apply_scan_selection(self):
-        if not hasattr(self, "scan_tree") or not self.scan_tree.winfo_exists():
-            return
-        sel = self.scan_tree.selection()
-        if not sel:
-            messagebox.showinfo("Apply IP", "Select a device row first.")
-            return
-        self._apply_host_text(sel[0])
-
-    def _apply_host_text(self, text):
-        if not is_valid_ipv4(text):
-            messagebox.showerror("Apply IP", "Invalid IPv4 address: " + text)
-            return
-        if self.launch_manager.is_running():
-            messagebox.showwarning(
-                "Apply IP",
-                "A task is running. Stop it before switching the robot address.",
-            )
-            return
-        self.remote_host = text
-        self.launch_manager.remote_host = text
-        self.remote_host_var.set(text)
-        self.ssh_var.set(f"{self.remote_user}@{text}")
-        self.current_health = SystemHealth()
-        self.health_probe.stop()
-        self.health_probe = RemoteHealthProbe(
-            self.remote_user,
-            self.remote_host,
-            interval=2.0,
-            callback=self.health_queue.put,
-        )
-        self.health_probe.start()
-        self.scan_status_var.set("applied " + text)
-        if self.scan_window is not None and self.scan_window.winfo_exists():
-            self.scan_window.destroy()
-            self.scan_window = None
-
-    # ------------------------------------------------------------------
-    # Health cards + topic table
-    # ------------------------------------------------------------------
-    def _flush_health(self):
-        while not self.health_queue.empty():
-            health = self.health_queue.get_nowait()
-            self.current_health = health
-            self._update_health_cards(health)
-
-    def _update_health_cards(self, health):
-        if health.online:
-            self.sys_vars["ssh"].set(
-                f"{self.remote_user}@{self.remote_host} {health.latency_ms}ms"
-            )
-            self.sys_vars["temp"].set(
-                f"{health.temp_c} C" if health.temp_c is not None else "N/A"
-            )
-            cpu = "N/A" if health.cpu_percent is None else f"{health.cpu_percent}%"
-            load = "N/A" if health.load_1m is None else f"{health.load_1m:.2f}"
-            self.sys_vars["cpu"].set(f"{cpu}  load {load}")
-            mem = "N/A" if health.mem_percent is None else f"{health.mem_percent}%"
-            self.sys_vars["mem"].set(mem)
-            self.sys_vars["uptime"].set(
-                _fmt_uptime(health.uptime_s) if health.uptime_s is not None else "N/A"
-            )
-            power = "5V Input: N/A (no ADC)"
-            if health.throttled_flags is not None:
-                uv_now = "Active" if health.throttled_flags & 0x1 else "Normal"
-                uv_seen = "seen" if health.throttled_flags & 0x10000 else "no"
-                power += f"  UV: {uv_now}/{uv_seen}"
-            if health.core_voltage_v is not None:
-                power += f"  Core: {health.core_voltage_v}V"
-            self.sys_vars["power"].set(power)
-        else:
-            self.sys_vars["ssh"].set("SSH: " + health.error_code)
-            if health.temp_c is None:
-                self.sys_vars["temp"].set("N/A (expired)")
-            if health.cpu_percent is None:
-                self.sys_vars["cpu"].set("N/A (expired)")
-            if health.mem_percent is None:
-                self.sys_vars["mem"].set("N/A (expired)")
-            if health.uptime_s is None:
-                self.sys_vars["uptime"].set("N/A (expired)")
-
-    def _update_topic_table(self):
-        if not hasattr(self, "topic_tree") or not self.topic_tree.winfo_exists():
-            return
-        mode = self._current_mode()
-        now = time.time()
-        order = ["/scan", "/odom", "/map", "/amcl_pose",
-                 "/robot_safety_status", "/mission_status_typed"]
-        existing = set(self.topic_tree.get_children())
-        for name in order:
-            tracker = self.topic_trackers.get(name)
-            snap = classify_topic(name, mode, tracker, now=now)
-            values = (snap.publishers, _fmt_rate(snap.rate_hz),
-                      _fmt_age(snap.age_s), snap.summary, snap.state)
-            if name in existing:
-                self.topic_tree.item(name, values=values, tags=(snap.state,))
+                payload = q.get_nowait()
+            except queue.Empty:
+                break
+            if channel == "safety":
+                signal.emit(*payload)
             else:
-                self.topic_tree.insert(
-                    "", "end", iid=name, text=name, values=values, tags=(snap.state,)
-                )
+                signal.emit(payload)
 
-    def _current_mode(self):
-        active = self.launch_manager.active_name
-        if active in ("mapping", "navigation"):
-            return active
-        return "idle"
 
-    def _build_drive_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Manual Drive", style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(18, 0))
+# ---------------------------------------------------------------------
+# Panels
+# ---------------------------------------------------------------------
+def build_map_image(map_msg):
+    """Render an OccupancyGrid into a QImage (Grayscale8)."""
+    width = map_msg.info.width
+    height = map_msg.info.height
+    pixels = bytearray(width * height)
+    for index, value in enumerate(map_msg.data):
+        if value < 0:
+            gray = 128  # unknown
+        else:
+            occupancy = max(0, min(100, int(value)))
+            gray = 255 - round(occupancy * 255 / 100)
+        pixels[index] = gray
+    # copy() detaches the QImage from the temporary Python byte buffer.
+    return QtGui.QImage(
+        bytes(pixels), width, height, width, QtGui.QImage.Format_Grayscale8
+    ).copy()
 
-        tk.Label(
-            frame,
-            text="Keyboard: W/A/S/D or Arrow Keys, Space to stop",
-            bg="#ebe6dc",
-            font=("Helvetica", 10),
-        ).pack(anchor="w", padx=12, pady=(12, 4))
 
-        pad = tk.Frame(frame, bg="#ebe6dc")
-        pad.pack(fill=tk.X, padx=14, pady=(4, 2))
 
-        self._make_hold_drive_button(pad, "←", 0, 0, 0.0, self.manual_angular, sticky="ew")
-        self._make_hold_drive_button(pad, "↑", 0, 1, self.manual_linear, 0.0, sticky="ew")
-        ttk.Button(
-            pad,
-            text="STOP",
-            width=6,
-            style="Danger.TButton",
-            command=self.stop_robot,
-        ).grid(row=0, column=2, padx=5, pady=4, sticky="ew")
-        self._make_hold_drive_button(pad, "↓", 0, 3, -self.manual_linear, 0.0, sticky="ew")
-        self._make_hold_drive_button(pad, "→", 0, 4, 0.0, -self.manual_angular, sticky="ew")
-        for column in range(5):
-            pad.grid_columnconfigure(column, weight=1)
+class MissionControlPanel(QtWidgets.QWidget):
+    ip_applied = QtCore.Signal(str)
+    map_query_finished = QtCore.Signal(list, str)
 
-        extra = tk.Frame(frame, bg="#ebe6dc")
-        extra.pack(fill=tk.X, padx=12, pady=(0, 12))
-        self._make_hold_drive_button(
-            extra,
-            "Forward Left",
-            0,
-            0,
-            self.manual_linear,
-            self.manual_angular * 0.5,
-            sticky="ew",
-            padx=(0, 8),
-            width=None,
+    def __init__(self, launch_manager=None, bridge=None, adapter=None,
+                 map_path=None, parent=None):
+        super().__init__(parent)
+        style_as_card(self, 215)
+        self.launch_manager = launch_manager
+        self.bridge = bridge
+        self.adapter = adapter
+        self.remote_user = getattr(launch_manager, "remote_user", None) or "yy"
+        self.remote_host = (
+            getattr(launch_manager, "remote_host", None) or "192.168.43.31"
         )
-        self._make_hold_drive_button(
-            extra,
-            "Forward Right",
-            0,
-            1,
-            self.manual_linear,
-            -self.manual_angular * 0.5,
-            sticky="ew",
-            padx=(8, 0),
-            width=None,
+        self.map_path = map_path or "/home/yy/ros2_ws/map_name.yaml"
+
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel("任务与运行控制")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+
+        # SSH address row
+        ssh_row = QtWidgets.QHBoxLayout()
+        ssh_row.addWidget(QtWidgets.QLabel("SSH"))
+        self.user_edit = QtWidgets.QLineEdit(self.remote_user)
+        self.user_edit.setMaximumWidth(90)
+        ssh_row.addWidget(self.user_edit)
+        ssh_row.addWidget(QtWidgets.QLabel("@"))
+        self.host_edit = QtWidgets.QLineEdit(self.remote_host)
+        ssh_row.addWidget(self.host_edit, 1)
+        layout.addLayout(ssh_row)
+
+        # scan row
+        scan_row = QtWidgets.QHBoxLayout()
+        self.scan_btn = QtWidgets.QPushButton("扫描局域网")
+        self.refresh_btn = QtWidgets.QPushButton("刷新")
+        self.apply_btn = QtWidgets.QPushButton("应用地址")
+        self.scan_status = QtWidgets.QLabel("")
+        for btn in (self.scan_btn, self.refresh_btn, self.apply_btn):
+            scan_row.addWidget(btn)
+        scan_row.addWidget(self.scan_status, 1)
+        layout.addLayout(scan_row)
+        self.scan_btn.clicked.connect(self._on_scan)
+        self.refresh_btn.clicked.connect(self._on_scan)
+        self.apply_btn.clicked.connect(self._apply_ip)
+
+        # map yaml row
+        map_row = QtWidgets.QHBoxLayout()
+        map_row.addWidget(QtWidgets.QLabel("地图文件"))
+        self.map_combo = QtWidgets.QComboBox()
+        self.map_combo.setEditable(True)
+        self.map_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.map_combo.setCurrentText(self.map_path)
+        # Compatibility for callers/tests that used the old QLineEdit.
+        self.map_edit = self.map_combo.lineEdit()
+        self.map_refresh_btn = QtWidgets.QPushButton("刷新地图")
+        self.map_refresh_status = QtWidgets.QLabel("")
+        map_row.addWidget(self.map_combo, 1)
+        map_row.addWidget(self.map_refresh_btn)
+        layout.addLayout(map_row)
+        self.map_refresh_status.setWordWrap(True)
+        self.map_refresh_status.setAlignment(
+            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
         )
-        extra.grid_columnconfigure(0, weight=1)
-        extra.grid_columnconfigure(1, weight=1)
+        layout.addWidget(self.map_refresh_status)
+        self.map_combo.activated.connect(self._on_map_selected)
+        self.map_refresh_btn.clicked.connect(self.refresh_maps)
+        self.map_query_finished.connect(self._on_maps_refreshed)
 
-    def _make_hold_drive_button(
-        self,
-        parent,
-        text,
-        row,
-        column,
-        linear_x,
-        angular_z,
-        *,
-        sticky="",
-        padx=5,
-        width=4,
-    ):
-        options = {"text": text, "style": "Drive.TButton"}
-        if width is not None:
-            options["width"] = width
-        button = ttk.Button(parent, **options)
-        button.grid(row=row, column=column, padx=padx, pady=4, sticky=sticky)
-        button.bind(
-            "<ButtonPress-1>",
-            lambda _event: self._begin_manual_cmd(linear_x, angular_z),
-        )
-        button.bind("<ButtonRelease-1>", lambda _event: self.stop_robot())
-        button.bind("<Leave>", lambda _event: self.stop_robot())
-        return button
+        # action buttons
+        actions = QtWidgets.QHBoxLayout()
+        self.start_mapping_btn = QtWidgets.QPushButton("启动建图")
+        self.start_navigation_btn = QtWidgets.QPushButton("启动导航")
+        self.save_map_btn = QtWidgets.QPushButton("保存地图")
+        self.reset_safety_btn = QtWidgets.QPushButton("复位安全状态")
+        self.stop_btn = QtWidgets.QPushButton("停止当前模式")
+        self.start_mapping_btn.setObjectName("primary")
+        self.start_navigation_btn.setObjectName("primary")
+        self.stop_btn.setObjectName("danger")
+        for btn in (self.start_mapping_btn, self.start_navigation_btn,
+                    self.save_map_btn, self.reset_safety_btn):
+            actions.addWidget(btn)
+        actions.addStretch(1)
+        actions.addWidget(self.stop_btn)
+        layout.addLayout(actions)
 
-    def _bind_keys(self):
-        bindings = {
-            "Up": (self.manual_linear, 0.0),
-            "Down": (-self.manual_linear, 0.0),
-            "Left": (0.0, self.manual_angular),
-            "Right": (0.0, -self.manual_angular),
-            "w": (self.manual_linear, 0.0),
-            "s": (-self.manual_linear, 0.0),
-            "a": (0.0, self.manual_angular),
-            "d": (0.0, -self.manual_angular),
-        }
-        for key, command in bindings.items():
-            linear_x, angular_z = command
-            self.root.bind(
-                f"<KeyPress-{key}>",
-                lambda _event, linear=linear_x, angular=angular_z: self._begin_manual_cmd(
-                    linear, angular
-                ),
-            )
-            self.root.bind(f"<KeyRelease-{key}>", lambda _event: self.stop_robot())
-        self.root.bind("<KeyPress-space>", lambda _event: self.stop_robot())
+        self.start_mapping_btn.clicked.connect(lambda: self._start("mapping", MAPPING_CMD))
+        self.start_navigation_btn.clicked.connect(self._start_navigation)
+        self.save_map_btn.clicked.connect(self._save_map)
+        self.reset_safety_btn.clicked.connect(self._reset_safety)
+        self.stop_btn.clicked.connect(self._stop)
+        QtCore.QTimer.singleShot(0, self.refresh_maps)
 
-    def start_mapping(self):
-        self._apply_workspace()
-        self.log_queue.put("[INFO] Start mapping. Make sure navigation is not running at the same time.")
-        self.launch_manager.start("mapping", "ros2 launch mapping_bringup mapping.launch.py")
+    # ------------------------------------------------------------------
+    def _start(self, name, command):
+        if self.launch_manager is None:
+            self._log("[运行] 启动管理器未连接")
+            return
+        if self.launch_manager.start(name, command):
+            self._log(f"[RUN] {name}: {command}")
 
-    def start_navigation(self):
-        self._apply_workspace()
-        map_path = self.map_var.get().strip()
+    def _start_navigation(self):
+        map_path = self.map_edit.text().strip()
         if not map_path:
-            messagebox.showerror("Missing Map", "Map YAML path is required.")
+            self._log("[导航] 请先选择地图 YAML 文件")
             return
-        self.log_queue.put("[INFO] Start navigation. Stop mapping first to avoid TF conflicts between slam_toolbox and AMCL.")
-        self.launch_manager.start(
-            "navigation",
-            f"ros2 launch mapping_bringup navigation.launch.py map:={map_path}",
-        )
+        command = f"{NAVIGATION_CMD} map:={shlex.quote(map_path)}"
+        self._start("navigation", command)
 
-    def save_map(self):
-        self._apply_workspace()
-        prefix = os.path.splitext(self.map_var.get().strip())[0]
+    def _stop(self):
+        if self.launch_manager is not None:
+            self.launch_manager.stop()
+            self._log("[STOP] remote tasks")
+
+    def _save_map(self):
+        if self.launch_manager is None:
+            self._log("[地图] 启动管理器未连接")
+            return
+        prefix = self.map_edit.text().strip()
         if not prefix:
-            messagebox.showerror("Missing Map", "Map path is required.")
+            self._log("[地图] 请先填写地图保存路径")
             return
-        self.launch_manager.run_once("save_map", f"ros2 run nav2_map_server map_saver_cli -f {prefix}")
+        prefix = os.path.splitext(prefix)[0]
+        self.launch_manager.run_once(
+            "save_map",
+            f"ros2 run nav2_map_server map_saver_cli -f {shlex.quote(prefix)}",
+        )
+        self._log(f"[MAP] save map -> {prefix}")
 
-    def stop_launch(self):
-        self.launch_manager.stop()
+    def _reset_safety(self):
+        from std_srvs.srv import Trigger
 
-    def drive_forward(self):
-        self._begin_manual_cmd(self.manual_linear, 0.0)
-
-    def drive_backward(self):
-        self._begin_manual_cmd(-self.manual_linear, 0.0)
-
-    def turn_left(self):
-        self._begin_manual_cmd(0.0, self.manual_angular)
-
-    def turn_right(self):
-        self._begin_manual_cmd(0.0, -self.manual_angular)
-
-    def forward_left(self):
-        self._begin_manual_cmd(self.manual_linear, self.manual_angular * 0.5)
-
-    def forward_right(self):
-        self._begin_manual_cmd(self.manual_linear, -self.manual_angular * 0.5)
-
-    def stop_robot(self):
-        self.manual_request_id += 1
-        self.manual_command = None
-        if self.manual_after_id is not None:
-            try:
-                self.root.after_cancel(self.manual_after_id)
-            except tk.TclError:
-                pass
-            self.manual_after_id = None
-        self.ros.publish_cmd_vel(0.0, 0.0)
-
-    def _begin_manual_cmd(self, linear_x, angular_z):
-        requested = (float(linear_x), float(angular_z))
-        if self.manual_command == requested:
+        if self.adapter is None:
+            self._log("[安全] ROS 适配器未连接")
             return
-        self.stop_robot()
-        self.manual_command = requested
-        self.manual_request_id += 1
-        request_id = self.manual_request_id
         request = Trigger.Request()
-
-        def done(result, error):
-            def finish():
-                if request_id != self.manual_request_id or self.manual_command != requested:
-                    return
-                if error is not None or result is None or not result.success:
-                    detail = error or (result.message if result is not None else "unknown error")
-                    self.log_queue.put(f"[MANUAL] autonomous abort failed; command blocked: {detail}")
-                    self.manual_command = None
-                    return
-                self._publish_manual_cmd()
-            self.root.after(0, finish)
-
-        self.ros.call_service_async(
-            self.ros.abort_mission_client, request, done, timeout_sec=2.0
+        self.adapter.call_service_async(
+            self.adapter.reset_safety_client, request,
+            lambda result, error: self._log(
+                f"[SAFETY] reset: {result.message if result else error}"
+            ),
         )
+        self._log("[SAFETY] reset requested")
 
-    def _publish_manual_cmd(self):
-        self.manual_after_id = None
-        if self.manual_command is None or self.closing:
+    def _apply_ip(self):
+        text = self.host_edit.text().strip()
+        if not is_valid_ipv4(text):
+            message = f"IPv4 地址无效：{text or '空'}"
+            self.scan_status.setText(message)
+            self._log(f"[NET] {message}")
             return
-        self.ros.publish_cmd_vel(*self.manual_command)
-        self.manual_after_id = self.root.after(100, self._publish_manual_cmd)
+        if self.launch_manager is not None:
+            running = getattr(self.launch_manager, "is_running", None)
+            thermal_running = getattr(self.launch_manager, "is_thermal_running", None)
+            if ((callable(running) and running()) or
+                    (callable(thermal_running) and thermal_running())):
+                message = "切换机器人地址前请先停止当前任务"
+                self.scan_status.setText(message)
+                self._log(f"[NET] {message}")
+                return
+        user = self.user_edit.text().strip() or self.remote_user
+        if self.launch_manager is not None:
+            self.launch_manager.remote_host = text
+            self.launch_manager.remote_user = user
+        self.remote_user = user
+        self.remote_host = text
+        self.user_edit.setText(user)
+        self.host_edit.setText(text)
+        self.scan_status.setText(f"已应用 {user}@{text}")
+        self._log(f"[网络] 已应用机器人地址 {text}")
+        self.ip_applied.emit(text)
+        self.refresh_maps()
 
-    def start_thermal(self):
-        self._apply_workspace()
-        self.log_queue.put("[INFO] Start thermal and gas sensor nodes.")
-        self.launch_manager.start_thermal()
+    def _map_directory(self):
+        path = self.map_edit.text().strip() or self.map_path
+        return os.path.dirname(path) or getattr(
+            self.launch_manager, "workspace_path", "/home/yy/ros2_ws"
+        )
 
-    def stop_thermal(self):
-        self.launch_manager.stop_thermal()
-
-    def open_thermal_window(self):
-        if self.thermal_window is not None and self.thermal_window.winfo_exists():
-            self.thermal_window.lift()
-            self._draw_thermal_view()
+    def refresh_maps(self):
+        query = getattr(self.launch_manager, "query_map_files", None)
+        if not callable(query):
+            self.map_refresh_status.setText("地图查询不可用")
             return
+        self.map_refresh_btn.setEnabled(False)
+        self.map_refresh_status.setText("正在刷新…")
+        directory = self._map_directory()
+        query(
+            directory,
+            lambda paths, error: self.map_query_finished.emit(paths, error),
+        )
 
-        self.thermal_window = tk.Toplevel(self.root)
-        self.thermal_window.title("Thermal Camera Detail")
-        self.thermal_window.geometry("900x620")
-        self.thermal_window.configure(bg="#ebe6dc")
-        self.thermal_window.protocol("WM_DELETE_WINDOW", self._close_thermal_window)
-
-        frame = ttk.LabelFrame(self.thermal_window, text="Thermal Detail", style="Card.TLabelframe")
-        frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
-        self.thermal_popup_fig, self.thermal_popup_ax = plt.subplots(figsize=(8.4, 5.0), dpi=100)
-        self.thermal_popup_canvas = FigureCanvasTkAgg(self.thermal_popup_fig, frame)
-        self.thermal_popup_canvas.draw()
-        self.thermal_popup_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        self._draw_thermal_view()
-
-    def _close_thermal_window(self):
-        if self.thermal_popup_fig is not None:
-            plt.close(self.thermal_popup_fig)
-        self.thermal_window.destroy()
-        self.thermal_window = None
-        self.thermal_popup_fig = None
-        self.thermal_popup_ax = None
-        self.thermal_popup_canvas = None
-        self.thermal_popup_cbar = None
-
-    def save_thermal_snapshot(self):
-        if not self.ros.thermal_frame:
-            messagebox.showinfo("Thermal Snapshot", "No thermal data available yet.")
+    def _on_maps_refreshed(self, paths, error):
+        self.map_refresh_btn.setEnabled(True)
+        if error:
+            self.map_refresh_status.setText(error)
+            self._log(f"[地图] {error}")
             return
+        current = self.map_edit.text().strip()
+        self.map_combo.blockSignals(True)
+        self.map_combo.clear()
+        for path in paths:
+            self.map_combo.addItem(os.path.basename(path), path)
+        self.map_combo.setEditText(current)
+        self.map_combo.blockSignals(False)
+        if paths:
+            self.map_refresh_status.setText(f"已找到 {len(paths)} 个")
+        else:
+            self.map_refresh_status.setText("目录中没有地图 YAML")
 
-        output_dir = os.path.join(os.path.expanduser("~"), "Pictures", "thermal_snapshots")
-        os.makedirs(output_dir, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(output_dir, f"thermal_{timestamp}.png")
-        self.thermal_fig.savefig(output_path, dpi=180, bbox_inches="tight")
-        self.log_queue.put(f"[THERMAL] snapshot saved: {output_path}")
-        messagebox.showinfo("Thermal Snapshot", f"Saved to:\n{output_path}")
+    def _on_map_selected(self, index):
+        path = self.map_combo.itemData(index)
+        if path:
+            self.map_combo.setEditText(path)
 
-    def clear_rviz_points(self):
-        request = Trigger.Request()
+    def _on_scan(self):
+        dialog = LanScanDialog(self)
+        dialog.ip_applied.connect(self._apply_ip_text)
+        dialog.exec_()
 
-        def done(result, error):
-            self.root.after(0, lambda: self._handle_clear_rviz_points_result(result, error))
+    def _apply_ip_text(self, text):
+        self.host_edit.setText(text)
+        self._apply_ip()
 
-        self.log_queue.put("[MISSION] clearing RViz-picked mission points on robot")
-        self.ros.call_service_async(self.ros.clear_rviz_points_client, request, done)
+    def _log(self, line):
+        if self.bridge is not None:
+            self.bridge.put_log(line)
 
-    def set_region_mode(self):
-        request = SetBool.Request()
-        request.data = bool(self.region_mode_var.get())
 
-        def done(result, error):
-            self.root.after(0, lambda: self._handle_region_mode_result(result, error))
+class LocalizationPanel(QtWidgets.QWidget):
+    def __init__(self, adapter=None, parent=None):
+        super().__init__(parent)
+        style_as_card(self, 125)
+        self.adapter = adapter
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel("定位与初始位姿")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
 
-        mode = "enabled" if request.data else "disabled"
-        self.log_queue.put(f"[MISSION] region mode {mode}")
-        self.ros.call_service_async(self.ros.set_region_mode_client, request, done)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("X"))
+        self.x_edit = QtWidgets.QLineEdit("0.0")
+        row.addWidget(self.x_edit)
+        row.addWidget(QtWidgets.QLabel("Y"))
+        self.y_edit = QtWidgets.QLineEdit("0.0")
+        row.addWidget(self.y_edit)
+        row.addWidget(QtWidgets.QLabel("航向角 (°)"))
+        self.yaw_edit = QtWidgets.QLineEdit("0.0")
+        row.addWidget(self.yaw_edit)
+        self.set_btn = QtWidgets.QPushButton("设置初始位姿")
+        row.addWidget(self.set_btn)
+        layout.addLayout(row)
+        self.status = QtWidgets.QLabel("AMCL：请先启动导航，再设置初始位姿")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
 
-    def set_tsp_mode(self):
-        request = SetBool.Request()
-        request.data = bool(self.tsp_mode_var.get())
-
-        def done(result, error):
-            self.root.after(0, lambda: self._handle_tsp_mode_result(result, error))
-
-        mode = "enabled" if request.data else "disabled"
-        self.log_queue.put(f"[MISSION] TSP mode {mode}")
-        self.ros.call_service_async(
-            self.ros.set_tsp_mode_client, request, done, timeout_sec=2.0
-        )
-
-    def save_regions(self):
-        self._call_region_trigger(
-            self.ros.save_inspection_regions_client,
-            "Save Regions",
-            "[MISSION] saving inspection regions on robot",
-        )
-
-    def load_regions(self):
-        self._call_region_trigger(
-            self.ros.load_inspection_regions_client,
-            "Load Regions",
-            "[MISSION] loading inspection regions on robot",
-        )
-
-    def clear_regions(self):
-        self._call_region_trigger(
-            self.ros.clear_inspection_regions_client,
-            "Clear Regions",
-            "[MISSION] clearing inspection regions on robot",
-        )
-
-    def undo_rviz_point(self):
-        self._call_region_trigger(
-            self.ros.undo_rviz_point_client,
-            "Undo Point",
-            "[MISSION] undoing last RViz point",
-        )
-
-    def undo_region(self):
-        self._call_region_trigger(
-            self.ros.undo_region_client,
-            "Undo Region",
-            "[MISSION] undoing last inspection region",
-        )
-
-    def stop_mission(self):
-        self._call_region_trigger(
-            self.ros.abort_mission_client,
-            "Stop Mission",
-            "[MISSION] abort requested",
-        )
-
-    def set_software_estop(self):
-        request = SetBool.Request()
-        request.data = bool(self.software_estop_var.get())
-
-        def done(result, error):
-            self.root.after(
-                0,
-                lambda: self._handle_software_estop_result(result, error, request.data),
-            )
-
-        if request.data:
-            self.ros.publish_cmd_vel(0.0, 0.0)
-        self.log_queue.put(
-            "[SAFETY] software emergency stop latch requested"
-            if request.data
-            else "[SAFETY] software emergency stop release requested"
-        )
-        self.ros.call_service_async(self.ros.software_estop_client, request, done)
-
-    def _call_region_trigger(self, client, title, log_message):
-        request = Trigger.Request()
-
-        def done(result, error):
-            self.root.after(
-                0,
-                lambda: self._handle_region_trigger_result(title, result, error),
-            )
-
-        self.log_queue.put(log_message)
-        self.ros.call_service_async(client, request, done)
-
-    def check_localization(self):
-        request = Localize.Request()
-
-        def done(result, error):
-            self.root.after(0, lambda: self._handle_localize_result(result, error))
-
-        self.log_queue.put("[MISSION] querying localization status")
-        self.ros.call_service_async(self.ros.localize_client, request, done)
+        self.set_btn.clicked.connect(self.set_initial_pose)
 
     def set_initial_pose(self):
-        if self.ros.initial_pose_subscription_count() < 1:
-            message = "AMCL is not subscribed to /initialpose. Start navigation first."
-            self.initial_pose_status_var.set(f"AMCL: {message}")
-            self.log_queue.put(f"[LOCALIZATION] {message}")
-            messagebox.showwarning("Set Initial Pose", message)
-            return
-
-        self._cancel_initial_pose_retry()
         try:
-            x = max(-20.0, min(20.0, float(self.initial_x_var.get())))
-            y = max(-20.0, min(20.0, float(self.initial_y_var.get())))
-            yaw_deg = max(-180.0, min(180.0, float(self.initial_yaw_deg_var.get())))
-        except (tk.TclError, TypeError, ValueError):
-            messagebox.showerror("Set Initial Pose", "Initial pose values are invalid.")
+            x = float(self.x_edit.text())
+            y = float(self.y_edit.text())
+            yaw_degrees = float(self.yaw_edit.text())
+        except ValueError:
+            self.status.setText("输入无效：X、Y 和航向角必须为数字")
             return
-
-        self.initial_x_var.set(x)
-        self.initial_y_var.set(y)
-        self.initial_yaw_deg_var.set(yaw_deg)
-        self.pending_initial_pose = (x, y, math.radians(yaw_deg))
-        self.initial_pose_retry.begin(time.time())
-        self._publish_initial_pose_attempt()
-        self._schedule_initial_pose_retry()
-
-    def _publish_initial_pose_attempt(self):
-        if not self.initial_pose_retry.record_publish():
-            return
-        x, y, yaw = self.pending_initial_pose
-        self.ros.publish_initial_pose(x, y, yaw)
-        attempt = self.initial_pose_retry.attempts
-        total = self.initial_pose_retry.max_attempts
-        message = (
-            f"Initial pose sent ({attempt}/{total}): "
-            f"x={x:.2f}, y={y:.2f}, yaw={math.degrees(yaw):.1f}deg"
-        )
-        self.initial_pose_status_var.set(f"AMCL: waiting for confirmation, attempt {attempt}/{total}")
-        self.log_queue.put(f"[LOCALIZATION] {message}")
-
-    def _schedule_initial_pose_retry(self):
-        self.initial_pose_after_id = self.root.after(1000, self._initial_pose_retry_tick)
-
-    def _initial_pose_retry_tick(self):
-        self.initial_pose_after_id = None
-        result = self.initial_pose_retry.evaluate(self.ros.last_amcl_stamp)
-        if result == InitialPoseRetryState.CONFIRMED:
-            message = (
-                f"AMCL confirmed: x={self.ros.amcl_x:.2f}, y={self.ros.amcl_y:.2f}, "
-                f"yaw={math.degrees(self.ros.amcl_yaw):.1f}deg"
+        if self.adapter is not None:
+            self.adapter.publish_initial_pose(x, y, math.radians(yaw_degrees))
+            self.status.setText(
+                f"AMCL: x={x:.2f}, y={y:.2f}, yaw={yaw_degrees:.1f}deg"
             )
-            self.initial_pose_status_var.set(message)
-            self.log_queue.put(f"[LOCALIZATION] {message}")
-            return
-        if result == InitialPoseRetryState.TIMED_OUT:
-            message = "AMCL did not confirm the initial pose after 8 attempts."
-            self.initial_pose_status_var.set(f"AMCL: {message}")
-            self.log_queue.put(f"[LOCALIZATION] {message}")
-            messagebox.showwarning("Set Initial Pose", message)
-            return
-        if result == InitialPoseRetryState.RETRY:
-            self._publish_initial_pose_attempt()
-            self._schedule_initial_pose_retry()
 
-    def _cancel_initial_pose_retry(self):
-        self.initial_pose_retry.cancel()
-        if self.initial_pose_after_id is not None:
-            try:
-                self.root.after_cancel(self.initial_pose_after_id)
-            except tk.TclError:
-                pass
-            self.initial_pose_after_id = None
 
-    def start_mission(self):
-        if self.ros.safety_level == "FAULT":
-            messagebox.showerror(
-                "Start Mission",
-                f"Safety fault is latched: {self.ros.safety_message}\n\nReset Safety before starting a new mission.",
+class MissionPanel(QtWidgets.QWidget):
+    def __init__(self, bridge=None, adapter=None, launch_manager=None, parent=None):
+        super().__init__(parent)
+        style_as_card(self, 285)
+        self.bridge = bridge
+        self.adapter = adapter
+        self.launch_manager = launch_manager
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel("巡检任务")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+
+        self.tsp_check = QtWidgets.QCheckBox("TSP 路径顺序优化")
+        self.tsp_check.setChecked(True)
+        self.return_check = QtWidgets.QCheckBox("任务完成后返回起点")
+        self.return_check.setChecked(False)
+        layout.addWidget(self.tsp_check)
+        layout.addWidget(self.return_check)
+
+        pause_row = QtWidgets.QHBoxLayout()
+        pause_row.addWidget(QtWidgets.QLabel("点位停留时间（秒）"))
+        self.pause_edit = QtWidgets.QLineEdit("2.0")
+        pause_row.addWidget(self.pause_edit)
+        layout.addLayout(pause_row)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.start_btn = QtWidgets.QPushButton("开始任务")
+        self.start_btn.setObjectName("primary")
+        self.stop_btn = QtWidgets.QPushButton("停止全部任务")
+        self.stop_btn.setObjectName("danger")
+        actions.addWidget(self.start_btn)
+        actions.addWidget(self.stop_btn)
+        layout.addLayout(actions)
+
+        tools = QtWidgets.QHBoxLayout()
+        self.clear_points_btn = QtWidgets.QPushButton("清除 RViz 点位")
+        self.region_mode_check = QtWidgets.QCheckBox("区域巡检模式")
+        tools.addWidget(self.clear_points_btn)
+        tools.addWidget(self.region_mode_check)
+        layout.addLayout(tools)
+
+        regions = QtWidgets.QHBoxLayout()
+        self.save_regions_btn = QtWidgets.QPushButton("保存区域")
+        self.load_regions_btn = QtWidgets.QPushButton("加载区域")
+        self.clear_regions_btn = QtWidgets.QPushButton("清除区域")
+        for btn in (self.save_regions_btn, self.load_regions_btn, self.clear_regions_btn):
+            regions.addWidget(btn)
+        layout.addLayout(regions)
+
+        undo_row = QtWidgets.QHBoxLayout()
+        self.undo_region_btn = QtWidgets.QPushButton("撤销区域")
+        self.undo_point_btn = QtWidgets.QPushButton("撤销点位")
+        undo_row.addWidget(self.undo_region_btn)
+        undo_row.addWidget(self.undo_point_btn)
+        undo_row.addStretch(1)
+        layout.addLayout(undo_row)
+
+        self.start_btn.clicked.connect(self._start_mission)
+        self.stop_btn.clicked.connect(self._stop_tasks)
+        self.clear_points_btn.clicked.connect(self._clear_points)
+        self.region_mode_check.toggled.connect(self._set_region_mode)
+        self.save_regions_btn.clicked.connect(lambda: self._service_call("save_regions"))
+        self.load_regions_btn.clicked.connect(lambda: self._service_call("load_regions"))
+        self.clear_regions_btn.clicked.connect(lambda: self._service_call("clear_regions"))
+        self.undo_region_btn.clicked.connect(lambda: self._service_call("undo_region"))
+        self.undo_point_btn.clicked.connect(lambda: self._service_call("undo_point"))
+    def _start_mission(self):
+        if self.adapter is None:
+            self._log("[任务] ROS 适配器未连接")
+            return
+        safety_level = getattr(self.adapter, "safety_level", None)
+        if safety_level == "FAULT":
+            self._log(
+                f"[任务] 存在已锁定的安全故障："
+                f"{getattr(self.adapter, 'safety_message', '')}"
             )
             return
+        from robot_monitor_interfaces.srv import StartNavigation
 
         request = StartNavigation.Request()
         try:
             request.waypoint_pause_sec = max(
-                0.0, min(60.0, float(self.waypoint_pause_var.get()))
+                0.0, min(60.0, float(self.pause_edit.text()))
             )
-        except (tk.TclError, TypeError, ValueError):
+        except (TypeError, ValueError):
             request.waypoint_pause_sec = 2.0
-            self.waypoint_pause_var.set(2.0)
-        request.use_tsp = bool(self.tsp_mode_var.get())
-        request.return_to_start = bool(self.return_to_start_var.get())
-        if self.region_mode_var.get():
-            self.log_queue.put("[MISSION] sending region inspection mission")
-        else:
-            self.log_queue.put("[MISSION] sending mission using RViz-picked points")
-
-        def done(result, error):
-            self.root.after(0, lambda: self._handle_start_mission_result(result, error))
-
-        self.ros.call_service_async(self.ros.start_navigation_client, request, done, timeout_sec=10.0)
-
-    def reset_safety(self):
-        request = Trigger.Request()
-
-        def done(result, error):
-            self.root.after(0, lambda: self._handle_reset_safety_result(result, error))
-
-        self.log_queue.put("[SAFETY] reset requested")
-        self.ros.call_service_async(self.ros.reset_safety_client, request, done)
-
-    def _apply_workspace(self):
-        self.launch_manager.workspace_path = self.workspace_var.get().strip() or self.workspace_path
-        self.launch_manager.remote_user = self.remote_user_var.get().strip() or self.remote_user
-        self.launch_manager.remote_host = self.remote_host_var.get().strip() or self.remote_host
-
-    def _handle_localize_result(self, result, error):
-        if error is not None:
-            self.log_queue.put(f"[ERROR] localization check failed: {error}")
-            messagebox.showerror("Localization", error)
-            return
-        self.log_queue.put(f"[MISSION] {result.message}")
-        if result.success:
-            messagebox.showinfo("Localization", result.message)
-        else:
-            messagebox.showwarning("Localization", result.message)
-
-    def _handle_clear_rviz_points_result(self, result, error):
-        if error is not None:
-            self.log_queue.put(f"[ERROR] clear RViz points failed: {error}")
-            messagebox.showerror("Clear RViz Points", error)
-            return
-        self.log_queue.put(f"[MISSION] {result.message}")
-        if result.success:
-            messagebox.showinfo("Clear RViz Points", result.message)
-        else:
-            messagebox.showwarning("Clear RViz Points", result.message)
-
-    def _handle_region_mode_result(self, result, error):
-        if error is not None:
-            self.region_mode_var.set(not self.region_mode_var.get())
-            self.log_queue.put(f"[ERROR] set region mode failed: {error}")
-            messagebox.showerror("Region Mode", error)
-            return
-        self.log_queue.put(f"[MISSION] {result.message}")
-        self.mission_var.set(
-            "mission: region mode" if self.region_mode_var.get() else "mission: RViz point mode"
+            self.pause_edit.setText("2.0")
+        request.use_tsp = bool(self.tsp_check.isChecked())
+        request.return_to_start = bool(self.return_check.isChecked())
+        self._log(
+            f"[任务] 正在发送（TSP={request.use_tsp}，"
+            f"返航={request.return_to_start}，停留={request.waypoint_pause_sec}s）"
         )
-        if not result.success:
-            self.region_mode_var.set(not self.region_mode_var.get())
-            messagebox.showwarning("Region Mode", result.message)
-
-    def _handle_tsp_mode_result(self, result, error):
-        if error is not None:
-            self.log_queue.put(
-                f"[WARN] TSP preview sync unavailable: {error}; start request will apply the selected mode"
-            )
-            return
-        self.log_queue.put(f"[MISSION] {result.message}")
-        if not result.success:
-            self.log_queue.put(
-                "[WARN] TSP preview was not changed now; the next start request remains authoritative"
-            )
-
-    def _handle_region_trigger_result(self, title, result, error):
-        if error is not None:
-            self.log_queue.put(f"[ERROR] {title.lower()} failed: {error}")
-            messagebox.showerror(title, error)
-            return
-        self.log_queue.put(f"[MISSION] {result.message}")
-        if result.success:
-            messagebox.showinfo(title, result.message)
-        else:
-            messagebox.showwarning(title, result.message)
-
-    def _handle_reset_safety_result(self, result, error):
-        if error is not None:
-            self.log_queue.put(f"[ERROR] reset safety failed: {error}")
-            messagebox.showerror("Reset Safety", error)
-            return
-        self.log_queue.put(f"[SAFETY] {result.message}")
-        if result.success:
-            messagebox.showinfo("Reset Safety", result.message)
-        else:
-            messagebox.showwarning("Reset Safety", result.message)
-
-    def _handle_software_estop_result(self, result, error, requested_state):
-        if error is not None or result is None or not result.success:
-            self.software_estop_var.set(not requested_state)
-            detail = error or (result.message if result is not None else "unknown error")
-            self.log_queue.put(f"[ERROR] software emergency stop update failed: {detail}")
-            messagebox.showerror("Software E-Stop", detail)
-            return
-        self.log_queue.put(f"[SAFETY] {result.message}")
-
-    def _handle_start_mission_result(self, result, error):
-        if error is not None:
-            self.log_queue.put(f"[ERROR] mission start failed: {error}")
-            messagebox.showerror("Start Mission", error)
-            return
-        self.log_queue.put(f"[MISSION] {result.message}")
-        if result.success:
-            messagebox.showinfo("Start Mission", result.message)
-        else:
-            messagebox.showwarning("Start Mission", result.message)
-
-    def _schedule_update(self):
-        self._flush_logs()
-        self._flush_health()
-        self._flush_scan_queue()
-        self._handle_safety_alert()
-        self._refresh_status()
-        self.root.after(200, self._schedule_update)
-
-    def _flush_logs(self):
-        while not self.log_queue.empty():
-            line = self.log_queue.get_nowait()
-            self.log_text.insert(tk.END, line + "\n")
-            self.log_text.see(tk.END)
-
-    def _handle_safety_alert(self):
-        if self.ros.pending_safety_alert is None:
-            return
-        level, code, message = self.ros.pending_safety_alert
-        self.ros.pending_safety_alert = None
-        self.log_queue.put(f"[SAFETY] {code}: {message}")
-        if level == "FAULT":
-            messagebox.showerror("Safety Fault", message)
-        elif level == "WARN":
-            messagebox.showwarning("Safety Warning", message)
-
-    def _refresh_status(self):
-        now = time.time()
-        self.pose_var.set(
-            f"x={self.ros.robot_x:.2f}  y={self.ros.robot_y:.2f}  yaw={math.degrees(self.ros.robot_yaw):.1f}deg"
+        self.adapter.call_service_async(
+            self.adapter.start_navigation_client, request,
+            lambda result, error: self._log(
+                f"[MISSION] result: {result.message if result else error}"
+            ),
+            timeout_sec=10.0,
         )
-        self._record_pose()
-        if not self.initial_pose_retry.active and now - self.ros.last_amcl_stamp < 2.0:
-            self.initial_pose_status_var.set(
-                f"AMCL: x={self.ros.amcl_x:.2f}, y={self.ros.amcl_y:.2f}, "
-                f"yaw={math.degrees(self.ros.amcl_yaw):.1f}deg"
-            )
-        if now - self.ros.last_scan_stamp < 1.0:
-            self.scan_var.set(f"scan alive, ranges={self.ros.scan_count}")
-            self._set_indicator("laser", True, f"Laser: {self.ros.scan_count} ranges")
-        else:
-            self.scan_var.set("scan timeout")
-            self._set_indicator("laser", False, "Laser: timeout")
 
-        if now - self.ros.last_odom_stamp < 1.0:
-            self.odom_var.set(f"odom alive, yaw_rate={self.ros.robot_yaw_rate:.2f}")
-            self._set_indicator("odom", True, "Odom: online")
-        else:
-            self.odom_var.set("odom timeout")
-            self._set_indicator("odom", False, "Odom: timeout")
+    def _stop_tasks(self):
+        self._log("[任务] 停止全部任务")
+        if self.launch_manager is not None:
+            self.launch_manager.stop()
 
-        if now - self.ros.last_map_stamp < 2.0 and self.ros.map_data is not None:
-            width = self.ros.map_data.info.width
-            height = self.ros.map_data.info.height
-            self.map_var_status.set(f"map alive, {width}x{height}")
-            self._set_indicator("map", True, f"Map: {width}x{height}")
-        else:
-            self.map_var_status.set("map timeout")
-            self._set_indicator("map", False, "Map: timeout")
+    def _clear_points(self):
+        if self.adapter is None:
+            self._log("[任务] ROS 适配器未连接")
+            return
+        from std_srvs.srv import Trigger
 
-        if now - self.ros.last_safety_stamp < 3.0:
-            self.safety_var.set(f"{self.ros.safety_level}: {self.ros.safety_message}")
-            if self.ros.safety_voltage_available:
-                voltage_text = f"V={self.ros.safety_measured_voltage_v:.3f}V"
-            else:
-                voltage_text = "V=n/a"
-            self.power_var.set(
-                f"{voltage_text}  uv_now={int(self.ros.safety_undervoltage_now)}  uv_seen={int(self.ros.safety_undervoltage_seen)}  throttled=0x{self.ros.safety_throttled_flags:x}"
-            )
-            if self.ros.safety_level == 'FAULT':
-                self._set_indicator_state('safety', '#d00000', f"Safety: {self.ros.safety_code}")
-            elif self.ros.safety_level == 'WARN':
-                self._set_indicator_state('safety', '#f77f00', f"Safety: {self.ros.safety_code}")
-            else:
-                self._set_indicator_state('safety', '#2dc653', f"Safety: {self.ros.safety_code}")
-        else:
-            self.safety_var.set('safety: waiting')
-            self.power_var.set('power: waiting')
-            self._set_indicator_state('safety', '#8f8f8f', 'Safety: waiting')
+        self.adapter.call_service_async(
+            self.adapter.clear_rviz_points_client, Trigger.Request(),
+            lambda result, error: self._log(
+                f"[RViz] clear points: {result.message if result else error}"
+            ),
+        )
 
-        if now - self.ros.last_thermal_stamp < 2.0 and self.ros.thermal_frame:
-            self.thermal_var.set(
-                f"thermal alive, min={self.ros.thermal_min:.1f}C  max={self.ros.thermal_max:.1f}C  avg={self.ros.thermal_avg:.1f}C"
-            )
-            self._set_indicator("thermal", True, "Thermal: online")
-        else:
-            self.thermal_var.set("thermal timeout")
-            self._set_indicator("thermal", False, "Thermal: timeout")
+    def _set_region_mode(self, enabled):
+        if self.adapter is None:
+            return
+        from std_srvs.srv import SetBool
 
-        if now - self.ros.last_gas_stamp < 2.0:
-            self.gas_h2_var.set(f"H2: {self.ros.gas_data['H2']:.1f}")
-            self.gas_co_var.set(f"CO: {self.ros.gas_data['CO']:.1f}")
-            self.gas_voc_var.set(f"VOC: {self.ros.gas_data['VOC']:.1f}")
-            self.gas_smoke_var.set(f"Smoke: {self.ros.gas_data['Smoke']:.1f}")
-            self.gas_var.set(
-                f"H2={self.ros.gas_data['H2']:.1f}  CO={self.ros.gas_data['CO']:.1f}  "
-                f"VOC={self.ros.gas_data['VOC']:.1f}  Smoke={self.ros.gas_data['Smoke']:.1f}"
-            )
-            self._set_indicator("gas", True, "Gas: online")
-        else:
-            self.gas_h2_var.set("H2: --")
-            self.gas_co_var.set("CO: --")
-            self.gas_voc_var.set("VOC: --")
-            self.gas_smoke_var.set("Smoke: --")
-            self.gas_var.set("gas timeout")
-            self._set_indicator("gas", False, "Gas: timeout")
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        self.adapter.call_service_async(
+            self.adapter.set_region_mode_client, request,
+            lambda result, error: self._log(
+                f"[Region] mode={'on' if enabled else 'off'}: "
+                f"{result.message if result else error}"
+            ),
+        )
 
-        health = self.current_health
+    def _service_call(self, name):
+        if self.adapter is None:
+            self._log("[任务] ROS 适配器未连接")
+            return
+        from std_srvs.srv import Trigger
+
+        client = {
+            "save_regions": self.adapter.save_inspection_regions_client,
+            "load_regions": self.adapter.load_inspection_regions_client,
+            "clear_regions": self.adapter.clear_inspection_regions_client,
+            "undo_region": self.adapter.undo_region_client,
+            "undo_point": self.adapter.undo_rviz_point_client,
+        }.get(name)
+        if client is None:
+            return
+        self.adapter.call_service_async(
+            client, Trigger.Request(),
+            lambda result, error: self._log(
+                f"[MISSION] {name}: {result.message if result else error}"
+            ),
+        )
+
+    def _log(self, line):
+        if self.bridge is not None:
+            self.bridge.put_log(line)
+
+
+class RuntimeLogPanel(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        style_as_card(self, 190)
+        self._expanded_dialog = None
+        self._expanded_view = None
+        layout = QtWidgets.QVBoxLayout(self)
+
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("运行日志")
+        title.setObjectName("panelTitle")
+        self.expand_btn = QtWidgets.QPushButton("放大查看")
+        self.expand_btn.setObjectName("compactTool")
+        self.expand_btn.setToolTip("在独立窗口中查看实时运行日志")
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self.expand_btn)
+        layout.addLayout(header)
+
+        self.log_view = QtWidgets.QPlainTextEdit(self)
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(2000)
+        self.log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        layout.addWidget(self.log_view, 1)
+        self.expand_btn.clicked.connect(self.show_expanded_log)
+
+    def append_line(self, line):
+        self.log_view.appendPlainText(line)
+        if self._expanded_view is not None:
+            self._expanded_view.appendPlainText(line)
+        for view in (self.log_view, self._expanded_view):
+            if view is None:
+                continue
+            cursor = view.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.End)
+            view.setTextCursor(cursor)
+            view.ensureCursorVisible()
+
+    def show_expanded_log(self):
+        """Show one modeless, live view of the shared runtime-log document."""
+        if self._expanded_dialog is not None:
+            self._expanded_dialog.show()
+            self._expanded_dialog.raise_()
+            self._expanded_dialog.activateWindow()
+            return
+
+        dialog = QtWidgets.QDialog(self.window())
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.setWindowTitle("运行日志 - 放大查看")
+        dialog.resize(1000, 650)
+        dialog.setMinimumSize(700, 420)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        hint = QtWidgets.QLabel("实时显示控制台与机器人端任务输出（最多保留 2000 行）")
+        hint.setObjectName("headerSubtitle")
+        hint.setStyleSheet("color: #46616d;")
+        layout.addWidget(hint)
+
+        view = QtWidgets.QPlainTextEdit(dialog)
+        view.setReadOnly(True)
+        view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        view.setMaximumBlockCount(2000)
+        view.setPlainText(self.log_view.toPlainText())
+        layout.addWidget(view, 1)
+
+        self._expanded_dialog = dialog
+        self._expanded_view = view
+        dialog.destroyed.connect(self._on_expanded_destroyed)
+        dialog.show()
+
+        cursor = view.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        view.setTextCursor(cursor)
+
+    def _on_expanded_destroyed(self, _object=None):
+        self._expanded_dialog = None
+        self._expanded_view = None
+
+
+class RobotStatusPanel(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        style_as_card(self, 330)
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel("机器人状态")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+
+        self.health_labels = {}
+
+        # indicator lamps (SSH/Laser/Odom/Map/Safety/Thermal/Gas)
+        lamps = QtWidgets.QHBoxLayout()
+        self.lamps = {}
+        for key, label in (
+            ("ssh", "SSH"), ("laser", "雷达"), ("odom", "里程计"),
+            ("map", "地图"), ("safety", "安全"), ("thermal", "热成像"),
+            ("gas", "气体"),
+        ):
+            dot = QtWidgets.QLabel("\u25cf")
+            dot.setStyleSheet("color: #8f8f8f; font-size: 12px;")
+            text = QtWidgets.QLabel(f"{label}：等待数据")
+            text.setStyleSheet("font-size: 9px;")
+            cell = QtWidgets.QWidget()
+            cell_layout = QtWidgets.QHBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.addWidget(dot)
+            cell_layout.addWidget(text)
+            lamps.addWidget(cell)
+            self.lamps[key] = (dot, text)
+        lamps.addStretch(1)
+        layout.addLayout(lamps)
+
+        grid = QtWidgets.QGridLayout()
+        cards = [
+            ("SSH", "ssh"), ("电源", "power"), ("CPU 温度", "temp"),
+            ("CPU", "cpu"), ("内存", "mem"), ("运行时间", "uptime"),
+        ]
+        for idx, (label, key) in enumerate(cards):
+            cell = QtWidgets.QLabel(f"{label}：--")
+            cell.setObjectName("metricCard")
+            cell.setWordWrap(True)
+            self.health_labels[key] = cell
+            grid.addWidget(cell, idx // 3, idx % 3)
+        layout.addLayout(grid)
+
+        gas_row = QtWidgets.QHBoxLayout()
+        self.gas_label = QtWidgets.QLabel("H2：--  CO：--  VOC：--  烟雾：--")
+        gas_row.addWidget(self.gas_label)
+        gas_row.addStretch(1)
+        layout.addLayout(gas_row)
+
+        self.topic_table = QtWidgets.QTableWidget(0, 5)
+        self.topic_table.setHorizontalHeaderLabels(
+            ["话题", "发布者", "频率 (Hz)", "延迟", "状态摘要"]
+        )
+        self.topic_table.setAlternatingRowColors(True)
+        self.topic_table.horizontalHeader().setStretchLastSection(True)
+        self.topic_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.topic_table, 1)
+    # ------------------------------------------------------------------
+    def _set_lamp(self, key, color, text):
+        dot, label = self.lamps[key]
+        dot.setStyleSheet(f"color: {color}; font-size: 12px;")
+        label.setText(text)
+
+    def update_gas(self, gas_data, state="online"):
+        if state == "waiting" or not gas_data:
+            self._set_lamp("gas", "#8f8f8f", "气体：等待数据")
+            self.gas_label.setText("H2：--  CO：--  VOC：--  烟雾：--")
+            return
+        online = state == "online"
+        self._set_lamp(
+            "gas", "#2dc653" if online else "#d00000",
+            "气体：在线" if online else "气体：数据超时",
+        )
+        suffix = "" if online else "（数据过期）"
+        self.gas_label.setText(
+            f"H2：{gas_data['H2']:.1f}  CO：{gas_data['CO']:.1f}  "
+            f"VOC：{gas_data['VOC']:.1f}  烟雾：{gas_data['Smoke']:.1f}{suffix}"
+        )
+
+    def update_thermal_lamp(self, state):
+        if state == "waiting":
+            self._set_lamp("thermal", "#8f8f8f", "热成像：等待数据")
+            return
+        online = state is True or state == "online"
+        self._set_lamp(
+            "thermal", "#2dc653" if online else "#d00000",
+            "热成像：在线" if online else "热成像：数据超时",
+        )
+
+    def update_safety(self, level, code):
+        level = (level or "WAITING").upper()
+        code = code or "UNKNOWN"
+        color = {
+            "NORMAL": "#2dc653",
+            "WARN": "#f77f00",
+            "FAULT": "#d00000",
+        }.get(level, "#8f8f8f")
+        text = "安全：等待数据" if level == "WAITING" else f"安全：{code}"
+        self._set_lamp("safety", color, text)
+
+    def update_health(self, health):
+        if health is None:
+            return
         if health.online:
-            self._set_indicator(
-                "ssh", True,
-                f"SSH: {self.ssh_var.get()} {health.latency_ms}ms"
+            self._set_lamp("ssh", "#2dc653", f"SSH: {health.latency_ms}ms")
+            self.health_labels["ssh"].setText(
+                f"SSH：在线 {health.latency_ms}ms"
             )
-        elif health.error_code == "unprobed":
-            self._set_indicator_state("ssh", "#8f8f8f", "SSH: probing...")
+            self.health_labels["temp"].setText(
+                f"CPU 温度：{health.temp_c} °C" if health.temp_c is not None else "CPU 温度：N/A"
+            )
+            cpu = "N/A" if health.cpu_percent is None else f"{health.cpu_percent}%"
+            self.health_labels["cpu"].setText(f"CPU：{cpu}")
+            mem = "N/A" if health.mem_percent is None else f"{health.mem_percent}%"
+            self.health_labels["mem"].setText(f"内存：{mem}")
+            self.health_labels["uptime"].setText(
+                f"运行时间：{health.uptime_s:.0f}s" if health.uptime_s is not None else "运行时间：N/A"
+            )
+            power = "5V 输入：N/A（无 ADC）"
+            if health.throttled_flags is not None:
+                uv = "欠压" if health.throttled_flags & 0x1 else "正常"
+                power += f"  供电：{uv}"
+            if health.core_voltage_v is not None:
+                power += f"  核心：{health.core_voltage_v}V"
+            self.health_labels["power"].setText(f"电源：{power}")
         else:
-            self._set_indicator_state(
-                "ssh", "#d00000", f"SSH: {health.error_code}"
+            self._set_lamp(
+                "ssh", "#d00000" if health.error_code != "unprobed" else "#8f8f8f",
+                f"SSH：{health.error_code}",
             )
-        self._update_topic_table()
-
-        if self.ros.safety_level == 'FAULT':
-            self.status_var.set(f"FAULT: {self.ros.safety_code}")
-        elif self.launch_manager.is_running():
-            self.status_var.set(f"Running: {self.launch_manager.active_name}")
-        else:
-            self.status_var.set("Idle")
-
-        self._refresh_mission_status()
-        self._draw_map_view()
-        self._draw_thermal_view()
-
-    def _set_indicator(self, key, ok, text):
-        color = '#2dc653' if ok else '#d00000'
-        self._set_indicator_state(key, color, text)
-
-    def _set_indicator_state(self, key, color, text):
-        canvas, label = self.indicators[key]
-        canvas.delete('all')
-        canvas.create_oval(1, 1, 11, 11, fill=color, outline='')
-        label.config(text=text)
-
-    def _record_pose(self):
-        point = (round(self.ros.robot_x, 2), round(self.ros.robot_y, 2))
-        if not self.pose_history or self.pose_history[-1] != point:
-            self.pose_history.append(point)
-            if len(self.pose_history) > 80:
-                self.pose_history.pop(0)
-
-    def _refresh_mission_status(self):
-        if self.ros.mission_active:
-            current = min(self.ros.mission_current_index + 1, self.ros.mission_total_count)
-            self.mission_var.set(
-                f"mission: {self.ros.mission_state} {self.ros.mission_mode} "
-                f"{current}/{self.ros.mission_total_count} - {self.ros.mission_message}"
-            )
-        else:
-            self.mission_var.set(
-                f"mission: {self.ros.mission_state} - {self.ros.mission_message}"
-            )
-
-    def _draw_map_view(self):
-        map_msg = self.ros.map_data
-        key = (
-            round(self.ros.robot_x, 2),
-            round(self.ros.robot_y, 2),
-            len(self.pose_history),
-            getattr(map_msg.info, "width", 0) if map_msg else 0,
-            getattr(map_msg.info, "height", 0) if map_msg else 0,
-            int(self.ros.last_map_stamp),
-        )
-        if key == self.last_map_render_key:
-            return
-        self.last_map_render_key = key
-
-        canvas = self.map_canvas
-        canvas.delete("all")
-        width_px = int(canvas["width"])
-        height_px = int(canvas["height"])
-        canvas.create_rectangle(8, 8, width_px - 8, height_px - 8, fill="#fcfbf7", outline="#d5d5d5")
-
-        if map_msg is None:
-            canvas.create_text(
-                width_px / 2,
-                height_px / 2,
-                text="No /map data yet",
-                fill="#6c757d",
-                font=("Helvetica", 14, "bold"),
-            )
-            return
-
-        info = map_msg.info
-        grid_w = info.width
-        grid_h = info.height
-        if grid_w == 0 or grid_h == 0:
-            return
-
-        resolution = info.resolution
-        origin_x = info.origin.position.x
-        origin_y = info.origin.position.y
-        inner_w = width_px - 16
-        inner_h = height_px - 16
-        step = max(1, max(grid_w, grid_h) // 80)
-        cell_w = inner_w / max(1, grid_w / step)
-        cell_h = inner_h / max(1, grid_h / step)
-
-        data = map_msg.data
-        for gy in range(0, grid_h, step):
-            for gx in range(0, grid_w, step):
-                value = data[gy * grid_w + gx]
-                if value < 0:
-                    color = "#d9d9d9"
-                elif value > 50:
-                    color = "#1f1f1f"
-                else:
+            self.health_labels["ssh"].setText(f"SSH：{health.error_code}")
+            for key in ("power", "temp", "cpu", "mem", "uptime"):
+                current = self.health_labels[key].text()
+                if "（数据过期）" in current:
                     continue
-                x0 = 8 + (gx / step) * cell_w
-                y0 = 8 + inner_h - ((gy / step) + 1) * cell_h
-                x1 = x0 + cell_w + 1
-                y1 = y0 + cell_h + 1
-                canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline=color)
+                if "--" in current:
+                    current = current.replace("--", "N/A")
+                self.health_labels[key].setText(f"{current}（数据过期）")
 
-        trail = []
-        for x, y in self.pose_history:
-            px, py = self._world_to_canvas(x, y, origin_x, origin_y, resolution, grid_w, grid_h, inner_w, inner_h)
-            trail.extend([px, py])
-        if len(trail) >= 4:
-            canvas.create_line(*trail, fill="#3a86ff", width=2, smooth=True)
+    TOPIC_LAMP = {
+        "/scan": "laser", "/odom": "odom", "/map": "map",
+    }
 
-        robot_px, robot_py = self._world_to_canvas(
-            self.ros.robot_x,
-            self.ros.robot_y,
-            origin_x,
-            origin_y,
-            resolution,
-            grid_w,
-            grid_h,
-            inner_w,
-            inner_h,
-        )
-        canvas.create_oval(robot_px - 5, robot_py - 5, robot_px + 5, robot_py + 5, fill="#e63946", outline="")
-        canvas.create_text(18, 18, anchor="nw", text=f"Pose ({self.ros.robot_x:.2f}, {self.ros.robot_y:.2f})", fill="#153243", font=("Helvetica", 10, "bold"))
+    def update_topics(self, rows):
+        """rows: list of (name, TopicSnapshot)."""
+        self.topic_table.setRowCount(len(rows))
+        for row, (name, snap) in enumerate(rows):
+            state_color = STATE_COLORS.get(snap.state, "#8f8f8f")
+            state_text = {
+                "online": "在线", "stale": "数据过期", "offline": "离线",
+                "available": "可用", "unstarted": "未启动", "na": "不适用",
+            }.get(snap.state, snap.state)
+            lamp_key = self.TOPIC_LAMP.get(name)
+            if lamp_key is not None:
+                self._set_lamp(
+                    lamp_key, state_color,
+                    f"{name.split('/')[-1]}：{state_text}",
+                )
+            cells = [
+                name,
+                str(snap.publishers),
+                "--" if snap.rate_hz is None else f"{snap.rate_hz:.1f}",
+                "--" if snap.age_s is None else f"{snap.age_s:.1f}s",
+                snap.summary,
+            ]
+            for col, text in enumerate(cells):
+                item = QtWidgets.QTableWidgetItem(text)
+                if col == 0:
+                    item.setForeground(QtCore.Qt.blue)
+                elif col == 4:
+                    item.setForeground(
+                        QtGui.QColor(state_color)
+                    )
+                self.topic_table.setItem(row, col, item)
 
-    def _world_to_canvas(self, x, y, origin_x, origin_y, resolution, grid_w, grid_h, inner_w, inner_h):
-        map_w = grid_w * resolution
-        map_h = grid_h * resolution
-        rel_x = 0.0 if map_w == 0 else (x - origin_x) / map_w
-        rel_y = 0.0 if map_h == 0 else (y - origin_y) / map_h
-        px = 8 + max(0.0, min(1.0, rel_x)) * inner_w
-        py = 8 + inner_h - max(0.0, min(1.0, rel_y)) * inner_h
-        return px, py
 
-    def _draw_thermal_view(self):
-        self.thermal_cbar = self._render_thermal_axes(
-            self.thermal_fig,
-            self.thermal_ax,
-            self.thermal_cbar,
-            title="MLX90640 Thermal View",
-        )
-        self.thermal_canvas.draw_idle()
+class LiveMapPanel(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        style_as_card(self, 320)
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel("实时地图")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+        self.canvas = QtWidgets.QLabel("暂无地图数据")
+        self.canvas.setAlignment(QtCore.Qt.AlignCenter)
+        self.canvas.setMinimumHeight(200)
+        layout.addWidget(self.canvas, 1)
+        self._pixmap = None
+        self._trail = []
+        self._last_pose = None
 
-        if self.thermal_popup_fig is not None and self.thermal_popup_ax is not None and self.thermal_popup_canvas is not None:
-            self.thermal_popup_cbar = self._render_thermal_axes(
-                self.thermal_popup_fig,
-                self.thermal_popup_ax,
-                self.thermal_popup_cbar,
-                title="MLX90640 Thermal Detail",
+    def set_trail(self, points):
+        self._trail = list(points)
+
+    def update_map(self, map_msg, pose=None):
+        image = build_map_image(map_msg)
+        pixmap = QtGui.QPixmap.fromImage(image)
+        self._pixmap = pixmap
+        self._last_pose = pose
+        self._redraw(pose)
+
+    def update_pose(self, pose):
+        if pose == self._last_pose:
+            return
+        self._last_pose = pose
+        self._redraw(pose)
+
+    def _redraw(self, pose=None):
+        if self._pixmap is None:
+            return
+        overlay = QtGui.QPixmap(self._pixmap)
+        painter = QtGui.QPainter(overlay)
+        painter.setPen(QtGui.QColor("#d00000"))
+        for x, y in self._trail:
+            painter.drawPoint(x, y)
+        if pose is not None:
+            x, y = pose
+            painter.setPen(QtGui.QPen(QtGui.QColor("#0f4c5c"), 2))
+            painter.drawEllipse(int(x) - 3, int(y) - 3, 7, 7)
+        painter.end()
+        self.canvas.setPixmap(
+            overlay.scaled(
+                self.canvas.size(), QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
             )
-            self.thermal_popup_canvas.draw_idle()
+        )
 
-    def _render_thermal_axes(self, figure, ax, current_cbar, title):
-        ax.clear()
 
-        if current_cbar is not None:
+class ThermalPanel(QtWidgets.QWidget):
+    def __init__(self, launch_manager=None, parent=None):
+        super().__init__(parent)
+        style_as_card(self, 385)
+        self.launch_manager = launch_manager
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel("热成像")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.start_btn = QtWidgets.QPushButton("启动热成像")
+        self.stop_btn = QtWidgets.QPushButton("停止热成像")
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.stop_btn)
+        layout.addLayout(btn_row)
+        self.start_btn.clicked.connect(self.start_thermal)
+        self.stop_btn.clicked.connect(self.stop_thermal)
+
+        self.figure = Figure(figsize=(4, 3), dpi=80)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        self._im = None
+        self._cbar = None
+        self._empty = True
+        layout.addWidget(self.canvas, 1)
+        self.status = QtWidgets.QLabel("热成像：暂无数据")
+        layout.addWidget(self.status)
+
+    def start_thermal(self):
+        if self.launch_manager is not None:
+            self.launch_manager.start_thermal()
+
+    def stop_thermal(self):
+        if self.launch_manager is not None:
+            self.launch_manager.stop_thermal()
+
+    def update_frame(self, width, height, data):
+        if not data:
+            self.status.setText("热成像：暂无数据")
+            return
+        frame_min, frame_max, frame_avg = analyze_frame(data)
+        import numpy as np
+
+        matrix = np.array(data, dtype=float).reshape(height, width)
+        if self._im is None:
+            self._im = self.ax.imshow(matrix, cmap="inferno", aspect="auto")
+            self.figure.colorbar(self._im, ax=self.ax)
+        else:
+            self._im.set_data(matrix)
+            self._im.set_clim(frame_min, frame_max)
+        self.canvas.draw_idle()
+        self._empty = False
+        self.status.setText(
+            f"热成像：最低 {frame_min:.1f}°C  最高 {frame_max:.1f}°C  平均 {frame_avg:.1f}°C"
+        )
+
+    def set_freshness(self, state):
+        if state == "waiting":
+            self.status.setText("热成像：等待数据")
+        elif state == "timeout" and "（数据过期）" not in self.status.text():
+            self.status.setText(f"{self.status.text()}（数据过期）")
+
+
+class ManualDrivePanel(QtWidgets.QWidget):
+    abort_finished = QtCore.Signal(int, object, object)
+    estop_finished = QtCore.Signal(bool, object, object)
+
+    def __init__(self, adapter=None, bridge=None, parent=None):
+        super().__init__(parent)
+        style_as_card(self, 205)
+        self.adapter = adapter
+        self.bridge = bridge
+        self.manual_linear = 0.12
+        self.manual_angular = 0.55
+        self._cmd = (0.0, 0.0)
+        self._pending_cmd = None
+        self._active = False
+        self._request_id = 0
+
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel("手动驾驶")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+        layout.addWidget(QtWidgets.QLabel("使用 W/A/S/D 或方向键控制，空格键立即停止"))
+
+        pad = QtWidgets.QGridLayout()
+        self._add_drive_button(pad, "←", 0, 0, 0.0, self.manual_angular)
+        self._add_drive_button(pad, "↑", 0, 1, self.manual_linear, 0.0)
+        self._add_drive_button(pad, "↓", 1, 0, -self.manual_linear, 0.0)
+        self._add_drive_button(pad, "→", 1, 1, 0.0, -self.manual_angular)
+        stop_btn = QtWidgets.QPushButton("立即停止")
+        stop_btn.setObjectName("danger")
+        stop_btn.clicked.connect(self.stop_robot)
+        pad.addWidget(stop_btn, 0, 2, 2, 1)
+        layout.addLayout(pad)
+
+        estop_row = QtWidgets.QHBoxLayout()
+        self.estop_btn = QtWidgets.QPushButton("软件急停")
+        self.estop_btn.setObjectName("danger")
+        self.release_estop_btn = QtWidgets.QPushButton("解除急停")
+        self.estop_status = QtWidgets.QLabel("急停状态：未知")
+        estop_row.addWidget(self.estop_btn)
+        estop_row.addWidget(self.release_estop_btn)
+        estop_row.addWidget(self.estop_status, 1)
+        layout.addLayout(estop_row)
+        self.estop_btn.clicked.connect(lambda: self.request_software_estop(True))
+        self.release_estop_btn.clicked.connect(
+            lambda: self.request_software_estop(False)
+        )
+
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._publish)
+        self.abort_finished.connect(self._on_abort_finished)
+        self.estop_finished.connect(self._on_estop_finished)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+    def _add_drive_button(self, grid, text, row, col, vx, wz):
+        btn = QtWidgets.QPushButton(text)
+        btn.pressed.connect(lambda: self._begin(vx, wz))
+        btn.released.connect(self.stop_robot)
+        grid.addWidget(btn, row, col)
+
+    # ------------------------------------------------------------------
+    def _begin(self, vx, wz):
+        requested = (float(vx), float(wz))
+        if requested == (0.0, 0.0):
+            self.stop_robot()
+            return
+        if self._active and self._cmd == requested:
+            return
+
+        self.stop_robot()
+        if (self.adapter is None or
+                not hasattr(self.adapter, "call_service_async") or
+                not hasattr(self.adapter, "abort_mission_client")):
+            self._log("[MANUAL] autonomous abort unavailable; command blocked")
+            return
+
+        from std_srvs.srv import Trigger
+
+        self._pending_cmd = requested
+        request_id = self._request_id
+        self._log("[MANUAL] aborting autonomy before manual drive")
+        self.adapter.call_service_async(
+            self.adapter.abort_mission_client,
+            Trigger.Request(),
+            lambda result, error: self.abort_finished.emit(
+                request_id, result, error
+            ),
+            timeout_sec=2.0,
+        )
+
+    def _on_abort_finished(self, request_id, result, error):
+        if request_id != self._request_id or self._pending_cmd is None:
+            return
+        if error is not None or result is None or not result.success:
+            detail = error or (
+                result.message if result is not None else "unknown error"
+            )
+            self._pending_cmd = None
+            self._log(f"[MANUAL] autonomous abort failed; command blocked: {detail}")
+            return
+        self._cmd = self._pending_cmd
+        self._pending_cmd = None
+        self._active = True
+        self._publish()
+        self._timer.start()
+
+    def stop_robot(self):
+        self._request_id += 1
+        self._pending_cmd = None
+        self._cmd = (0.0, 0.0)
+        self._active = False
+        self._timer.stop()
+        if self.adapter is not None and hasattr(self.adapter, "publish_cmd_vel"):
+            self.adapter.publish_cmd_vel(0.0, 0.0)
+
+    def _publish(self):
+        if (self._active and self.adapter is not None and
+                hasattr(self.adapter, "publish_cmd_vel")):
+            self.adapter.publish_cmd_vel(self._cmd[0], self._cmd[1])
+
+    def request_software_estop(self, enabled):
+        if enabled:
+            self.stop_robot()
+        if (self.adapter is None or
+                not hasattr(self.adapter, "call_service_async") or
+                not hasattr(self.adapter, "software_estop_client")):
+            self.estop_status.setText("急停状态：服务不可用")
+            self._log("[安全] 软件急停服务不可用")
+            return
+
+        from std_srvs.srv import SetBool
+
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        self.estop_btn.setEnabled(False)
+        self.release_estop_btn.setEnabled(False)
+        self.estop_status.setText("急停状态：正在更新…")
+        self.adapter.call_service_async(
+            self.adapter.software_estop_client,
+            request,
+            lambda result, error: self.estop_finished.emit(
+                bool(enabled), result, error
+            ),
+            timeout_sec=2.0,
+        )
+
+    def _on_estop_finished(self, enabled, result, error):
+        self.estop_btn.setEnabled(True)
+        self.release_estop_btn.setEnabled(True)
+        if error is not None or result is None or not result.success:
+            detail = error or (
+                result.message if result is not None else "unknown error"
+            )
+            self.estop_status.setText("急停状态：更新失败 / 状态未知")
+            self._log(f"[安全] 软件急停更新失败：{detail}")
+            return
+        state = "已锁定" if enabled else "已解除"
+        self.estop_status.setText(f"急停状态：{state}")
+        self._log(f"[安全] 软件急停{state}")
+
+    def stop_all(self):
+        self.stop_robot()
+
+    def _log(self, line):
+        if self.bridge is not None:
+            self.bridge.put_log(line)
+
+    # ------------------------------------------------------------ keyboard
+    def keyPressEvent(self, event):
+        if event.isAutoRepeat():
+            event.accept()
+            return
+        if event.key() == QtCore.Qt.Key_Space:
+            self.stop_robot()
+            event.accept()
+            return
+        mapping = {
+            QtCore.Qt.Key_W: (self.manual_linear, 0.0),
+            QtCore.Qt.Key_Up: (self.manual_linear, 0.0),
+            QtCore.Qt.Key_S: (-self.manual_linear, 0.0),
+            QtCore.Qt.Key_Down: (-self.manual_linear, 0.0),
+            QtCore.Qt.Key_A: (0.0, self.manual_angular),
+            QtCore.Qt.Key_Left: (0.0, self.manual_angular),
+            QtCore.Qt.Key_D: (0.0, -self.manual_angular),
+            QtCore.Qt.Key_Right: (0.0, -self.manual_angular),
+        }
+        if event.key() in mapping:
+            self._begin(*mapping[event.key()])
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() in (
+            QtCore.Qt.Key_W, QtCore.Qt.Key_Up, QtCore.Qt.Key_S,
+            QtCore.Qt.Key_Down, QtCore.Qt.Key_A, QtCore.Qt.Key_Left,
+            QtCore.Qt.Key_D, QtCore.Qt.Key_Right, QtCore.Qt.Key_Space,
+        ):
+            self.stop_robot()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event):
+        self.stop_robot()
+        super().focusOutEvent(event)
+
+
+class LanScanDialog(QtWidgets.QDialog):
+    scan_finished = QtCore.Signal(list)
+    status_changed = QtCore.Signal(str)
+    ip_applied = QtCore.Signal(str)
+
+    COLUMNS = ("IP", "主机名", "MAC", "可达", "SSH", "当前地址")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("局域网设备扫描")
+        self.setMinimumSize(780, 440)
+        self._cancel = None
+        self._scanning = False
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        layout.addWidget(self.table, 1)
+
+        bar = QtWidgets.QHBoxLayout()
+        self.status = QtWidgets.QLabel("就绪")
+        bar.addWidget(self.status, 1)
+        self.scan_btn = QtWidgets.QPushButton("开始扫描")
+        self.cancel_btn = QtWidgets.QPushButton("取消")
+        self.apply_btn = QtWidgets.QPushButton("应用所选地址")
+        bar.addWidget(self.scan_btn)
+        bar.addWidget(self.cancel_btn)
+        bar.addWidget(self.apply_btn)
+        layout.addLayout(bar)
+
+        self.scan_btn.clicked.connect(self.start_scan)
+        self.cancel_btn.clicked.connect(self.cancel_scan)
+        self.apply_btn.clicked.connect(self._apply_selected)
+        self.scan_finished.connect(self._on_finished)
+        self.status_changed.connect(self.status.setText)
+
+    # ------------------------------------------------------------------
+    def start_scan(self):
+        if self._scanning:
+            return
+        self._scanning = True
+        self._cancel = threading.Event()
+        self.status.setText("正在扫描…")
+        self.scan_btn.setEnabled(False)
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def cancel_scan(self):
+        if self._cancel is not None:
+            self._cancel.set()
+            self.status.setText("正在取消…")
+
+    def _worker(self):
+        subnet = default_subnet()
+        if not subnet:
+            self.status_changed.emit("无法确定当前活动子网")
+            self.scan_finished.emit([])
+            return
+        try:
+            devices = scan_subnet(subnet, timeout=0.8, cancel_event=self._cancel)
+        except Exception as exc:  # noqa: BLE001
+            self.status_changed.emit(f"扫描错误：{exc}")
+            devices = []
+        self.scan_finished.emit(devices)
+
+    def _on_finished(self, devices):
+        self._scanning = False
+        self.scan_btn.setEnabled(True)
+        self.table.setRowCount(len(devices))
+        for row, dev in enumerate(devices):
+            values = (
+                dev.ip,
+                dev.hostname,
+                dev.mac,
+                "是" if dev.reachable else "否",
+                "开放" if dev.ssh_open else "关闭",
+                "*" if dev.current else "",
+            )
+            for col, text in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(text)
+                self.table.setItem(row, col, item)
+        self.status.setText(f"扫描完成：发现 {len(devices)} 台设备")
+
+    def _apply_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            self.status.setText("请先选择一行设备")
+            return
+        ip = self.table.item(row, 0).text()
+        self.ip_applied.emit(ip)
+        self.accept()
+
+
+# ---------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------
+class QtMainWindow(QtWidgets.QMainWindow):
+    """Main window for the Qt control UI."""
+
+    def __init__(self, bridge=None, adapter=None, launch_manager=None,
+                 health_probe=None, map_path=None, parent=None,
+                 rqt_process=None, rviz_process=None):
+        super().__init__(parent)
+        self.bridge = bridge if bridge is not None else QtBridge()
+        self.adapter = adapter  # RosUiAdapter (may be None in tests/skeleton)
+        self.launch_manager = launch_manager
+        self.health_probe = health_probe
+        self.map_path = map_path
+        self._last_map_revision = None
+        self._last_robot_grid_pose = None
+        self._last_thermal_render_stamp = 0.0
+        self._rqt_process = rqt_process or QtCore.QProcess(self)
+        self._rqt_process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        self._rqt_process.started.connect(self._on_rqt_started)
+        self._rqt_process.finished.connect(self._on_rqt_finished)
+        self._rqt_process.errorOccurred.connect(self._on_rqt_error)
+        self._rqt_process.readyReadStandardOutput.connect(self._on_rqt_output)
+        self._rviz_process = rviz_process or QtCore.QProcess(self)
+        self._rviz_process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        self._rviz_process.started.connect(self._on_rviz_started)
+        self._rviz_process.finished.connect(self._on_rviz_finished)
+        self._rviz_process.errorOccurred.connect(self._on_rviz_error)
+        self._rviz_process.readyReadStandardOutput.connect(self._on_rviz_output)
+
+        self.setWindowTitle("履带机器人控制中心")
+        self.resize(1440, 900)
+        self.setMinimumSize(1120, 720)
+
+        self._build_ui()
+        self.bridge.log_received.connect(self.log_panel.append_line)
+        self.bridge.health_received.connect(self.status_panel.update_health)
+        self.bridge.safety_alert_received.connect(self._on_safety_alert)
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._on_tick)
+        self._timer.start(200)
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        central = QtWidgets.QWidget(self)
+        central.setObjectName("appRoot")
+        self.setCentralWidget(central)
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        # header
+        header = QtWidgets.QFrame(central)
+        header.setObjectName("appHeader")
+        header.setMinimumHeight(76)
+        header_layout = QtWidgets.QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 10, 16, 10)
+
+        logo = QtWidgets.QLabel(header)
+        logo.setFixedSize(50, 50)
+        logo.setAlignment(QtCore.Qt.AlignCenter)
+        try:
+            logo_path = os.path.join(
+                get_package_share_directory("robot_control_ui"),
+                "assets", "wut_logo.png",
+            )
+            pixmap = QtGui.QPixmap(logo_path)
+            if not pixmap.isNull():
+                logo.setPixmap(
+                    pixmap.scaled(
+                        logo.size(), QtCore.Qt.KeepAspectRatio,
+                        QtCore.Qt.SmoothTransformation,
+                    )
+                )
+            else:
+                logo.hide()
+        except Exception:
+            logo.hide()
+        header_layout.addWidget(logo)
+
+        heading = QtWidgets.QVBoxLayout()
+        heading.setSpacing(1)
+        title = QtWidgets.QLabel("履带机器人控制中心", header)
+        title.setObjectName("headerTitle")
+        subtitle = QtWidgets.QLabel("ROS 2 建图 · 导航 · 巡检与安全监控", header)
+        subtitle.setObjectName("headerSubtitle")
+        heading.addWidget(title)
+        heading.addWidget(subtitle)
+        header_layout.addLayout(heading)
+        header_layout.addStretch(1)
+
+        self.rqt_graph_btn = QtWidgets.QPushButton("查看 RQT Graph", header)
+        self.rqt_graph_btn.setObjectName("headerTool")
+        self.rqt_graph_btn.setToolTip("打开当前 ROS 2 网络的节点与话题关系图")
+        self.rqt_graph_btn.clicked.connect(self.open_rqt_graph)
+        header_layout.addWidget(self.rqt_graph_btn)
+        self.rviz_btn = QtWidgets.QPushButton("启动 RViz", header)
+        self.rviz_btn.setObjectName("headerTool")
+        self.rviz_btn.setToolTip("按需打开用于建图、导航和任务点设置的 RViz")
+        self.rviz_btn.clicked.connect(self.open_rviz)
+        header_layout.addWidget(self.rviz_btn)
+        root.addWidget(header)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, central)
+        splitter.setChildrenCollapsible(False)
+
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(2, 2, 6, 2)
+        left_layout.setSpacing(10)
+        self.mission_control = MissionControlPanel(
+            launch_manager=self.launch_manager, bridge=self.bridge,
+            adapter=self.adapter, map_path=self.map_path, parent=left,
+        )
+        self.mission_control.ip_applied.connect(self._on_ip_applied)
+        self.localization = LocalizationPanel(adapter=self.adapter, parent=left)
+        self.mission = MissionPanel(
+            bridge=self.bridge, adapter=self.adapter,
+            launch_manager=self.launch_manager, parent=left,
+        )
+        self.log_panel = RuntimeLogPanel(left)
+        self.status_panel = RobotStatusPanel(left)
+        for panel in (self.mission_control, self.localization, self.mission,
+                      self.log_panel, self.status_panel):
+            left_layout.addWidget(panel)
+        left_layout.addStretch(1)
+
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(6, 2, 2, 2)
+        right_layout.setSpacing(10)
+        self.live_map = LiveMapPanel(right)
+        self.thermal = ThermalPanel(launch_manager=self.launch_manager, parent=right)
+        self.manual_drive = ManualDrivePanel(
+            adapter=self.adapter, bridge=self.bridge, parent=right
+        )
+        for panel in (self.live_map, self.thermal, self.manual_drive):
+            right_layout.addWidget(panel)
+        right_layout.addStretch(1)
+
+        self.left_scroll = self._make_scroll_area(left)
+        self.right_scroll = self._make_scroll_area(right)
+        splitter.addWidget(self.left_scroll)
+        splitter.addWidget(self.right_scroll)
+        splitter.setStretchFactor(0, 58)
+        splitter.setStretchFactor(1, 42)
+        splitter.setSizes([820, 590])
+        root.addWidget(splitter, 1)
+
+    @staticmethod
+    def _make_scroll_area(content):
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        return scroll
+
+    # ------------------------------------------------------------- tools
+    def open_rqt_graph(self):
+        """Start one managed rqt_graph instance with the UI's ROS environment."""
+        if self._rqt_process.state() != QtCore.QProcess.NotRunning:
+            self.bridge.put_log("[RQT] RQT Graph 已在运行")
+            return
+
+        executable = self._find_rqt_graph()
+        if not executable:
+            message = "未找到 rqt_graph，请安装 ROS 2 rqt_graph 软件包。"
+            self.bridge.put_log(f"[RQT] {message}")
+            QtWidgets.QMessageBox.warning(self, "无法启动 RQT Graph", message)
+            return
+
+        self.rqt_graph_btn.setText("RQT Graph 启动中…")
+        self.rqt_graph_btn.setEnabled(False)
+        self._rqt_process.setProgram(executable)
+        self._rqt_process.setArguments([])
+        self._rqt_process.start()
+
+    @staticmethod
+    def _find_rqt_graph():
+        return QtCore.QStandardPaths.findExecutable("rqt_graph")
+
+    def _on_rqt_started(self):
+        self.rqt_graph_btn.setText("RQT Graph 已打开")
+        self.rqt_graph_btn.setEnabled(True)
+        self.bridge.put_log("[RQT] RQT Graph 已启动")
+
+    def _on_rqt_finished(self, exit_code, _exit_status):
+        self.rqt_graph_btn.setText("查看 RQT Graph")
+        self.rqt_graph_btn.setEnabled(True)
+        self.bridge.put_log(f"[RQT] RQT Graph 已退出（代码 {exit_code}）")
+
+    def _on_rqt_error(self, _error):
+        message = self._rqt_process.errorString() or "未知错误"
+        self.rqt_graph_btn.setText("查看 RQT Graph")
+        self.rqt_graph_btn.setEnabled(True)
+        self.bridge.put_log(f"[RQT] 启动失败：{message}")
+        QtWidgets.QMessageBox.warning(
+            self, "RQT Graph 启动失败", f"无法启动 RQT Graph：{message}"
+        )
+
+    def _on_rqt_output(self):
+        output = bytes(self._rqt_process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        for line in output.splitlines():
+            if line.strip():
+                self.bridge.put_log(f"[RQT] {line}")
+
+    def _stop_rqt_graph(self):
+        if self._rqt_process.state() == QtCore.QProcess.NotRunning:
+            return
+        self._rqt_process.terminate()
+        if not self._rqt_process.waitForFinished(1500):
+            self._rqt_process.kill()
+            self._rqt_process.waitForFinished(500)
+
+    def open_rviz(self):
+        if self._rviz_process.state() != QtCore.QProcess.NotRunning:
+            self.bridge.put_log("[RViz] RViz 已在运行")
+            return
+        executable = QtCore.QStandardPaths.findExecutable("rviz2")
+        if not executable:
+            self._rviz_launch_error("未找到 rviz2，请安装 ROS 2 RViz 软件包。")
+            return
+        try:
+            config = os.path.join(
+                get_package_share_directory("sllidar_ros2"),
+                "rviz", "sllidar_ros2.rviz",
+            )
+        except Exception as exc:
+            self._rviz_launch_error(f"无法解析 sllidar_ros2 配置：{exc}")
+            return
+        if not os.path.isfile(config):
+            self._rviz_launch_error(f"RViz 配置不存在：{config}")
+            return
+        self.rviz_btn.setText("RViz 启动中…")
+        self.rviz_btn.setEnabled(False)
+        self._rviz_process.setProgram(executable)
+        self._rviz_process.setArguments(["-d", config])
+        self._rviz_process.start()
+
+    def _rviz_launch_error(self, message):
+        self.rviz_btn.setText("启动 RViz")
+        self.rviz_btn.setEnabled(True)
+        self.bridge.put_log(f"[RViz] {message}")
+        QtWidgets.QMessageBox.warning(self, "无法启动 RViz", message)
+
+    def _on_rviz_started(self):
+        self.rviz_btn.setText("RViz 已打开")
+        self.rviz_btn.setEnabled(True)
+        self.bridge.put_log("[RViz] RViz 已启动")
+
+    def _on_rviz_finished(self, exit_code, _exit_status):
+        self.rviz_btn.setText("启动 RViz")
+        self.rviz_btn.setEnabled(True)
+        self.bridge.put_log(f"[RViz] RViz 已退出（代码 {exit_code}）")
+
+    def _on_rviz_error(self, _error):
+        self._rviz_launch_error(self._rviz_process.errorString() or "未知错误")
+
+    def _on_rviz_output(self):
+        output = bytes(self._rviz_process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        for line in output.splitlines():
+            if line.strip():
+                self.bridge.put_log(f"[RViz] {line}")
+
+    def _stop_rviz(self):
+        if self._rviz_process.state() == QtCore.QProcess.NotRunning:
+            return
+        self._rviz_process.terminate()
+        if not self._rviz_process.waitForFinished(1500):
+            self._rviz_process.kill()
+            self._rviz_process.waitForFinished(500)
+
+    # ---------------------------------------------------------------- tick
+    def _on_ip_applied(self, text):
+        # Restart the health probe against the newly selected address.
+        if self.health_probe is not None:
+            self.health_probe.stop()
+        from .logic.remote_health import RemoteHealthProbe
+
+        self.health_probe = RemoteHealthProbe(
+            self.remote_user() if callable(getattr(self, "remote_user", None)) else "yy",
+            text,
+            interval=2.0,
+            callback=self.bridge.put_health,
+        )
+        self.health_probe.start()
+
+    def remote_user(self):
+        return self.mission_control.user_edit.text().strip() or "yy"
+
+    def _on_tick(self):
+        if self.adapter is not None:
+            alert = getattr(self.adapter, "pending_safety_alert", None)
+            if alert is not None:
+                self.adapter.pending_safety_alert = None
+                self.bridge.put_safety(*alert)
+        self.bridge.drain()
+        if self.adapter is not None and hasattr(self, "status_panel"):
+            now = time.time()
+            mode = "idle"
+            if self.launch_manager is not None:
+                active = self.launch_manager.active_name
+                if active in ("mapping", "navigation"):
+                    mode = active
+            rows = []
+            for name, tracker in self.adapter.topic_trackers.items():
+                snap = classify_topic(name, mode, tracker)
+                rows.append((name, snap))
+            self.status_panel.update_topics(rows)
+            self.status_panel.update_safety(
+                getattr(self.adapter, "safety_level", "WAITING"),
+                getattr(self.adapter, "safety_code", "INIT"),
+            )
+
+            gas_stamp = float(getattr(self.adapter, "last_gas_stamp", 0.0) or 0.0)
+            gas_state = (
+                "waiting" if gas_stamp <= 0.0 else
+                "online" if now - gas_stamp < 2.0 else "timeout"
+            )
+            self.status_panel.update_gas(
+                getattr(self.adapter, "gas_data", None), gas_state
+            )
+            # live map
+            map_msg = getattr(self.adapter, "map_data", None)
+            if map_msg is not None:
+                pose = self._robot_grid_pose()
+                revision = getattr(self.adapter, "map_revision", id(map_msg))
+                if revision != self._last_map_revision:
+                    self.live_map.update_map(map_msg, pose=pose)
+                    self._last_map_revision = revision
+                    self._last_robot_grid_pose = pose
+                elif pose != self._last_robot_grid_pose:
+                    self.live_map.update_pose(pose)
+                    self._last_robot_grid_pose = pose
+            # thermal
+            thermal_frame = getattr(self.adapter, "thermal_frame", None)
+            thermal_stamp = float(
+                getattr(self.adapter, "last_thermal_stamp", 0.0) or 0.0
+            )
+            thermal_state = (
+                "waiting" if thermal_stamp <= 0.0 else
+                "online" if now - thermal_stamp < 2.0 else "timeout"
+            )
+            if (thermal_state == "online" and thermal_frame and
+                    thermal_stamp != self._last_thermal_render_stamp):
+                self.thermal.update_frame(
+                    getattr(self.adapter, "thermal_width", 32),
+                    getattr(self.adapter, "thermal_height", 24),
+                    thermal_frame,
+                )
+                self._last_thermal_render_stamp = thermal_stamp
+            self.thermal.set_freshness(thermal_state)
+            self.status_panel.update_thermal_lamp(thermal_state)
+
+    def _robot_grid_pose(self):
+        if self.adapter.map_data is None:
+            return None
+        try:
+            x, y = world_to_grid(
+                self.adapter.map_data, self.adapter.robot_x, self.adapter.robot_y
+            )
+        except Exception:
+            return None
+        return x, y
+
+    def _on_safety_alert(self, level, code, message):
+        from python_qt_binding import QtWidgets
+
+        box = QtWidgets.QMessageBox(self)
+        box.setText(f"{code}: {message}")
+        if level == "FAULT":
+            box.setIcon(QtWidgets.QMessageBox.Critical)
+            box.setWindowTitle("安全故障")
+        else:
+            box.setIcon(QtWidgets.QMessageBox.Warning)
+            box.setWindowTitle("安全警告")
+        # non-modal: do not block the 200 ms tick loop
+        box.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        box.show()
+
+    # ------------------------------------------------------------- closing
+    def shutdown(self):
+        """Best-effort, idempotent cleanup of local and robot-side runtimes."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+
+        cleanup_steps = []
+        if hasattr(self, "_timer"):
+            cleanup_steps.append(self._timer.stop)
+        if hasattr(self, "_rqt_process"):
+            cleanup_steps.append(self._stop_rqt_graph)
+        if hasattr(self, "_rviz_process"):
+            cleanup_steps.append(self._stop_rviz)
+        if hasattr(self, "manual_drive"):
+            cleanup_steps.append(self.manual_drive.stop_all)
+        if self.health_probe is not None:
+            cleanup_steps.append(self.health_probe.stop)
+        if self.launch_manager is not None:
+            stop_thermal = getattr(self.launch_manager, "stop_thermal", None)
+            stop_runtime = getattr(self.launch_manager, "stop", None)
+            if callable(stop_thermal):
+                cleanup_steps.append(stop_thermal)
+            if callable(stop_runtime):
+                cleanup_steps.append(stop_runtime)
+        if self.adapter is not None:
+            cleanup_steps.append(self.adapter.shutdown)
+
+        for step in cleanup_steps:
             try:
-                current_cbar.remove()
+                step()
             except Exception:
                 pass
-            current_cbar = None
 
-        if not self.ros.thermal_frame:
-            ax.text(
-                0.5,
-                0.5,
-                "No /thermal_frame data yet",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                fontsize=12,
-                color="red",
-            )
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 1)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            return current_cbar
-
-        cols = max(1, self.ros.thermal_width)
-        rows = max(1, self.ros.thermal_height)
-        frame = self.ros.thermal_frame[: rows * cols]
-        matrix = [frame[row * cols:(row + 1) * cols] for row in range(rows)]
-        vmin = self.ros.thermal_min if self.ros.thermal_min > 0 else 20.0
-        vmax = self.ros.thermal_max if self.ros.thermal_max > 0 else 75.0
-
-        plot = ax.imshow(matrix, cmap="inferno", vmin=vmin, vmax=vmax)
-        current_cbar = figure.colorbar(plot, ax=ax, shrink=0.82)
-        current_cbar.set_label("Temp (C)", fontsize=9)
-
-        ax.text(
-            0.02,
-            0.95,
-            f"Min: {self.ros.thermal_min:.1f}C",
-            transform=ax.transAxes,
-            color="cyan",
-            fontsize=9,
-            bbox=dict(facecolor="black", alpha=0.5),
-        )
-        ax.text(
-            0.02,
-            0.90,
-            f"Max: {self.ros.thermal_max:.1f}C",
-            transform=ax.transAxes,
-            color="red",
-            fontsize=9,
-            bbox=dict(facecolor="black", alpha=0.5),
-        )
-        ax.text(
-            0.02,
-            0.85,
-            f"Avg: {self.ros.thermal_avg:.1f}C",
-            transform=ax.transAxes,
-            color="lime",
-            fontsize=9,
-            bbox=dict(facecolor="black", alpha=0.5),
-        )
-
-        if self.ros.thermal_change_ready:
-            delta_text = f"Delta/min: {self.ros.thermal_change_per_min:.1f}C"
-            delta_color = "red" if self.ros.thermal_change_per_min > 0 else "cyan"
-        else:
-            delta_text = "Delta/min: collecting..."
-            delta_color = "white"
-        ax.text(
-            0.02,
-            0.80,
-            delta_text,
-            transform=ax.transAxes,
-            color=delta_color,
-            fontsize=9,
-            bbox=dict(facecolor="black", alpha=0.5),
-        )
-
-        ax.set_xlabel("Pixel X (32)", fontsize=9)
-        ax.set_ylabel("Pixel Y (24)", fontsize=9)
-        ax.set_title(title, fontsize=11)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        return current_cbar
-
-    def on_close(self):
-        if self.closing:
-            return
-        self.closing = True
-        self.health_probe.stop()
-        try:
-            self._cancel_initial_pose_retry()
-            self.stop_robot()
-            self.stop_thermal()
-            self.launch_manager.stop()
-            self.ros.shutdown()
-        finally:
-            if self.thermal_window is not None and self.thermal_window.winfo_exists():
-                self._close_thermal_window()
-            self.root.destroy()
+    def closeEvent(self, event):
+        self.shutdown()
+        event.accept()
 
 
+# ---------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------
 def main(args=None):
-    root = tk.Tk()
-    ros_adapter = RosUiAdapter(args=args)
-    app = RobotControlApp(root, ros_adapter)
+    if args is None:
+        args = sys.argv
+    app = QtWidgets.QApplication(args)
+    app.setStyleSheet(STYLE_QSS)
 
-    def request_close(_signum, _frame):
-        try:
-            root.after(0, app.on_close)
-        except tk.TclError:
-            pass
+    adapter = RosUiAdapter(args=args)
+    node = adapter.node
+    workspace_path = node.declare_parameter(
+        "workspace_path", "/home/yy/ros2_ws"
+    ).value
+    remote_user = node.declare_parameter("remote_user", "yy").value
+    remote_host = node.declare_parameter(
+        "remote_host", "192.168.43.31"
+    ).value
+    ros_setup_path = node.declare_parameter(
+        "ros_setup_path", "/opt/ros/jazzy/setup.bash"
+    ).value
+    map_path = node.declare_parameter(
+        "map_path", "/home/yy/ros2_ws/map_name.yaml"
+    ).value
 
-    signal.signal(signal.SIGINT, request_close)
-    signal.signal(signal.SIGTERM, request_close)
+    bridge = QtBridge()
+    launch_manager = LaunchManager(
+        workspace_path,
+        remote_user,
+        remote_host,
+        ros_setup_path,
+        bridge.put_log,
+    )
+    from .logic.remote_health import RemoteHealthProbe
+
+    health_probe = RemoteHealthProbe(
+        remote_user,
+        remote_host,
+        interval=2.0,
+        callback=bridge.put_health,
+    )
+    health_probe.start()
+    window = QtMainWindow(
+        bridge=bridge,
+        adapter=adapter,
+        launch_manager=launch_manager,
+        health_probe=health_probe,
+        map_path=map_path,
+    )
+    window.show()
     try:
-        root.mainloop()
+        return app.exec_()
     finally:
-        try:
-            if root.winfo_exists():
-                app.on_close()
-        except tk.TclError:
-            pass
+        window.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

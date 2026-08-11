@@ -4,11 +4,11 @@ import sys
 import time
 from pathlib import Path
 
-PKG = Path(__file__).resolve().parents[1] / "robot_control_ui"
+PKG = Path(__file__).resolve().parents[1]
 if str(PKG) not in sys.path:
     sys.path.insert(0, str(PKG))
 
-from topic_health import EXPECTED, TopicHealthTracker, classify
+from robot_control_ui.logic.topic_health import EXPECTED, TopicHealthTracker, classify
 
 
 def _tracker_at(hz, seconds, start=None):

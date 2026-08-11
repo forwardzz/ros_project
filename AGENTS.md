@@ -8,7 +8,7 @@ Use this file as the first project context for future coding agents.
 
 - Local repo: `/home/zjy/Desktop/ros_project_git_2026-05-20`
 - Local ROS workspace: `/home/zjy/Desktop/ros_project_git_2026-05-20/ros_ws`
-- Robot host: `yy@192.168.43.30`
+- Robot host: `yy@192.168.43.31`
 - Robot source directory: `/home/yy/ros2_ws/src`
 - ROS distro: `jazzy`
 - Main branch remote: `git@github.com:forwardzz/ros_project.git`
@@ -26,7 +26,7 @@ Always treat the git tree as potentially dirty. Do not revert user changes unles
   - `config/slam.yaml`: `slam_toolbox` mapping parameters.
 - `sllidar_ros2`: SLLIDAR/RPLIDAR driver publishing `/scan`.
 - `rf2o_laser_odometry`: laser odometry publishing `/odom` and `odom -> base_link` TF.
-- `robot_control_ui`: Tkinter desktop UI, normally run on the host PC, not on the Raspberry Pi display.
+- `robot_control_ui`: Qt desktop UI, normally run on the host PC, not on the Raspberry Pi display.
 - `robot_monitor_interfaces`: mission, gas, and UI-related custom messages/services.
 - `robot_mission_utils`: helper planning utilities used by mission preview/validation.
 - `imu_ros2_device` and `YbImuLib`: retained in the repo, but IMU is not part of the default mapping/navigation chain.
@@ -86,7 +86,7 @@ cd /home/zjy/Desktop/ros_project_git_2026-05-20
 ./start.sh
 ```
 
-`start.sh` builds the affected local packages, enforces a single local console, and starts the host Tk UI plus RViz. It does not automatically start mapping or navigation on the robot. Start and stop the selected robot mode through the UI. Do not launch a second UI/RViz manually.
+`start.sh` builds the affected local packages, enforces a single local console, and starts only the host Qt UI. It does not automatically start RViz, mapping, or navigation. Open the managed host RViz with the UI's `启动 RViz` button, and start or stop the selected robot mode through the UI. Do not launch a second UI manually.
 
 ## RViz Mission Workflow
 
@@ -97,15 +97,15 @@ Use RViz for mission points. The UI should only confirm and start the mission.
 - `2D Goal Pose (Mission Heading)` publishes `/mission_goal_pose` and only updates the nearest mission point heading.
 - `Clear RViz Points` clears mission-manager cached RViz points and preview markers.
 
-Mission ordering is explicit in the Tk UI. `TSP` defaults on and optimizes ordinary points and regions; when it is off, execution must preserve the operator-provided point/region order. Never reorder without reflecting the selected mode in the UI and mission status.
+Mission ordering is explicit in the Qt UI. `TSP` defaults on and optimizes ordinary points and regions; when it is off, execution must preserve the operator-provided point/region order. Never reorder without reflecting the selected mode in the UI and mission status.
 
 ## UI Notes
 
-The UI is a Tkinter application intended to run on the host PC. It subscribes to robot ROS topics over DDS and uses SSH to launch/stop processes on the Raspberry Pi.
+The UI is a Qt application intended to run on the host PC. It subscribes to robot ROS topics over DDS and uses SSH to launch/stop processes on the Raspberry Pi.
 
 Current UI layout is intentionally preserved by user request. Be careful when changing `robot_control_ui.py`; layout regressions are easy because status cards, runtime log, thermal panel, map, and manual drive all compete for vertical space.
 
-If the UI appears unchanged after a code edit, close the current `start.sh` console and run `./start.sh` again. Its exact local cleanup avoids duplicate UI/RViz processes.
+If the UI appears unchanged after a code edit, close the current `start.sh` console and run `./start.sh` again. Its exact local cleanup avoids duplicate UI processes; RViz opened from the UI is also closed with that window.
 
 ## Networking And QoS
 
@@ -156,7 +156,7 @@ source /opt/ros/jazzy/setup.bash
 colcon build --packages-select <changed_package>
 ```
 
-For robot-side changes, sync to `yy@192.168.43.30:/home/yy/ros2_ws/src/...` and build on the robot when the user expects immediate testing.
+For robot-side changes, sync to `yy@192.168.43.31:/home/yy/ros2_ws/src/...` and build on the robot when the user expects immediate testing.
 
 Useful runtime checks:
 
@@ -183,7 +183,7 @@ Keep commits focused. If there are unrelated dirty files, leave them alone and r
 
 ## UI 网络与状态监控（2026-08 改造）
 
-- 默认机器人 SSH 地址为 `yy@192.168.43.30`，可用 `REMOTE_HOST=<addr> ./start.sh` 覆盖。
+- 默认机器人 SSH 地址为 `yy@192.168.43.31`，可用 `REMOTE_HOST=<addr> ./start.sh` 覆盖。
 - Mission Control 的 `Scan LAN` / `Refresh` / `Apply IP` 执行局域网尽力发现（邻居表 + TCP 22 探测，不要求管理员权限，不依赖 nmap）；任务运行中禁止切换地址。
 - `Robot Status` 的系统卡片通过 `RemoteHealthProbe`（后台 SSH，`BatchMode=yes` + `ConnectTimeout=2`）采集温度/CPU/内存/负载/运行时间/欠压，断线保留末值并标记过期。
 - 电压边界：`vcgencmd measure_volts` 是 CPU 核心电压；5V 输入电压在无 ADC/遥测路径时一律显示 `N/A (no ADC)`。

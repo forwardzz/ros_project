@@ -19,7 +19,13 @@
   <depend>robot_monitor_interfaces</depend>
   <depend>robot_mission_utils</depend>
 
+  <exec_depend>python_qt_binding</exec_depend>
+  <exec_depend>rqt_graph</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>sllidar_ros2</exec_depend>
+
   <test_depend>python3-pytest</test_depend>
+  <test_depend>python_qt_binding</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

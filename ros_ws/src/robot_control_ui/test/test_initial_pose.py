@@ -2,7 +2,7 @@ import math
 
 from builtin_interfaces.msg import Time
 
-from robot_control_ui.initial_pose import (
+from robot_control_ui.logic.initial_pose import (
     INITIAL_POSE_COVARIANCE_XY,
     INITIAL_POSE_COVARIANCE_YAW,
     InitialPoseRetryState,

@@ -17,7 +17,7 @@ ROS 2 Jazzy 履带机器人项目。源码工作区在 `ros_ws/src`，树莓派�
         │   ├── config/                 # Nav2、SLAM、行为树参数
         │   ├── launch/                 # mapping/navigation/sensor launch
         │   └── mapping_bringup/        # 机器人运行节点
-        ├── robot_control_ui/           # 电脑端 Tkinter 控制界面
+        ├── robot_control_ui/           # 电脑端 Qt 控制界面
         ├── robot_monitor_interfaces/   # 自定义 msg/srv
         ├── robot_mission_utils/        # 任务点、路径、碰撞检查工具
         ├── sllidar_ros2/               # RPLIDAR 驱动和 RViz 配置
@@ -109,11 +109,11 @@ cd /home/zjy/Desktop/ros_project_git_2026-05-20
 ./start.sh
 ```
 
-`start.sh` 会在正确的 `ros_ws` 目录编译受影响包，清理本机旧 UI/RViz，然后启动唯一的 Tk 控制台和 RViz。它不会自动让树莓派进入建图或导航；使用 UI 中的 `Start Mapping` / `Start Navigation` 选择模式。重复执行会被单实例锁拒绝。
+`start.sh` 会在正确的 `ros_ws` 目录编译受影响包，清理本机旧 UI，然后只启动唯一的 Qt 控制台。RViz 不再默认启动，可在界面顶部点击“启动 RViz”按需打开；它不会自动让树莓派进入建图或导航。使用 UI 中的 `Start Mapping` / `Start Navigation` 选择模式，重复执行会被单实例锁拒绝。
 
 ## RViz 操作
 
-导航启动后，可在 Tk 界面的 `Localization and Initial Pose` 输入 X/Y/Yaw 并点击 `Set Initial Pose`；也保留 RViz `2D Pose Estimate` 方式。
+导航启动后，可在 Qt 界面的 `Localization and Initial Pose` 输入 X/Y/Yaw 并点击 `Set Initial Pose`；也保留 RViz `2D Pose Estimate` 方式。
 
 RViz 工具用途：
 
@@ -123,7 +123,7 @@ RViz 工具用途：
 
 任务执行规则：
 
-- Tk 中 `TSP` 默认开启：普通多点任务按地图可通行路径代价优化顺序；关闭后严格保留 RViz 点击/请求顺序
+- Qt 界面中 `TSP` 默认开启：普通多点任务按地图可通行路径代价优化顺序；关闭后严格保留 RViz 点击/请求顺序
 - 10 个及以下目标使用精确开放式 TSP，更多目标使用最近邻加 2-opt；区域 TSP 同时选择区域顺序和正/反扫方向
 - `Return to Start` 默认关闭；开启后仅在全部巡检成功时返回任务启动瞬间记录的 AMCL 位姿
 - 只有 UI 启用 `Region Mode` 时才执行区域巡检，已保存区域不会抢占普通多点任务
@@ -150,7 +150,7 @@ RViz 主要显示：
 - 区域巡检模式开关、保存、加载、清空
 - 安全故障复位
 
-本机 UI/RViz 旧进程由 `start.sh` 自动清理，不要另外手工启动第二份 UI 或 RViz。
+本机 UI 旧进程由 `start.sh` 自动清理。由界面启动的 RViz 采用单实例管理并在主窗口关闭时退出，不影响其他方式启动的 RViz。
 
 ## 网络与 QoS
 

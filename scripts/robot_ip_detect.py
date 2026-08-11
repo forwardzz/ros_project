@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Detect the robot (Raspberry Pi) IP on the current LAN.
 
-Used by start.sh so the TK UI always launches with the correct device
+Used by start.sh so the Qt UI always launches with the correct device
 address.  Reuses robot_control_ui.network_discovery for scanning.
 
 Modes:
@@ -21,11 +21,11 @@ import sys
 from pathlib import Path
 
 
-PKG = Path(__file__).resolve().parents[1] / "ros_ws" / "src" / "robot_control_ui" / "robot_control_ui"
+PKG = Path(__file__).resolve().parents[1] / "ros_ws" / "src" / "robot_control_ui"
 if str(PKG) not in sys.path:
     sys.path.insert(0, str(PKG))
 
-from network_discovery import scan_subnet  # noqa: E402
+from robot_control_ui.logic.network_discovery import scan_subnet  # noqa: E402
 
 
 EXCLUDED_NETS = ("169.254.0.0/16", "26.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12")
@@ -132,6 +132,13 @@ def main(argv=None):
     p_val = sub.add_parser("validate", help="exit 0 when the IP is a valid IPv4")
     p_val.add_argument("--ip", required=True)
 
+    p_fast = sub.add_parser(
+        "fast-check", help="exit 0 when passwordless SSH works for one IP"
+    )
+    p_fast.add_argument("--ip", required=True)
+    p_fast.add_argument("--user", default="yy")
+    p_fast.add_argument("--timeout", type=float, default=3.0)
+
     args = parser.parse_args(argv)
     if args.mode == "detect":
         print(json.dumps(detect(args.user, args.timeout)))
@@ -139,9 +146,11 @@ def main(argv=None):
         ip = wsl_ip_for_host(args.for_host)
         print(ip if ip else "")
     elif args.mode == "validate":
-        from network_discovery import is_valid_ipv4  # noqa: F811
+        from robot_control_ui.logic.network_discovery import is_valid_ipv4  # noqa: F811
 
         sys.exit(0 if is_valid_ipv4(args.ip) else 1)
+    elif args.mode == "fast-check":
+        sys.exit(0 if passwordless_ssh_ok(args.user, args.ip, args.timeout) else 1)
 
 
 if __name__ == "__main__":

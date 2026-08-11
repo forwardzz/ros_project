@@ -20,27 +20,45 @@ HOST_ONLY = pytest.mark.skipif(
 def test_start_script_is_valid_and_is_local_console_only():
     subprocess.run(["bash", "-n", str(START_SCRIPT)], check=True)
     assert 'cd "${WORKSPACE}"' in START_SOURCE
-    assert "colcon build --packages-select" in START_SOURCE
+    assert "colcon build --packages-up-to" in START_SOURCE
+    assert "mapping_bringup" in START_SOURCE
+    assert "robot_control_ui" in START_SOURCE
+    assert "将编译主机所需包及本地依赖" in START_SOURCE
+    # WSLg display hardening: Qt5/RViz use XWayland and a private runtime dir.
+    assert 'QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"' in START_SOURCE
+    assert 'chmod 700 "${XDG_RUNTIME_DIR}"' in START_SOURCE
     assert "flock -n 9" in START_SOURCE
     assert "trap cleanup EXIT INT TERM HUP" in START_SOURCE
     assert "ros2 launch robot_control_ui ui.launch.py" in START_SOURCE
-    assert 'rviz2 -d "${RVIZ_CONFIG}"' in START_SOURCE
+    assert "RVIZ_CONFIG" not in START_SOURCE
+    assert "RVIZ_PID" not in START_SOURCE
+    assert "setsid rviz2" not in START_SOURCE
+    assert 'wait "${UI_PID}"' in START_SOURCE
     assert "mapping.launch.py" not in START_SOURCE
     assert "navigation.launch.py" not in START_SOURCE
     # dynamic robot-IP detection & robot-side CycloneDDS sync
     assert "robot_ip_detect.py" in START_SOURCE
-    assert 'REMOTE_HOST="${REMOTE_HOST:-__AUTO__}"' in START_SOURCE
+    assert 'REMOTE_HOST="${REMOTE_HOST:-192.168.43.31}"' in START_SOURCE
     assert "ssh -o BatchMode=yes" in START_SOURCE
     assert "generate_cyclone_xml" in START_SOURCE
     # build-choice prompt: interactive default-build, SKIP_BUILD override
     assert 'read -r -p "[BUILD]' in START_SOURCE
     assert "SKIP_BUILD" in START_SOURCE
     assert 'BUILD_CHOICE="build"' in START_SOURCE
+    # Qt is the only interface backend and uses the canonical executable.
+    assert "ROBOT_UI_BACKEND" not in START_SOURCE
+    assert "robot_control_ui_qt" not in START_SOURCE
+    assert "ui_executable" not in START_SOURCE
+    assert 'echo "[UI] Qt interface"' in START_SOURCE
+    # last-known-IP fast path
+    assert 'LAST_IP_FILE="${HOME}/.ros_device_ip"' in START_SOURCE
+    assert "fast-check" in START_SOURCE
+    assert "上次地址仍在线" in START_SOURCE
 
 
 @HOST_ONLY
-def test_start_script_rejects_a_second_instance_before_building():
-    lock_path = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / (
+def test_start_script_rejects_a_second_instance_before_building(tmp_path):
+    lock_path = tmp_path / (
         f"ros_project_control_{os.getuid()}.lock"
     )
     with lock_path.open("w", encoding="utf-8") as lock_file:
@@ -56,6 +74,7 @@ def test_start_script_rejects_a_second_instance_before_building():
             text=True,
             timeout=5,
             check=False,
+            env={**os.environ, "XDG_RUNTIME_DIR": str(tmp_path)},
         )
     assert result.returncode == 1
     assert "already running" in result.stdout
