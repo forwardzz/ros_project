@@ -9,7 +9,7 @@ cd /home/zjy/Desktop/ros_project_git_2026-05-20
 
 `start.sh` 会：
 
-- 在 `ros_ws` 中编译界面、任务和安全链相关包
+- 在 `ros_ws` 中编译界面和任务相关包
 - 设置 `ROS_DOMAIN_ID=0` 和 `ROS_LOCALHOST_ONLY=0`
 - 清理本机残留的 Qt UI
 - 启动唯一的 Qt 控制台（不默认启动 RViz）

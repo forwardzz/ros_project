@@ -33,15 +33,13 @@ ROS 2 Jazzy 履带机器人项目。源码工作区在 `ros_ws/src`，树莓派�
 - `mapping_bringup`
   - `launch/mapping.launch.py`：建图链路
   - `launch/navigation.launch.py`：导航链路
-  - `mapping_bringup/tracked_motor_driver.py`：GPIO/PWM 底盘驱动，订阅 `/cmd_vel`
+  - `mapping_bringup/tracked_motor_driver.py`：创乐博 V3.0 两路直连 GPIO 电机驱动，订阅 `/cmd_vel`；左侧使用 BCM 18/22/27，右侧使用 BCM 23/25/24，板上的 PCA9685 三针 PWM 口不用于电机输出
   - `mapping_bringup/mission_manager.py`：RViz 任务点、区域巡检、直接导航桥接
   - `mapping_bringup/actual_path_recorder.py`：发布 `/actual_path`
-  - `mapping_bringup/safety_monitor.py`：导航安全监控
-  - `mapping_bringup/velocity_safety_gate.py`：唯一 `/cmd_vel` 发布者，统一仲裁手动与自主速度
 - `robot_control_ui`
   - 电脑端 UI，通过 ROS 2 DDS 读状态，通过 SSH 控制树莓派启动/停止任务
 - `robot_monitor_interfaces`
-  - 任务点、气体、安全状态、UI 服务等接口
+  - 任务点、气体和 UI 服务等接口
 - `robot_mission_utils`
   - 地图栅格、任务点校验、A*/Theta* 路径预览和碰撞检查
 - `sllidar_ros2`
@@ -67,8 +65,9 @@ ROS 2 Jazzy 履带机器人项目。源码工作区在 `ros_ws/src`，树莓派�
 - `tracked_motor_driver`
 - `mission_manager`
 - `actual_path_recorder`
-- `safety_monitor`
 - Nav2：`map_server`、`amcl`、`planner_server`、`controller_server`、`bt_navigator`、`behavior_server`、`smoother_server`、`velocity_smoother`、lifecycle manager
+
+手动控制由主机 UI 直接发布 `/cmd_vel`；导航速度经 `velocity_smoother` 后直接发布 `/cmd_vel`。当前运行链路不包含速度安全门或独立安全监控节点。
 
 不要同时运行建图和导航。`slam_toolbox` 与 `map_server + amcl` 都参与 `map` 链路，同时运行会造成 TF 或定位冲突。
 
@@ -145,10 +144,9 @@ RViz 主要显示：
 - 设置 AMCL 初始位姿并显示确认结果
 - 保存地图
 - 按住按钮或键盘持续手动控制底盘，松开立即停车
-- 查看 `/scan`、`/odom`、`/map`、安全状态、热成像和气体数据
+- 查看 `/scan`、`/odom`、`/map`、热成像和气体数据
 - RViz 任务启动、TSP/返航选择、定位检查、任务点清空
 - 区域巡检模式开关、保存、加载、清空
-- 安全故障复位
 
 本机 UI 旧进程由 `start.sh` 自动清理。由界面启动的 RViz 采用单实例管理并在主窗口关闭时退出，不影响其他方式启动的 RViz。
 

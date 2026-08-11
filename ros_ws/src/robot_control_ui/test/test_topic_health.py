@@ -79,4 +79,4 @@ def test_expected_spec_contains_required_topics():
     assert "/scan" in EXPECTED["mapping"]
     assert "/map" in EXPECTED["mapping"]
     assert "/amcl_pose" in EXPECTED["navigation"]
-    assert "/robot_safety_status" in EXPECTED["mapping"]
+    assert "/robot_safety_status" not in EXPECTED["mapping"]

@@ -22,7 +22,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import SetBool, Trigger
 
-from robot_monitor_interfaces.msg import GasData, MissionStatus, RobotSafetyStatus
+from robot_monitor_interfaces.msg import GasData, MissionStatus
 from robot_monitor_interfaces.srv import Localize, StartNavigation
 
 from .logic.initial_pose import make_initial_pose_message
@@ -44,7 +44,6 @@ class RosUiAdapter:
             "/odom": TopicHealthTracker("/odom"),
             "/map": TopicHealthTracker("/map"),
             "/amcl_pose": TopicHealthTracker("/amcl_pose"),
-            "/robot_safety_status": TopicHealthTracker("/robot_safety_status"),
             "/mission_status_typed": TopicHealthTracker("/mission_status_typed"),
         }
 
@@ -55,7 +54,7 @@ class RosUiAdapter:
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self.cmd_vel_pub = self.node.create_publisher(Twist, "/cmd_vel_teleop", 10)
+        self.cmd_vel_pub = self.node.create_publisher(Twist, "/cmd_vel", 10)
         self.initial_pose_pub = self.node.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", 10
         )
@@ -74,9 +73,6 @@ class RosUiAdapter:
         )
         self.gas_sub = self.node.create_subscription(
             GasData, "/gas_data", self._gas_cb, 10
-        )
-        self.safety_sub = self.node.create_subscription(
-            RobotSafetyStatus, "/robot_safety_status", self._safety_cb, map_qos
         )
         self.mission_status_sub = self.node.create_subscription(
             MissionStatus, "/mission_status_typed", self._mission_status_cb, map_qos
@@ -101,18 +97,12 @@ class RosUiAdapter:
         self.load_inspection_regions_client = self.node.create_client(
             Trigger, "/load_inspection_regions"
         )
-        self.reset_safety_client = self.node.create_client(
-            Trigger, "/reset_safety_monitor"
-        )
         self.abort_mission_client = self.node.create_client(Trigger, "/abort_mission")
         self.undo_rviz_point_client = self.node.create_client(
             Trigger, "/undo_last_rviz_point"
         )
         self.undo_region_client = self.node.create_client(
             Trigger, "/undo_last_inspection_region"
-        )
-        self.software_estop_client = self.node.create_client(
-            SetBool, "/set_software_estop"
         )
 
         self.robot_x = 0.0
@@ -147,18 +137,6 @@ class RosUiAdapter:
             "VOC": 0.0,
             "Smoke": 0.0,
         }
-        self.safety_level = 'WAITING'
-        self.safety_code = 'INIT'
-        self.safety_message = 'No safety data'
-        self.safety_mission_active = False
-        self.safety_voltage_available = False
-        self.safety_measured_voltage_v = float('nan')
-        self.safety_undervoltage_now = False
-        self.safety_undervoltage_seen = False
-        self.safety_throttled_flags = 0
-        self.last_safety_stamp = 0.0
-        self.pending_safety_alert = None
-        self.last_safety_alert_signature = None
         self.mission_state = "IDLE"
         self.mission_mode = "waypoints"
         self.mission_message = "No mission"
@@ -232,26 +210,6 @@ class RosUiAdapter:
             self.thermal_baseline_avg = self.thermal_avg
             self.thermal_baseline_time = now
         self.last_thermal_stamp = time.time()
-
-    def _safety_cb(self, msg):
-        self.safety_level = msg.level or 'WAITING'
-        self.safety_code = msg.code or 'UNKNOWN'
-        self.safety_message = msg.message or 'No details'
-        self.safety_mission_active = bool(msg.mission_active)
-        self.safety_voltage_available = bool(msg.voltage_available)
-        self.safety_measured_voltage_v = float(msg.measured_voltage_v)
-        self.safety_undervoltage_now = bool(msg.undervoltage_now)
-        self.safety_undervoltage_seen = bool(msg.undervoltage_seen)
-        self.safety_throttled_flags = int(msg.throttled_flags)
-        now = time.time()
-        self.last_safety_stamp = now
-        self.topic_trackers["/robot_safety_status"].track(
-            now, self.safety_sub.get_publisher_count()
-        )
-        signature = (self.safety_level, self.safety_code, self.safety_message)
-        if self.safety_level in ('WARN', 'FAULT') and signature != self.last_safety_alert_signature:
-            self.pending_safety_alert = signature
-            self.last_safety_alert_signature = signature
 
     def _mission_status_cb(self, msg):
         self.mission_state = msg.state or "IDLE"

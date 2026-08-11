@@ -14,7 +14,7 @@ def test_ros_adapter_creates_trackers_before_callbacks():
     try:
         expected = {
             "/scan", "/odom", "/map", "/amcl_pose",
-            "/robot_safety_status", "/mission_status_typed",
+            "/mission_status_typed",
         }
         assert expected.issubset(set(adapter.topic_trackers))
     finally:

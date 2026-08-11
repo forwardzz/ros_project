@@ -74,8 +74,6 @@ class LaunchManager:
             "ybimu_driver",
             "ekf_node",
             "tracked_motor_driver",
-            "safety_monitor",
-            "velocity_safety_gate",
         ]
         mapping = ["slam_toolbox"]
         navigation = [

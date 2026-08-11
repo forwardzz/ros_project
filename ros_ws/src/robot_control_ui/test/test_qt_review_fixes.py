@@ -25,9 +25,6 @@ class _FakeLM:
 
 class _FakeAdapter:
     topic_trackers = {}
-    safety_level = "NORMAL"
-    safety_message = ""
-    pending_safety_alert = None
     start_navigation_client = "start_navigation"
     calls = []
 
@@ -75,23 +72,6 @@ def test_start_mission_builds_request():
     assert request.return_to_start is False
     assert request.waypoint_pause_sec == 3.0
     panel.close()
-
-
-def test_pending_safety_alert_forwarded():
-    from robot_control_ui.robot_control_ui import QtBridge, QtMainWindow
-
-    adapter = _FakeAdapter()
-    adapter.pending_safety_alert = ("FAULT", "TEST-1", "latch message")
-    bridge = QtBridge()
-    win = QtMainWindow(bridge=bridge, adapter=adapter, launch_manager=_FakeLM())
-    alerts = []
-    bridge.safety_alert_received.connect(
-        lambda l, c, m: alerts.append((l, c, m))
-    )
-    win._on_tick()
-    assert alerts == [("FAULT", "TEST-1", "latch message")]
-    assert adapter.pending_safety_alert is None
-    win.close()
 
 
 def test_scan_dialog_status_emits_signal():

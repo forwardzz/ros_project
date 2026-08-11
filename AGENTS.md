@@ -20,7 +20,7 @@ Always treat the git tree as potentially dirty. Do not revert user changes unles
 - `mapping_bringup`: launch files and robot-specific Python nodes.
   - `launch/mapping.launch.py`: mapping pipeline.
   - `launch/navigation.launch.py`: navigation pipeline.
-  - `mapping_bringup/tracked_motor_driver.py`: GPIO motor driver subscribing to `/cmd_vel`.
+  - `mapping_bringup/tracked_motor_driver.py`: active CLB V3.0 direct-GPIO motor driver subscribing to `/cmd_vel`; left uses BCM 18/22/27 and right uses BCM 23/25/24. The PCA9685 three-pin headers are servo PWM outputs, not the two-pin motor outputs.
   - `mapping_bringup/mission_manager.py`: RViz mission-point handling and mission execution.
   - `config/nav2_params.yaml`: Nav2 controller, planner, costmap, AMCL, and smoother parameters.
   - `config/slam.yaml`: `slam_toolbox` mapping parameters.
@@ -51,6 +51,8 @@ Navigation mode starts:
 - `tracked_motor_driver`
 - `mission_manager`
 - Nav2: `map_server`, `amcl`, `planner_server`, `controller_server`, `bt_navigator`, `behavior_server`, `smoother_server`, `velocity_smoother`, lifecycle manager
+
+Manual control publishes directly to `/cmd_vel`. Nav2 output is smoothed and then also publishes directly to `/cmd_vel`. The default runtime no longer includes `velocity_safety_gate` or `safety_monitor`; there is no software-estop or safety-heartbeat arbitration layer.
 
 Do not run mapping and navigation at the same time. `slam_toolbox` and `map_server + amcl` both participate in the `map` chain and can create TF/localization conflicts if run together.
 
@@ -181,7 +183,7 @@ Avoid touching deleted legacy `robot_monitor_ws_src` files unless the user speci
 
 Keep commits focused. If there are unrelated dirty files, leave them alone and report that they were not included.
 
-## UI 网络与状态监控（2026-08 改造）
+## UI 网络与状态监控
 
 - 默认机器人 SSH 地址为 `yy@192.168.43.31`，可用 `REMOTE_HOST=<addr> ./start.sh` 覆盖。
 - Mission Control 的 `Scan LAN` / `Refresh` / `Apply IP` 执行局域网尽力发现（邻居表 + TCP 22 探测，不要求管理员权限，不依赖 nmap）；任务运行中禁止切换地址。

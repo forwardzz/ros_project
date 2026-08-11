@@ -32,8 +32,6 @@ setup(
             "mission_manager = mapping_bringup.mission_manager:main",
             "thermal_camera_node = mapping_bringup.thermal_camera_node:main",
             "gas_sensor_node = mapping_bringup.gas_sensor_node:main",
-            "safety_monitor = mapping_bringup.safety_monitor:main",
-            "velocity_safety_gate = mapping_bringup.velocity_safety_gate:main",
             "actual_path_recorder = mapping_bringup.actual_path_recorder:main",
         ],
     },

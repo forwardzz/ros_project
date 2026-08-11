@@ -16,14 +16,12 @@ EXPECTED = {
         "/scan": 5.0,
         "/odom": 10.0,
         "/map": None,          # static map: special semantics
-        "/robot_safety_status": 1.0,
     },
     "navigation": {
         "/scan": 5.0,
         "/odom": 10.0,
         "/map": None,
         "/amcl_pose": 1.0,
-        "/robot_safety_status": 1.0,
         "/mission_status_typed": 1.0,
     },
 }
@@ -155,8 +153,8 @@ def classify(
 
 
 def _mode_requires(mode: str, name: str) -> bool:
-    # scan/odom/safety are hard requirements; map too after data expected
-    return name in ("/scan", "/odom", "/robot_safety_status", "/map")
+    # scan/odom are hard requirements; map too after data expected
+    return name in ("/scan", "/odom", "/map")
 
 
 def _fmt_rate(rate) -> str:

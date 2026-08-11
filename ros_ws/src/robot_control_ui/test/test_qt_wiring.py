@@ -41,6 +41,7 @@ def test_main_window_wires_launch_manager_to_mission_control():
     bridge = QtBridge()
     win = QtMainWindow(bridge=bridge, adapter=FakeAdapter(), launch_manager=lm)
     assert win.mission_control.launch_manager is lm
+    assert win.manual_drive.launch_manager is lm
     win.mission_control._start("mapping", "ros2 launch mapping_bringup mapping.launch.py")
     assert lm.started == [("mapping", "ros2 launch mapping_bringup mapping.launch.py")]
     win.close()  # closeEvent must not raise

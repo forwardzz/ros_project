@@ -206,7 +206,6 @@ class QtBridge(QtCore.QObject):
     health_received = QtCore.Signal(object)
     scan_status_received = QtCore.Signal(str)
     scan_devices_received = QtCore.Signal(list)
-    safety_alert_received = QtCore.Signal(str, str, str)  # level, code, message
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -215,7 +214,6 @@ class QtBridge(QtCore.QObject):
             "health": queue.Queue(),
             "scan_status": queue.Queue(),
             "scan_devices": queue.Queue(),
-            "safety": queue.Queue(),
         }
 
     # --- producers (callable from any thread) ---
@@ -236,16 +234,12 @@ class QtBridge(QtCore.QObject):
     def put_scan_devices(self, devices):
         self.put("scan_devices", devices)
 
-    def put_safety(self, level, code, message):
-        self.put("safety", (level, code, message))
-
     # --- consumer (GUI thread, called by QTimer) ---
     def drain(self):
         self._drain("log", self.log_received)
         self._drain("health", self.health_received)
         self._drain("scan_status", self.scan_status_received)
         self._drain("scan_devices", self.scan_devices_received)
-        self._drain("safety", self.safety_alert_received)
 
     def _drain(self, channel, signal):
         q = self._queues[channel]
@@ -254,10 +248,7 @@ class QtBridge(QtCore.QObject):
                 payload = q.get_nowait()
             except queue.Empty:
                 break
-            if channel == "safety":
-                signal.emit(*payload)
-            else:
-                signal.emit(payload)
+            signal.emit(payload)
 
 
 # ---------------------------------------------------------------------
@@ -357,13 +348,12 @@ class MissionControlPanel(QtWidgets.QWidget):
         self.start_mapping_btn = QtWidgets.QPushButton("启动建图")
         self.start_navigation_btn = QtWidgets.QPushButton("启动导航")
         self.save_map_btn = QtWidgets.QPushButton("保存地图")
-        self.reset_safety_btn = QtWidgets.QPushButton("复位安全状态")
         self.stop_btn = QtWidgets.QPushButton("停止当前模式")
         self.start_mapping_btn.setObjectName("primary")
         self.start_navigation_btn.setObjectName("primary")
         self.stop_btn.setObjectName("danger")
         for btn in (self.start_mapping_btn, self.start_navigation_btn,
-                    self.save_map_btn, self.reset_safety_btn):
+                    self.save_map_btn):
             actions.addWidget(btn)
         actions.addStretch(1)
         actions.addWidget(self.stop_btn)
@@ -372,7 +362,6 @@ class MissionControlPanel(QtWidgets.QWidget):
         self.start_mapping_btn.clicked.connect(lambda: self._start("mapping", MAPPING_CMD))
         self.start_navigation_btn.clicked.connect(self._start_navigation)
         self.save_map_btn.clicked.connect(self._save_map)
-        self.reset_safety_btn.clicked.connect(self._reset_safety)
         self.stop_btn.clicked.connect(self._stop)
         QtCore.QTimer.singleShot(0, self.refresh_maps)
 
@@ -411,21 +400,6 @@ class MissionControlPanel(QtWidgets.QWidget):
             f"ros2 run nav2_map_server map_saver_cli -f {shlex.quote(prefix)}",
         )
         self._log(f"[MAP] save map -> {prefix}")
-
-    def _reset_safety(self):
-        from std_srvs.srv import Trigger
-
-        if self.adapter is None:
-            self._log("[安全] ROS 适配器未连接")
-            return
-        request = Trigger.Request()
-        self.adapter.call_service_async(
-            self.adapter.reset_safety_client, request,
-            lambda result, error: self._log(
-                f"[SAFETY] reset: {result.message if result else error}"
-            ),
-        )
-        self._log("[SAFETY] reset requested")
 
     def _apply_ip(self):
         text = self.host_edit.text().strip()
@@ -626,13 +600,6 @@ class MissionPanel(QtWidgets.QWidget):
         if self.adapter is None:
             self._log("[任务] ROS 适配器未连接")
             return
-        safety_level = getattr(self.adapter, "safety_level", None)
-        if safety_level == "FAULT":
-            self._log(
-                f"[任务] 存在已锁定的安全故障："
-                f"{getattr(self.adapter, 'safety_message', '')}"
-            )
-            return
         from robot_monitor_interfaces.srv import StartNavigation
 
         request = StartNavigation.Request()
@@ -807,12 +774,12 @@ class RobotStatusPanel(QtWidgets.QWidget):
 
         self.health_labels = {}
 
-        # indicator lamps (SSH/Laser/Odom/Map/Safety/Thermal/Gas)
+        # indicator lamps (SSH/Laser/Odom/Map/Thermal/Gas)
         lamps = QtWidgets.QHBoxLayout()
         self.lamps = {}
         for key, label in (
             ("ssh", "SSH"), ("laser", "雷达"), ("odom", "里程计"),
-            ("map", "地图"), ("safety", "安全"), ("thermal", "热成像"),
+            ("map", "地图"), ("thermal", "热成像"),
             ("gas", "气体"),
         ):
             dot = QtWidgets.QLabel("\u25cf")
@@ -887,17 +854,6 @@ class RobotStatusPanel(QtWidgets.QWidget):
             "thermal", "#2dc653" if online else "#d00000",
             "热成像：在线" if online else "热成像：数据超时",
         )
-
-    def update_safety(self, level, code):
-        level = (level or "WAITING").upper()
-        code = code or "UNKNOWN"
-        color = {
-            "NORMAL": "#2dc653",
-            "WARN": "#f77f00",
-            "FAULT": "#d00000",
-        }.get(level, "#8f8f8f")
-        text = "安全：等待数据" if level == "WAITING" else f"安全：{code}"
-        self._set_lamp("safety", color, text)
 
     def update_health(self, health):
         if health is None:
@@ -1094,13 +1050,14 @@ class ThermalPanel(QtWidgets.QWidget):
 
 class ManualDrivePanel(QtWidgets.QWidget):
     abort_finished = QtCore.Signal(int, object, object)
-    estop_finished = QtCore.Signal(bool, object, object)
 
-    def __init__(self, adapter=None, bridge=None, parent=None):
+    def __init__(self, adapter=None, bridge=None, launch_manager=None,
+                 parent=None):
         super().__init__(parent)
         style_as_card(self, 205)
         self.adapter = adapter
         self.bridge = bridge
+        self.launch_manager = launch_manager
         self.manual_linear = 0.12
         self.manual_angular = 0.55
         self._cmd = (0.0, 0.0)
@@ -1125,25 +1082,10 @@ class ManualDrivePanel(QtWidgets.QWidget):
         pad.addWidget(stop_btn, 0, 2, 2, 1)
         layout.addLayout(pad)
 
-        estop_row = QtWidgets.QHBoxLayout()
-        self.estop_btn = QtWidgets.QPushButton("软件急停")
-        self.estop_btn.setObjectName("danger")
-        self.release_estop_btn = QtWidgets.QPushButton("解除急停")
-        self.estop_status = QtWidgets.QLabel("急停状态：未知")
-        estop_row.addWidget(self.estop_btn)
-        estop_row.addWidget(self.release_estop_btn)
-        estop_row.addWidget(self.estop_status, 1)
-        layout.addLayout(estop_row)
-        self.estop_btn.clicked.connect(lambda: self.request_software_estop(True))
-        self.release_estop_btn.clicked.connect(
-            lambda: self.request_software_estop(False)
-        )
-
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._publish)
         self.abort_finished.connect(self._on_abort_finished)
-        self.estop_finished.connect(self._on_estop_finished)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
 
     def _add_drive_button(self, grid, text, row, col, vx, wz):
@@ -1162,6 +1104,11 @@ class ManualDrivePanel(QtWidgets.QWidget):
             return
 
         self.stop_robot()
+        mode = getattr(self.launch_manager, "active_name", None)
+        if mode in ("idle", "mapping"):
+            self._log(f"[MANUAL] direct manual control in {mode} mode")
+            self._activate_command(requested)
+            return
         if (self.adapter is None or
                 not hasattr(self.adapter, "call_service_async") or
                 not hasattr(self.adapter, "abort_mission_client")):
@@ -1192,8 +1139,12 @@ class ManualDrivePanel(QtWidgets.QWidget):
             self._pending_cmd = None
             self._log(f"[MANUAL] autonomous abort failed; command blocked: {detail}")
             return
-        self._cmd = self._pending_cmd
+        command = self._pending_cmd
         self._pending_cmd = None
+        self._activate_command(command)
+
+    def _activate_command(self, command):
+        self._cmd = command
         self._active = True
         self._publish()
         self._timer.start()
@@ -1211,46 +1162,6 @@ class ManualDrivePanel(QtWidgets.QWidget):
         if (self._active and self.adapter is not None and
                 hasattr(self.adapter, "publish_cmd_vel")):
             self.adapter.publish_cmd_vel(self._cmd[0], self._cmd[1])
-
-    def request_software_estop(self, enabled):
-        if enabled:
-            self.stop_robot()
-        if (self.adapter is None or
-                not hasattr(self.adapter, "call_service_async") or
-                not hasattr(self.adapter, "software_estop_client")):
-            self.estop_status.setText("急停状态：服务不可用")
-            self._log("[安全] 软件急停服务不可用")
-            return
-
-        from std_srvs.srv import SetBool
-
-        request = SetBool.Request()
-        request.data = bool(enabled)
-        self.estop_btn.setEnabled(False)
-        self.release_estop_btn.setEnabled(False)
-        self.estop_status.setText("急停状态：正在更新…")
-        self.adapter.call_service_async(
-            self.adapter.software_estop_client,
-            request,
-            lambda result, error: self.estop_finished.emit(
-                bool(enabled), result, error
-            ),
-            timeout_sec=2.0,
-        )
-
-    def _on_estop_finished(self, enabled, result, error):
-        self.estop_btn.setEnabled(True)
-        self.release_estop_btn.setEnabled(True)
-        if error is not None or result is None or not result.success:
-            detail = error or (
-                result.message if result is not None else "unknown error"
-            )
-            self.estop_status.setText("急停状态：更新失败 / 状态未知")
-            self._log(f"[安全] 软件急停更新失败：{detail}")
-            return
-        state = "已锁定" if enabled else "已解除"
-        self.estop_status.setText(f"急停状态：{state}")
-        self._log(f"[安全] 软件急停{state}")
 
     def stop_all(self):
         self.stop_robot()
@@ -1285,6 +1196,12 @@ class ManualDrivePanel(QtWidgets.QWidget):
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
+        # X11/WSLg keyboard auto-repeat can emit synthetic release/press
+        # pairs while the physical key is still held.  Treat only the final,
+        # non-repeat release as a stop command.
+        if event.isAutoRepeat():
+            event.accept()
+            return
         if event.key() in (
             QtCore.Qt.Key_W, QtCore.Qt.Key_Up, QtCore.Qt.Key_S,
             QtCore.Qt.Key_Down, QtCore.Qt.Key_A, QtCore.Qt.Key_Left,
@@ -1432,7 +1349,6 @@ class QtMainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self.bridge.log_received.connect(self.log_panel.append_line)
         self.bridge.health_received.connect(self.status_panel.update_health)
-        self.bridge.safety_alert_received.connect(self._on_safety_alert)
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._on_tick)
         self._timer.start(200)
@@ -1479,7 +1395,7 @@ class QtMainWindow(QtWidgets.QMainWindow):
         heading.setSpacing(1)
         title = QtWidgets.QLabel("履带机器人控制中心", header)
         title.setObjectName("headerTitle")
-        subtitle = QtWidgets.QLabel("ROS 2 建图 · 导航 · 巡检与安全监控", header)
+        subtitle = QtWidgets.QLabel("ROS 2 建图 · 导航 · 巡检与设备监控", header)
         subtitle.setObjectName("headerSubtitle")
         heading.addWidget(title)
         heading.addWidget(subtitle)
@@ -1529,7 +1445,8 @@ class QtMainWindow(QtWidgets.QMainWindow):
         self.live_map = LiveMapPanel(right)
         self.thermal = ThermalPanel(launch_manager=self.launch_manager, parent=right)
         self.manual_drive = ManualDrivePanel(
-            adapter=self.adapter, bridge=self.bridge, parent=right
+            adapter=self.adapter, bridge=self.bridge,
+            launch_manager=self.launch_manager, parent=right,
         )
         for panel in (self.live_map, self.thermal, self.manual_drive):
             right_layout.addWidget(panel)
@@ -1691,11 +1608,6 @@ class QtMainWindow(QtWidgets.QMainWindow):
         return self.mission_control.user_edit.text().strip() or "yy"
 
     def _on_tick(self):
-        if self.adapter is not None:
-            alert = getattr(self.adapter, "pending_safety_alert", None)
-            if alert is not None:
-                self.adapter.pending_safety_alert = None
-                self.bridge.put_safety(*alert)
         self.bridge.drain()
         if self.adapter is not None and hasattr(self, "status_panel"):
             now = time.time()
@@ -1709,10 +1621,6 @@ class QtMainWindow(QtWidgets.QMainWindow):
                 snap = classify_topic(name, mode, tracker)
                 rows.append((name, snap))
             self.status_panel.update_topics(rows)
-            self.status_panel.update_safety(
-                getattr(self.adapter, "safety_level", "WAITING"),
-                getattr(self.adapter, "safety_code", "INIT"),
-            )
 
             gas_stamp = float(getattr(self.adapter, "last_gas_stamp", 0.0) or 0.0)
             gas_state = (
@@ -1764,21 +1672,6 @@ class QtMainWindow(QtWidgets.QMainWindow):
         except Exception:
             return None
         return x, y
-
-    def _on_safety_alert(self, level, code, message):
-        from python_qt_binding import QtWidgets
-
-        box = QtWidgets.QMessageBox(self)
-        box.setText(f"{code}: {message}")
-        if level == "FAULT":
-            box.setIcon(QtWidgets.QMessageBox.Critical)
-            box.setWindowTitle("安全故障")
-        else:
-            box.setIcon(QtWidgets.QMessageBox.Warning)
-            box.setWindowTitle("安全警告")
-        # non-modal: do not block the 200 ms tick loop
-        box.setAttribute(QtCore.Qt.WA_DeleteOnClose)
-        box.show()
 
     # ------------------------------------------------------------- closing
     def shutdown(self):

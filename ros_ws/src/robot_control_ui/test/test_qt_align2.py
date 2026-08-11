@@ -1,4 +1,4 @@
-"""Alignment tests part 2: save map / reset safety / lamps / mission tools."""
+"""Alignment tests part 2: save map / lamps / mission tools."""
 
 import os
 
@@ -39,7 +39,6 @@ class _FakeAdapter:
         def __init__(self, owner):
             self.owner = owner
 
-    reset_safety_client = None
     clear_rviz_points_client = None
     set_region_mode_client = None
     save_inspection_regions_client = None
@@ -55,13 +54,12 @@ class _FakeAdapter:
         pass
 
 
-def test_mission_control_has_save_map_and_reset_safety():
+def test_mission_control_has_save_map():
     from robot_control_ui.robot_control_ui import MissionControlPanel
 
     lm = _FakeLM()
     panel = MissionControlPanel(launch_manager=lm, bridge=None)
     assert panel.save_map_btn.text() == "保存地图"
-    assert panel.reset_safety_btn.text() == "复位安全状态"
     panel.map_edit.setText("/home/yy/ros2_ws/map.yaml")
     panel._save_map()
     assert lm.run_once_calls and "map_saver_cli -f /home/yy/ros2_ws/map" in lm.run_once_calls[0][1]
@@ -73,7 +71,7 @@ def test_status_panel_has_lamps_and_updates():
     from robot_control_ui.robot_control_ui import RobotStatusPanel
 
     panel = RobotStatusPanel()
-    assert set(panel.lamps) == {"ssh", "laser", "odom", "map", "safety", "thermal", "gas"}
+    assert set(panel.lamps) == {"ssh", "laser", "odom", "map", "thermal", "gas"}
     snap = TopicSnapshot(name="/scan", publishers=1, state="online")
     panel.update_topics([("/scan", snap)])
     label = panel.lamps["laser"][1].text()

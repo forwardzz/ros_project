@@ -47,7 +47,6 @@ class _Result:
 
 class _ManualAdapter:
     abort_mission_client = "abort"
-    software_estop_client = "estop"
 
     def __init__(self):
         self.published = []
@@ -63,9 +62,6 @@ class _ManualAdapter:
 class _TickAdapter:
     def __init__(self):
         self.topic_trackers = {}
-        self.pending_safety_alert = None
-        self.safety_level = "NORMAL"
-        self.safety_code = "OK"
         self.gas_data = {"H2": 0.0, "CO": 0.0, "VOC": 0.0, "Smoke": 0.0}
         self.last_gas_stamp = 0.0
         self.thermal_frame = []
@@ -182,6 +178,61 @@ def test_manual_drive_waits_for_abort_and_ignores_late_result():
     panel.close()
 
 
+def test_manual_drive_mapping_mode_publishes_without_abort_and_stops():
+    from robot_control_ui.robot_control_ui import ManualDrivePanel
+
+    adapter = _ManualAdapter()
+    manager = _LaunchManager()
+    manager.active_name = "mapping"
+    panel = ManualDrivePanel(adapter=adapter, launch_manager=manager)
+
+    panel._begin(0.12, 0.0)
+    assert adapter.calls == []
+    assert adapter.published[-1] == (0.12, 0.0)
+    assert panel._timer.isActive()
+
+    panel._publish()
+    assert adapter.published[-1] == (0.12, 0.0)
+    panel.stop_robot()
+    assert adapter.published[-1] == (0.0, 0.0)
+    assert not panel._timer.isActive()
+    panel.close()
+
+
+def test_manual_drive_navigation_mode_still_requires_abort():
+    from robot_control_ui.robot_control_ui import ManualDrivePanel
+
+    adapter = _ManualAdapter()
+    manager = _LaunchManager()
+    manager.active_name = "navigation"
+    panel = ManualDrivePanel(adapter=adapter, launch_manager=manager)
+
+    panel._begin(0.0, 0.55)
+    assert adapter.published == [(0.0, 0.0)]
+    assert len(adapter.calls) == 1
+    adapter.calls[0][2](_Result(), None)
+    assert adapter.published[-1] == (0.0, 0.55)
+    panel.close()
+
+
+def test_manual_drive_navigation_ignores_abort_after_key_release():
+    from robot_control_ui.robot_control_ui import ManualDrivePanel
+
+    adapter = _ManualAdapter()
+    manager = _LaunchManager()
+    manager.active_name = "navigation"
+    panel = ManualDrivePanel(adapter=adapter, launch_manager=manager)
+
+    panel._begin(0.12, 0.0)
+    callback = adapter.calls[0][2]
+    panel.stop_robot()
+    count = len(adapter.published)
+    callback(_Result(), None)
+    assert len(adapter.published) == count
+    assert adapter.published[-1] == (0.0, 0.0)
+    panel.close()
+
+
 def test_manual_drive_blocks_when_abort_fails():
     from robot_control_ui.robot_control_ui import ManualDrivePanel
 
@@ -194,34 +245,11 @@ def test_manual_drive_blocks_when_abort_fails():
     panel.close()
 
 
-def test_software_estop_has_independent_latch_and_release_calls():
-    from robot_control_ui.robot_control_ui import ManualDrivePanel
-
-    adapter = _ManualAdapter()
-    panel = ManualDrivePanel(adapter=adapter)
-    panel.request_software_estop(True)
-    assert adapter.published[-1] == (0.0, 0.0)
-    assert adapter.calls[-1][0] == "estop"
-    assert adapter.calls[-1][1].data is True
-    adapter.calls[-1][2](_Result(), None)
-    assert "已锁定" in panel.estop_status.text()
-
-    panel.request_software_estop(False)
-    assert adapter.calls[-1][1].data is False
-    adapter.calls[-1][2](_Result(), None)
-    assert "已解除" in panel.estop_status.text()
-    panel.close()
-
-
-def test_safety_and_sensor_lamps_use_semantic_state_and_freshness():
+def test_sensor_lamps_use_freshness():
     from robot_control_ui.robot_control_ui import QtBridge, QtMainWindow, RobotStatusPanel
 
     panel = RobotStatusPanel()
-    panel.update_safety("WARN", "W-1")
-    assert "#f77f00" in panel.lamps["safety"][0].styleSheet()
-    assert "W-1" in panel.lamps["safety"][1].text()
-    panel.update_safety("FAULT", "F-1")
-    assert "#d00000" in panel.lamps["safety"][0].styleSheet()
+    assert "safety" not in panel.lamps
     panel.close()
 
     adapter = _TickAdapter()

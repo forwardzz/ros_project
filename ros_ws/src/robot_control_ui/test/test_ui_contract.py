@@ -36,9 +36,9 @@ def test_qt_is_the_only_ui_module_and_entrypoint():
     assert '"ui_executable"' not in launch
 
 
-def test_ui_uses_project_velocity_safety_chain():
-    assert 'create_publisher(Twist, "/cmd_vel_teleop", 10)' in ROS_ADAPTER_SOURCE
-    assert 'create_publisher(Twist, "/cmd_vel",' not in ROS_ADAPTER_SOURCE
+def test_ui_publishes_directly_to_cmd_vel():
+    assert 'create_publisher(Twist, "/cmd_vel", 10)' in ROS_ADAPTER_SOURCE
+    assert "/cmd_vel_teleop" not in ROS_ADAPTER_SOURCE
     manual = _class_source("ManualDrivePanel", "LanScanDialog")
     assert "self._timer.timeout.connect(self._publish)" in manual
     assert "self.stop_robot()" in _method_source("_begin", "_on_abort_finished")

@@ -23,15 +23,6 @@ class UiStateSnapshot:
     amcl_x: float = 0.0
     amcl_y: float = 0.0
     amcl_yaw: float = 0.0
-    safety_level: str = "WAITING"
-    safety_code: str = "INIT"
-    safety_message: str = "No safety data"
-    safety_voltage_available: bool = False
-    safety_measured_voltage_v: float = float("nan")
-    safety_undervoltage_now: bool = False
-    safety_undervoltage_seen: bool = False
-    safety_throttled_flags: int = 0
-    safety_mission_active: bool = False
     mission_state: str = "IDLE"
     mission_mode: str = "waypoints"
     mission_message: str = "No mission"
@@ -55,7 +46,6 @@ class UiStateSnapshot:
     last_amcl_stamp: float = 0.0
     last_thermal_stamp: float = 0.0
     last_gas_stamp: float = 0.0
-    last_safety_stamp: float = 0.0
 
 
 class UiStateStore:

@@ -171,23 +171,6 @@ def generate_launch_description():
         ),
 
         Node(
-            package="mapping_bringup",
-            executable="safety_monitor",
-            name="safety_monitor",
-            output="screen",
-            parameters=[{
-                "fault_on_undervoltage_seen": False,
-            }],
-        ),
-
-        Node(
-            package="mapping_bringup",
-            executable="velocity_safety_gate",
-            name="velocity_safety_gate",
-            output="screen",
-        ),
-
-        Node(
             package="nav2_map_server",
             executable="map_server",
             name="map_server",
@@ -260,7 +243,7 @@ def generate_launch_description():
             parameters=[nav2_param_path],
             remappings=[
                 ("/cmd_vel", "/cmd_vel_nav"),
-                ("/cmd_vel_smoothed", "/cmd_vel_auto"),
+                ("/cmd_vel_smoothed", "/cmd_vel"),
             ],
         ),
 

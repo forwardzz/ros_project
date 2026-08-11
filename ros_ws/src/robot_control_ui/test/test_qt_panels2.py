@@ -14,7 +14,6 @@ class FakeAdapter:
     def __init__(self):
         self.published = []
         self.abort_mission_client = "abort_mission"
-        self.software_estop_client = "software_estop"
 
     def publish_cmd_vel(self, vx, wz):
         self.published.append((vx, wz))
@@ -103,19 +102,44 @@ def test_manual_drive_focus_loss_stops():
 
 
 def test_manual_drive_keyboard_ignores_autorepeat():
-    from python_qt_binding import QtCore, QtGui
+    from python_qt_binding import QtCore
 
     from robot_control_ui.robot_control_ui import ManualDrivePanel
 
+    class Manager:
+        active_name = "mapping"
+
+    class KeyEvent:
+        def __init__(self, auto_repeat):
+            self.auto_repeat = auto_repeat
+            self.accepted = False
+
+        def isAutoRepeat(self):
+            return self.auto_repeat
+
+        def key(self):
+            return QtCore.Qt.Key_W
+
+        def accept(self):
+            self.accepted = True
+
     adapter = FakeAdapter()
-    panel = ManualDrivePanel(adapter=adapter)
-    event = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_W,
-                             QtCore.Qt.NoModifier)
-    event._auto_repeat = True
-    # isAutoRepeat is a property on the C++ event; simulate via class
-    if not hasattr(event, "isAutoRepeat") or not event.isAutoRepeat():
-        pass
-    panel.keyPressEvent(event)
+    panel = ManualDrivePanel(adapter=adapter, launch_manager=Manager())
+    panel.keyPressEvent(KeyEvent(False))
+    assert panel._active is True
+    assert adapter.published[-1] == (0.12, 0.0)
+
+    repeat_release = KeyEvent(True)
+    panel.keyReleaseEvent(repeat_release)
+    assert repeat_release.accepted is True
+    assert panel._active is True
+    panel._publish()
+    assert adapter.published[-1] == (0.12, 0.0)
+
+    final_release = KeyEvent(False)
+    panel.keyReleaseEvent(final_release)
+    assert panel._active is False
+    assert adapter.published[-1] == (0.0, 0.0)
     panel.close()
 
 
